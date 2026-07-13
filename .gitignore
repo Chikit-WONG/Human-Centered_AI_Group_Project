@@ -1,0 +1,109 @@
+# Operating-system and editor files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python bytecode, caches, and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Python environments and packaging outputs
+.venv/
+venv/
+env/
+ENV/
+.python-version
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Local environment variables and credentials
+.env
+.env.*
+!.env.example
+
+# Jupyter and general application caches
+.ipynb_checkpoints/
+.cache/
+**/.cache/
+.huggingface/
+hf_cache/
+datasets_cache/
+**/cache/
+
+# Experiment trackers and runtime logs
+logs/
+*.log
+*.out
+*.err
+slurm-*
+swanlog/
+wandb/
+tensorboard/
+mlruns/
+
+# Training runs, checkpoints, and generated artifacts
+runs/
+outputs/
+artifacts/
+checkpoints/
+checkpoint-*/
+**/checkpoint-*/
+epoch_*/
+**/epoch_*/
+caps-*/
+*.resolved*.yaml
+
+# Model weights, optimizer states, and binary ML artifacts
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.onnx
+*.arrow
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+
+# Local datasets and downloaded pretrained assets
+data/
+dataset/
+datasets/
+training_images/
+test_images/
+Preprocessed_data*/
+pretrained_models/
+model_weights/
+
+# LaTeX build products (keep source .tex/.bib and final PDFs)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.synctex.gz
+*.toc
+
+# Project-local working plans and generated evaluation results
+plan/
+results/
