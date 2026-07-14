@@ -1,5 +1,7 @@
 # EEG-to-Image Retrieval with Joint Brain–Vision Alignment
 
+English | [简体中文](README_ZH.md)
+
 Course project for **AIAA3800 — Human-Centered Artificial Intelligence**.
 
 This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The current verified experiment aligns a trainable brain encoder with a LoRA-adapted CLIP vision encoder on **THINGS-EEG2 Subject 08**, then compares standard independent retrieval with an optional global one-to-one Hungarian decoder.
