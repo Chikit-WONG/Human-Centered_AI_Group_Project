@@ -78,9 +78,9 @@ The table below uses the closest identifiable protocol in the literature: **intr
 | [Shallow Alignment](https://arxiv.org/abs/2601.21948) | arXiv 2026 preprint | 82.60% | 97.70% | Five-seed mean; best intermediate visual layer |
 | [HCF](https://arxiv.org/abs/2603.07077) | arXiv 2026 preprint | 84.60% | 98.20% | Hierarchically fused intermediate visual features |
 | [SAMGA](https://arxiv.org/abs/2604.17782) | arXiv 2026 preprint | **91.30%** | **98.80%** | Five-seed mean; 60 epochs with early stopping |
-| Our project (standard retrieval) | Course project, fixed protocol | $`\color{blue}{\mathbf{87.35\%}}`$ | $`\color{blue}{\mathbf{98.30\%}}`$ | One seed; 17 channels; fixed epoch-25 checkpoint |
+| Our project (standard retrieval) | Course project, fixed protocol | $\color{blue}{\mathbf{87.35\%}}$ | $\color{blue}{\mathbf{98.30\%}}$ | One seed; 17 channels; fixed epoch-25 checkpoint |
 
-Although our project does not take first place in this selected comparison, **ranking second on both metrics is still a strong result**: Top-1 $`\color{blue}{\mathbf{87.35\%}}`$ and Top-5 $`\color{blue}{\mathbf{98.30\%}}`$. Our project exceeds every peer-reviewed literature row in the table; the only higher row is SAMGA, which is currently a non-peer-reviewed preprint. This is **not** an unqualified state-of-the-art claim: the papers use different visual targets, pretrained encoders, seed counts, and checkpoint-selection rules. HCF and Shallow Alignment are also preprints, whereas our project reports one seed. The hierarchical-visual-embedding paper reports 94.60% in its main table, although the ten displayed per-subject Top-5 values average to approximately 94.91%.
+Although our project does not take first place in this selected comparison, **ranking second on both metrics is still a strong result**: Top-1 $\color{blue}{\mathbf{87.35\%}}$ and Top-5 $\color{blue}{\mathbf{98.30\%}}$. Our project exceeds every peer-reviewed literature row in the table; the only higher row is SAMGA, which is currently a non-peer-reviewed preprint. This is **not** an unqualified state-of-the-art claim: the papers use different visual targets, pretrained encoders, seed counts, and checkpoint-selection rules. HCF and Shallow Alignment are also preprints, whereas our project reports one seed. The hierarchical-visual-embedding paper reports 94.60% in its main table, although the ten displayed per-subject Top-5 values average to approximately 94.91%.
 
 Two further reporting decisions prevent protocol mixing:
 
@@ -90,6 +90,8 @@ Two further reporting decisions prevent protocol mixing:
 Although every test concept in this split has exactly one stimulus image, making concept identity and image identity one-to-one at scoring time, the gallery representation still matters. Our project ranks the actual test-image embeddings; it does not replace them with class templates. All literature values above are paper-reported rather than rerun inside this repository.
 
 ### Subject 08 Hungarian one-to-one ablation
+
+![Hungarian one-to-one assignment implementation for EEG-to-image retrieval](asserts/Hungarian_Algorithm.png)
 
 | Evaluation protocol (`sub-08` only) | Top-1 / assignment accuracy | Top-5 |
 |---|---:|---:|
