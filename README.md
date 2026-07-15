@@ -4,18 +4,18 @@ English | [简体中文](README_ZH.md)
 
 Course project for **AIAA3800 — Human-Centered Artificial Intelligence**.
 
-This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The current verified experiment aligns a trainable brain encoder with a LoRA-adapted CLIP vision encoder on **THINGS-EEG2 Subject 08**, then compares standard independent retrieval with an optional global one-to-one Hungarian decoder.
+This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The formal standard protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`). A global one-to-one Hungarian decoder is retained only as a transductive Subject 08 ablation.
 
-> **Scope.** The verified numbers in this README cover one subject (`sub-08`) and one seed (`42`). They are not a ten-subject average.
+> **Scope.** Standard Top-1/Top-5 results cover all ten subjects at seed `42` and are reported per subject and as a ten-subject aggregate. Each subject has an independently trained model. The Hungarian result covers only `sub-08` and is excluded from the aggregate.
 
 ## Highlights
 
 - Maps trial-averaged posterior EEG signals to the 512-dimensional CLIP image space.
 - Jointly trains a brain MLP and rank-32 LoRA adapters on CLIP ViT-B/32.
 - Uses different learning rates for the brain and vision branches (TTUR-style optimization).
-- Reports a fixed final-checkpoint result rather than selecting the best test epoch.
-- Includes deterministic per-query evaluation and an audited Hungarian one-to-one assignment ablation.
-- Provides unit tests, independent checkpoint-reload checks, per-query predictions, and similarity-matrix provenance.
+- Reports a fixed final-checkpoint result for every subject rather than selecting the best test epoch.
+- Trains and evaluates all ten subjects independently, then aggregates standard Top-1/Top-5.
+- Provides unit tests, independent checkpoint-reload checks, and per-query predictions for every standard run, plus similarity-matrix provenance for the `sub-08` Hungarian ablation.
 
 ## Method
 
@@ -56,14 +56,32 @@ The second protocol can assign an image that is not a query's row-wise maximum b
 
 ## Verified Results
 
-The official result uses the saved model after epoch 25 and an independent save/reload evaluation over 200 held-out queries and 200 unique gallery images.
+### Ten-subject standard independent retrieval
 
-| Evaluation protocol | Top-1 / assignment accuracy | Top-5 |
+Each subject has a separately trained model. The official result uses the fixed checkpoint saved after epoch 25 and evaluates 200 held-out queries against 200 unique gallery images per subject. Two fresh save/reload evaluations produced identical metrics and per-query predictions for every subject. The new array trained `sub-01`–`sub-07` and `sub-09`–`sub-10`; `sub-08` reuses the previously completed, repeat-verified run under the identical protocol.
+
+| Subject | Top-1 | Top-5 | Correct@1 | Correct@5 |
+|---|---:|---:|---:|---:|
+| sub-01 | 86.0% | 96.5% | 172/200 | 193/200 |
+| sub-02 | 90.5% | 100.0% | 181/200 | 200/200 |
+| sub-03 | 85.0% | 97.0% | 170/200 | 194/200 |
+| sub-04 | 83.5% | 97.0% | 167/200 | 194/200 |
+| sub-05 | 84.0% | 98.0% | 168/200 | 196/200 |
+| sub-06 | 94.0% | 99.5% | 188/200 | 199/200 |
+| sub-07 | 86.0% | 98.0% | 172/200 | 196/200 |
+| sub-08 | 91.0% | 99.5% | 182/200 | 199/200 |
+| sub-09 | 82.5% | 98.0% | 165/200 | 196/200 |
+| sub-10 | 91.0% | 99.5% | 182/200 | 199/200 |
+| **Ten-subject mean / pooled count** | **87.35%** | **98.30%** | **1747/2000** | **1966/2000** |
+
+The between-subject population standard deviation is 3.74 percentage points for Top-1 and 1.19 points for Top-5. The macro mean equals pooled accuracy because every subject contributes 200 queries. The random 200-way baselines are 0.5% Top-1 and 2.5% Top-5.
+
+### Subject 08 Hungarian one-to-one ablation
+
+| Evaluation protocol (`sub-08` only) | Top-1 / assignment accuracy | Top-5 |
 |---|---:|---:|
 | Standard independent per-query retrieval | **182/200 (91.0%)** | **199/200 (99.5%)** |
 | Global Hungarian one-to-one assignment | **200/200 (100.0%)** | N/A |
-
-The random 200-way baselines are 0.5% Top-1 and 2.5% Top-5.
 
 ### Interpreting the Hungarian result
 
@@ -74,21 +92,23 @@ The Hungarian result is a **transductive closed-set ablation**, not a replacemen
 - every gallery image must be used exactly once;
 - a single global assignment returns one image per query, so it has no directly comparable Top-5.
 
-In this run, independent Top-1 predictions covered only 183 unique gallery images. Hungarian decoding changed 18 assignments, converting all 18 standard Top-1 errors to correct matches without changing any correct match to an error. Nine predeclared row/column orderings produced the same mapped assignment, ruling out an aligned-order tie-break explanation for the 100% result.
+In the `sub-08` run, independent Top-1 predictions covered only 183 unique gallery images. Hungarian decoding changed 18 assignments, converting all 18 standard Top-1 errors to correct matches without changing any correct match to an error. Nine predeclared row/column orderings produced the same mapped assignment, ruling out an aligned-order tie-break explanation for the 100% result.
 
 The recommended reporting convention is therefore:
 
-- **Primary result:** standard Top-1 91.0%, standard Top-5 99.5%.
-- **Secondary ablation:** global one-to-one assignment accuracy 100.0%.
+- **Primary result:** ten-subject standard mean Top-1 87.35% and Top-5 98.30%, accompanied by the per-subject table, pooled counts, and population standard deviations above.
+- **Secondary ablation:** `sub-08` global one-to-one assignment accuracy 100.0%, compared with that subject's standard Top-1 91.0% and Top-5 99.5%.
+
+Hungarian assignment is not used in any ten-subject score.
 
 ## Experiment Configuration
 
 | Component | Setting |
 |---|---|
 | Dataset | THINGS-EEG2 |
-| Verified subject / seed | `sub-08` / `42` |
-| Loaded train EEG tensor | `(16540, 4, 63, 250)` |
-| Loaded test EEG tensor | `(200, 80, 63, 250)` |
+| Verified subjects / seed | `sub-01`–`sub-10` (trained separately) / `42` |
+| Per-subject loaded train EEG tensor | `(16540, 4, 63, 250)` |
+| Per-subject loaded test EEG tensor | `(200, 80, 63, 250)` |
 | Trial handling | Average 4 train trials and 80 test trials separately |
 | EEG channels | `P7,P5,P3,P1,Pz,P2,P4,P6,P8,PO7,PO3,POz,PO4,PO8,O1,Oz,O2` |
 | Time window | `[0, 250)` samples |
@@ -100,7 +120,8 @@ The recommended reporting convention is therefore:
 | Scheduler / weight decay | Cosine / `0.05` |
 | Train / evaluation batch size | 512 / 100 |
 | Training | 25 epochs, bf16, gradient checkpointing |
-| Formal hardware | One NVIDIA A40 |
+| Evaluation scope | 200 queries × 200-image gallery per subject (2,000 queries total) |
+| Formal hardware | One NVIDIA A40 per subject job |
 
 ## Repository Layout
 
@@ -113,11 +134,14 @@ The recommended reporting convention is therefore:
 │   └── models_diffusion.py         # Experimental reconstruction components
 ├── scripts/
 │   ├── evaluate_retrieval.py       # Standard and Hungarian evaluation
+│   ├── aggregate_subject_metrics.py # Validate/aggregate ten-subject metrics
 │   ├── finalize_results.py         # Standard-result validation/reporting
 │   ├── finalize_hungarian_results.py
-│   ├── run_sub08_reproduction.sh   # Site-specific reproduction wrapper
+│   ├── run_subject_reproduction.sh # Generic single-subject reproduction
+│   ├── run_sub08_reproduction.sh   # Legacy Subject 08-specific wrapper
 │   ├── run_hungarian_evaluation.sh # Site-specific Hungarian wrapper
-│   └── submit_*.slurm              # HKUST(GZ) SLURM launchers
+│   ├── submit_subject_array.slurm  # Ten-subject SLURM array launcher
+│   └── submit_*.slurm              # Other HKUST(GZ) SLURM launchers
 ├── tests/
 │   └── test_hungarian_assignment.py
 ├── docs/                            # Internal technical notes
@@ -131,7 +155,7 @@ Generated checkpoints, caches, logs, plans, and result artifacts are intentional
 
 ## Environment Setup
 
-Run the commands in this section from the repository root. The formal experiment used Linux, one NVIDIA A40, and the following fully tested software stack:
+Run the commands in this section from the repository root. Each formal subject run used Linux, one NVIDIA A40, and the following fully tested software stack:
 
 | Package | Tested version |
 |---|---:|
@@ -264,7 +288,11 @@ Download THINGS-EEG2 from the [THINGS initiative](https://things-initiative.org/
 ```text
 things_eeg_data/
 ├── Preprocessed_data_250Hz_whiten/
-│   └── sub-08/
+│   ├── sub-01/
+│   │   ├── train.pt
+│   │   └── test.pt
+│   ├── ...
+│   └── sub-10/
 │       ├── train.pt
 │       └── test.pt
 ├── training_images/
@@ -289,8 +317,10 @@ export PROJECT_ROOT="$(pwd)"
 export THINGS_ROOT="/path/to/things_eeg_data"
 export BRAIN_DIR="$THINGS_ROOT/Preprocessed_data_250Hz_whiten"
 export CLIP_PATH="/path/to/CLIP-ViT-B-32-laion2B-s34B-b79K"
-export OUTPUT_DIR="$PROJECT_ROOT/runs/seed42/subj08"
-export RESULTS_DIR="$PROJECT_ROOT/results"
+export SUBJECT_ID=1
+printf -v SUBJECT_PADDED '%02d' "$SUBJECT_ID"
+export OUTPUT_DIR="$PROJECT_ROOT/runs/all_subjects/seed42/subj${SUBJECT_PADDED}"
+export RESULTS_DIR="$PROJECT_ROOT/results/all_subjects/seed42/subj${SUBJECT_PADDED}"
 export CHANNELS="P7,P5,P3,P1,Pz,P2,P4,P6,P8,PO7,PO3,POz,PO4,PO8,O1,Oz,O2"
 
 mkdir -p "$OUTPUT_DIR/cache" "$RESULTS_DIR"
@@ -308,7 +338,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 ## Training
 
-The following command reproduces the Subject 08 configuration without relying on the site-specific wrapper paths:
+The following command reproduces one subject without relying on site-specific wrapper paths. For the formal ten-subject protocol, set `SUBJECT_ID` to each value from 1 through 10 and run a separate training job; do not combine subjects in one model.
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=1 \
@@ -317,8 +347,8 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   --brain_directory "$BRAIN_DIR" \
   --image_directory "$THINGS_ROOT" \
   --cache_dir "$OUTPUT_DIR/cache" \
-  --subject_ids 8 \
-  --eval_subject_ids 8 \
+  --subject_ids "$SUBJECT_ID" \
+  --eval_subject_ids "$SUBJECT_ID" \
   --brain_column eeg \
   --brain_backbone brain_mlp \
   --dropout 0.1 \
@@ -346,7 +376,14 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   --per_device_eval_batch_size 100
 ```
 
-Run a one-step or one-epoch smoke test before the formal job if using new hardware or a newly prepared dataset.
+The generic wrapper performs a smoke run or a 25-epoch formal run followed by two fresh checkpoint-reload evaluations. It refuses to overwrite an existing formal run by default:
+
+```bash
+bash scripts/run_subject_reproduction.sh smoke --subject-id 1
+bash scripts/run_subject_reproduction.sh formal --subject-id 1
+```
+
+Run a smoke test before the formal job if using new hardware or a newly prepared dataset.
 
 ## Evaluation
 
@@ -360,7 +397,7 @@ EVAL_ARGS=(
   --brain-directory "$BRAIN_DIR"
   --image-directory "$THINGS_ROOT"
   --dataset-name things
-  --subject-id 8
+  --subject-id "$SUBJECT_ID"
   --selected-channels "$CHANNELS"
   --time-slice 0,250
   --batch-size 100
@@ -379,13 +416,13 @@ EVAL_ARGS=(
 ```bash
 python scripts/evaluate_retrieval.py \
   "${EVAL_ARGS[@]}" \
-  --metrics-output "$RESULTS_DIR/sub08_standard_metrics.json" \
-  --predictions-output "$RESULTS_DIR/sub08_standard_predictions.csv"
+  --metrics-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed42_formal_metrics.json" \
+  --predictions-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed42_formal_predictions.csv"
 ```
 
 ### Hungarian one-to-one ablation
 
-The evaluator still writes the standard per-query metrics, while adding a separate constrained-assignment namespace and CSV:
+This ablation was verified only for `sub-08`. First set `SUBJECT_ID=8`, recompute `SUBJECT_PADDED=08`, point `OUTPUT_DIR` and `RESULTS_DIR` to its run, and then rebuild the complete `EVAL_ARGS=(...)` array above so Bash captures the updated values. The evaluator still writes the standard per-query metrics while adding a separate constrained-assignment namespace and CSV:
 
 ```bash
 python scripts/evaluate_retrieval.py \
@@ -412,10 +449,26 @@ The tests cover solver optimality, collision resolution, invalid matrices, non-d
 The repository includes launchers used on the HKUST(GZ) cluster:
 
 ```bash
-sbatch scripts/submit_sub08.slurm smoke
+# All ten standard subject runs; the array permits at most two concurrent jobs.
+sbatch scripts/submit_subject_array.slurm smoke
+sbatch scripts/submit_subject_array.slurm formal
+
+# Subject 08-specific legacy/Hungarian launchers.
 sbatch scripts/submit_sub08.slurm formal
 sbatch scripts/submit_hungarian_eval.slurm
 ```
+
+After all ten standard runs finish, validate and aggregate them:
+
+```bash
+python scripts/aggregate_subject_metrics.py \
+  --results-root "$PROJECT_ROOT/results/all_subjects/seed42" \
+  --subjects 1-10 \
+  --seed 42 \
+  --expected-epochs 25
+```
+
+The aggregator checks query/gallery cardinality, all 25 validation records, metric/count agreement, repeat-reload prediction identity, retrieval protocol, saved model configurations, CLIP base path, and key environment versions. It writes `summary.json`, `per_subject_metrics.csv`, `RESULTS_EN.md`, and `RESULTS_ZH.md` under `results/all_subjects/seed42/`.
 
 These shell and SLURM files currently contain site-specific absolute paths. Before using them in another clone or cluster, update:
 
@@ -430,17 +483,21 @@ The direct training and evaluation commands above are the portable reference com
 
 - The official metric is evaluated from the fixed final checkpoint after epoch 25.
 - Test-set peak epochs are diagnostic only and are not used for checkpoint selection.
+- The ten subjects use distinct models; there is no cross-subject pooling or joint training.
 - Query and gallery identity are matched by unique image ID rather than by assuming a diagonal target.
-- Standard evaluation is repeated after independent model reloads.
-- Hungarian evaluation saves the full similarity matrix, ID ordering, hashes, transition ledger, and assignment output.
+- Every standard evaluation is repeated after an independent model reload.
+- The ten-subject aggregate contains only standard independent Top-1/Top-5 scores.
+- The `sub-08` Hungarian evaluation saves the full similarity matrix, ID ordering, hashes, transition ledger, and assignment output.
 - Ground-truth labels are used only after the assignment is solved; they are not part of the Hungarian objective.
 - Multiple predeclared row/column orderings are audited so aligned input order cannot silently determine an exact tie.
 
 ## Limitations and Responsible Use
 
-- Results currently cover one subject and one random seed.
+- Results cover all ten THINGS-EEG2 subjects but only one random seed, so across-seed uncertainty is not measured.
+- Each subject uses an independent model; this experiment does not evaluate cross-subject generalization.
+- The reproduced training loop invokes gradient clipping before `backward()`, so the configured maximum gradient norm does not affect these runs. All ten subjects use this same behavior; correcting the order would define a different protocol and require a full rerun.
 - Trial averaging uses repeated presentations and is not equivalent to single-trial decoding.
-- Hungarian decoding requires the complete query batch and a known one-to-one gallery prior, so it is not an online single-query retrieval protocol.
+- The Hungarian ablation was verified only for `sub-08`; it must not be extrapolated to all ten subjects. It also requires the complete query batch and a known one-to-one gallery prior, so it is not an online single-query retrieval protocol.
 - Dataset, preprocessing, and model-weight versions can materially affect the result.
 - The reconstruction path is experimental; no formal reconstruction metric is claimed in this README.
 - EEG is sensitive human-participant data. Follow the dataset's consent, privacy, licensing, and redistribution requirements, and do not interpret this research system as a clinical or diagnostic tool.

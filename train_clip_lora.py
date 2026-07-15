@@ -346,7 +346,7 @@ def build_datasets(
     eval_dataset = load_things_brain_dataset(
         data_directory=args.brain_directory,
         split="test",
-        subject_ids=args.subject_ids,
+        subject_ids=args.eval_subject_ids,
         brain_column=args.brain_column,
         avg_trials=True,
         selected_channels=args.selected_channels,
@@ -780,7 +780,7 @@ def main():
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
             checkpoint_path = args.resume_from_checkpoint
-            path = os.path.basename(args.resume_from_checkpoint)
+            path = os.path.basename(os.path.normpath(args.resume_from_checkpoint))
         else:
             # Get the most recent checkpoint
             dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
@@ -789,7 +789,7 @@ def main():
                 -1
             ]  # Sorts folders by date modified, most recent checkpoint is the last
             checkpoint_path = path
-            path = os.path.basename(checkpoint_path)
+            path = os.path.basename(os.path.normpath(checkpoint_path))
 
         accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
         accelerator.load_state(checkpoint_path)
