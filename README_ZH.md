@@ -19,38 +19,26 @@
 
 ## 方法
 
-```mermaid
-flowchart LR
-    EEG["试次平均 EEG<br/>17 个通道 × 250 个采样点"] --> BM["脑 MLP"]
-    IMG["刺激图像"] --> CLIP["CLIP ViT-B/32<br/>秩为 32 的 LoRA"]
-    BM --> BE["L2 归一化<br/>512 维脑嵌入"]
-    CLIP --> IE["L2 归一化<br/>512 维图像嵌入"]
-    BE --> LOSS["批次对比对齐"]
-    IE --> LOSS
-    BE --> SIM["余弦相似度矩阵"]
-    IE --> SIM
-    SIM --> TOPK["逐查询独立排序<br/>Top-1 / Top-5"]
-    SIM --> HUNG["可选的全局一对一<br/>匈牙利分配"]
-```
+![EEG 图像检索模型结构：训练阶段进行双侧 CLIP 对齐，推理阶段进行 Top-1/Top-5 图像检索](asserts/Architecture.png)
 
 对于 EEG 查询嵌入 $b_i$ 和图库图像嵌入 $v_j$，两者均经过 L2 归一化，检索分数为
 
-$$
+```math
 S_{ij} = b_i^\top v_j.
-$$
+```
 
 标准检索对每一行独立排序：
 
-$$
-\hat{j}_i = \operatorname*{arg\,max}_{j} S_{ij}.
-$$
+```math
+\hat{j}_i = \underset{j}{\arg\,\max}\; S_{ij}.
+```
 
 可选的匈牙利解码器则求解一个全局双射：
 
-$$
-\hat{\pi} = \operatorname*{arg\,max}_{\pi \in \mathrm{Perm}(N)}
+```math
+\hat{\pi} = \underset{\pi \in \mathrm{Perm}(N)}{\arg\,\max}
 \sum_{i=1}^{N} S_{i,\pi(i)}.
-$$
+```
 
 第二种协议优化的是完整的一对一匹配，因此可能为某个查询分配一个并非该查询行内最大值的图像。
 
@@ -75,6 +63,31 @@ $$
 | **十名受试者平均 / 合并计数** | **87.35%** | **98.30%** | **1747/2000** | **1966/2000** |
 
 被试间总体标准差为 Top-1 3.74 个百分点、Top-5 1.19 个百分点。由于每名受试者均贡献 200 个查询，宏平均与合并准确率相同。包含 200 张候选图像时，随机基线为 Top-1 0.5%、Top-5 2.5%。
+
+### 与既有 EEG 图像检索工作的比较
+
+下表采用文献中能够确认的最接近协议：在 **THINGS-EEG2 上进行被试内、200-way、零样本检索**，并对全部十名受试者取平均。每个 EEG 查询都独立地在 200 张留出刺激图像中排序，因此不纳入匈牙利结果。数值取各论文主要比较表中的主结果；每个指标列的最高值用粗体标出，本项目结果另外使用蓝色突出显示。
+
+| 方法 | 发表状态 | Top-1 | Top-5 | 协议说明 |
+|---|---|---:|---:|---|
+| [NICE（Li 等人的精确图像复现）](https://proceedings.neurips.cc/paper_files/paper/2024/file/ba5f1233efa77787ff9ec015877dbd1f-Paper-Conference.pdf) | NeurIPS 2024，Table 8 | 21.52% | 51.57% | 依据验证集选择检查点；使用真实刺激图图库 |
+| [ATM-S](https://proceedings.neurips.cc/paper_files/paper/2024/file/ba5f1233efa77787ff9ec015877dbd1f-Paper-Conference.pdf) | NeurIPS 2024，Table 8 | 26.13% | 55.32% | 正式会议版本结果；使用 63 个 EEG 通道 |
+| [UBP](https://openaccess.thecvf.com/content/CVPR2025/html/Wu_Bridging_the_Vision-Brain_Gap_with_an_Uncertainty-Aware_Blur_Prior_CVPR_2025_paper.html) | CVPR 2025 | 50.90% | 79.70% | 17 通道；试次平均；图库使用模糊后的图像表征 |
+| [分层视觉嵌入](https://openreview.net/forum?id=IEq71qS8B7) | ICLR 2026 | 75.70% | 94.60% | 17 通道；融合 RN50、CLIP-B/32 与 VAE |
+| [EEGiT](https://openaccess.thecvf.com/content/CVPR2026/html/Zhou_EEGiT_Teaching_Vision_Transformers_to_Understand_the_EEG_signal_CVPR_2026_paper.html) | CVPR 2026 | 70.40% | 95.10% | 将预训练 ViT 迁移为 EEG 编码器 |
+| [Shallow Alignment](https://arxiv.org/abs/2601.21948) | arXiv 2026 预印本 | 82.60% | 97.70% | 五个随机种子的平均；选择最佳中间层视觉特征 |
+| [HCF](https://arxiv.org/abs/2603.07077) | arXiv 2026 预印本 | 84.60% | 98.20% | 分层融合中间层视觉特征 |
+| [SAMGA](https://arxiv.org/abs/2604.17782) | arXiv 2026 预印本 | **91.30%** | **98.80%** | 五个随机种子的平均；训练 60 个 epoch 并早停 |
+| 我们的项目（标准检索） | 课程项目，固定协议 | $\color{blue}{\mathbf{87.35\%}}$ | $\color{blue}{\mathbf{98.30\%}}$ | 一个随机种子；17 通道；固定第 25 个 epoch 检查点 |
+
+虽然我们的项目没有在这组比较中取得第一名，但 **Top-1 和 Top-5 均排名第二仍然是一项很强的结果**：Top-1 $\color{blue}{\mathbf{87.35\%}}$、Top-5 $\color{blue}{\mathbf{98.30\%}}$。我们的项目超过表中所有经过同行评审的文献结果；唯一更高的是目前尚未经过同行评审的 SAMGA 预印本。这**不是**不加限定的 SOTA 声明：各论文使用的视觉目标、预训练编码器、随机种子数量和检查点选择规则并不完全相同。HCF 和 Shallow Alignment 同样是预印本，而我们的项目只报告一个随机种子。分层视觉嵌入论文的主表报告 Top-5 94.60%，但其列出的十个逐被试 Top-5 数值的算术平均约为 94.91%。
+
+以下两项处理用于避免混淆不同协议：
+
+- 原始 NICE-GA 论文的 EEG Top-1 15.6% 和 Top-5 42.8% **未纳入**。该结果使用每个概念的其他图像构建类别模板，评估 200-way 类别模板识别，而非找回精确的刺激图像。上表的 NICE 行是 Li 等人在 ATM 检索协议下完成的后续精确图像复现。
+- NeurIPS 正式版 ATM 论文在正式 Table 8 中报告 26.13%/55.32%。网上常见的 28.64%/58.47% 来自采用不同统计规则的 arXiv/消融结果，因此未将其混入上表。
+
+该测试划分中每个概念恰好只有一张刺激图像，所以评分时概念身份与图像身份一一对应；但图库表征方式仍会影响任务。本项目直接对真实测试图的嵌入进行排序，不使用类别模板。以上文献数值均为论文报告值，并未在本仓库中逐一重跑。
 
 ### `sub-08` 匈牙利一对一消融实验
 
@@ -507,6 +520,12 @@ python scripts/aggregate_subject_metrics.py \
 - Gifford, A. T., Dwivedi, K., Roig, G., & Cichy, R. M. (2022). [A large and rich EEG dataset for modeling human visual object recognition](https://doi.org/10.1016/j.neuroimage.2022.119754). *NeuroImage, 264*, 119754.
 - Song, Y., Liu, B., Li, X., Shi, N., Wang, Y., & Gao, X. (2024). [Decoding Natural Images from EEG for Object Recognition](https://openreview.net/forum?id=dhLIno8FmH). *ICLR 2024*. 代码：[NICE-EEG](https://github.com/eeyhsong/NICE-EEG)。
 - Li, D., Wei, C., Li, S., Zou, J., & Liu, Q. (2024). [Visual Decoding and Reconstruction via EEG Embeddings with Guided Diffusion](https://proceedings.neurips.cc/paper_files/paper/2024/hash/ba5f1233efa77787ff9ec015877dbd1f-Abstract-Conference.html). *NeurIPS 2024*. 代码：[EEG Image Decode](https://github.com/dongyangli-del/EEG_Image_decode)。
+- Wu, H., Li, Q., Zhang, C., He, Z., & Ying, X. (2025). [Bridging the Vision-Brain Gap with an Uncertainty-Aware Blur Prior](https://openaccess.thecvf.com/content/CVPR2025/html/Wu_Bridging_the_Vision-Brain_Gap_with_an_Uncertainty-Aware_Blur_Prior_CVPR_2025_paper.html). *CVPR 2025*。
+- Zheng, J., Jia, H., Li, M., Zheng, Y., Zeng, Y., Gao, Y., & Liang, C. (2026). [Learning Brain Representation with Hierarchical Visual Embeddings](https://openreview.net/forum?id=IEq71qS8B7). *ICLR 2026*。
+- Zhou, J., Xu, C., Wang, W., Yang, E., & Deng, C. (2026). [EEGiT: Teaching Vision Transformers to Understand the EEG Signal](https://openaccess.thecvf.com/content/CVPR2026/html/Zhou_EEGiT_Teaching_Vision_Transformers_to_Understand_the_EEG_signal_CVPR_2026_paper.html). *CVPR 2026*。
+- Du, Y., Dai, S., Song, Y., Thompson, P. M., Tang, H., & Zhan, L. (2026). [Deep Models, Shallow Alignment: Uncovering the Granularity Mismatch in Neural Decoding](https://arxiv.org/abs/2601.21948). *arXiv 预印本*。
+- Tang, J., Jiang, S., Su, F., & Zhao, Z. (2026). [Aligning What EEG Can See: Structural Representations for Brain-Vision Matching](https://arxiv.org/abs/2603.07077). *arXiv 预印本*。
+- Jiang, L., She, Q., Xu, J., Xu, H., Wu, D., & Kuang, Z. (2026). [Subject-Aware Multi-Granularity Alignment for Zero-Shot EEG-to-Image Retrieval](https://arxiv.org/abs/2604.17782). *arXiv 预印本*。
 
 ## 许可证
 

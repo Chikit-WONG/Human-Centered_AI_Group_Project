@@ -19,38 +19,26 @@ This repository studies whether non-invasive EEG recordings can be mapped into a
 
 ## Method
 
-```mermaid
-flowchart LR
-    EEG["Trial-averaged EEG<br/>17 channels × 250 samples"] --> BM["Brain MLP"]
-    IMG["Stimulus image"] --> CLIP["CLIP ViT-B/32<br/>rank-32 LoRA"]
-    BM --> BE["L2-normalized<br/>512-D brain embedding"]
-    CLIP --> IE["L2-normalized<br/>512-D image embedding"]
-    BE --> LOSS["Batch contrastive alignment"]
-    IE --> LOSS
-    BE --> SIM["Cosine-similarity matrix"]
-    IE --> SIM
-    SIM --> TOPK["Independent per-query ranking<br/>Top-1 / Top-5"]
-    SIM --> HUNG["Optional global one-to-one<br/>Hungarian assignment"]
-```
+![EEG-to-image retrieval architecture: dual-side CLIP alignment for training and Top-1/Top-5 image retrieval at inference](asserts/Architecture.png)
 
 For EEG query embedding $b_i$ and gallery image embedding $v_j$, both L2-normalized, the retrieval score is
 
-$$
+```math
 S_{ij} = b_i^\top v_j.
-$$
+```
 
 Standard retrieval ranks each row independently:
 
-$$
-\hat{j}_i = \operatorname*{arg\,max}_{j} S_{ij}.
-$$
+```math
+\hat{j}_i = \underset{j}{\arg\,\max}\; S_{ij}.
+```
 
 The optional Hungarian decoder instead solves one global bijection:
 
-$$
-\hat{\pi} = \operatorname*{arg\,max}_{\pi \in \mathrm{Perm}(N)}
+```math
+\hat{\pi} = \underset{\pi \in \mathrm{Perm}(N)}{\arg\,\max}
 \sum_{i=1}^{N} S_{i,\pi(i)}.
-$$
+```
 
 The second protocol can assign an image that is not a query's row-wise maximum because it optimizes the complete one-to-one matching.
 
@@ -75,6 +63,31 @@ Each subject has a separately trained model. The official result uses the fixed 
 | **Ten-subject mean / pooled count** | **87.35%** | **98.30%** | **1747/2000** | **1966/2000** |
 
 The between-subject population standard deviation is 3.74 percentage points for Top-1 and 1.19 points for Top-5. The macro mean equals pooled accuracy because every subject contributes 200 queries. The random 200-way baselines are 0.5% Top-1 and 2.5% Top-5.
+
+### Comparison with prior EEG-to-image retrieval work
+
+The table below uses the closest identifiable protocol in the literature: **intra-subject, 200-way, zero-shot retrieval on THINGS-EEG2**, averaged over all ten subjects. Each EEG query is ranked independently against the 200 held-out stimulus images; the Hungarian result is therefore excluded. Values are the headline results from each paper's main comparison table. The largest value in each metric column is bold, and our results are additionally highlighted in blue.
+
+| Method | Publication status | Top-1 | Top-5 | Protocol note |
+|---|---|---:|---:|---|
+| [NICE (exact-image reimplementation by Li et al.)](https://proceedings.neurips.cc/paper_files/paper/2024/file/ba5f1233efa77787ff9ec015877dbd1f-Paper-Conference.pdf) | NeurIPS 2024, Table 8 | 21.52% | 51.57% | Validation-selected checkpoint; exact stimulus-image gallery |
+| [ATM-S](https://proceedings.neurips.cc/paper_files/paper/2024/file/ba5f1233efa77787ff9ec015877dbd1f-Paper-Conference.pdf) | NeurIPS 2024, Table 8 | 26.13% | 55.32% | Formal proceedings result; 63 EEG channels |
+| [UBP](https://openaccess.thecvf.com/content/CVPR2025/html/Wu_Bridging_the_Vision-Brain_Gap_with_an_Uncertainty-Aware_Blur_Prior_CVPR_2025_paper.html) | CVPR 2025 | 50.90% | 79.70% | 17 channels; trial averaging; blurred-image gallery representation |
+| [Hierarchical visual embeddings](https://openreview.net/forum?id=IEq71qS8B7) | ICLR 2026 | 75.70% | 94.60% | 17 channels; RN50 + CLIP-B/32 + VAE fusion |
+| [EEGiT](https://openaccess.thecvf.com/content/CVPR2026/html/Zhou_EEGiT_Teaching_Vision_Transformers_to_Understand_the_EEG_signal_CVPR_2026_paper.html) | CVPR 2026 | 70.40% | 95.10% | Pretrained ViT transferred to the EEG encoder |
+| [Shallow Alignment](https://arxiv.org/abs/2601.21948) | arXiv 2026 preprint | 82.60% | 97.70% | Five-seed mean; best intermediate visual layer |
+| [HCF](https://arxiv.org/abs/2603.07077) | arXiv 2026 preprint | 84.60% | 98.20% | Hierarchically fused intermediate visual features |
+| [SAMGA](https://arxiv.org/abs/2604.17782) | arXiv 2026 preprint | **91.30%** | **98.80%** | Five-seed mean; 60 epochs with early stopping |
+| Our project (standard retrieval) | Course project, fixed protocol | $\color{blue}{\mathbf{87.35\%}}$ | $\color{blue}{\mathbf{98.30\%}}$ | One seed; 17 channels; fixed epoch-25 checkpoint |
+
+Although our project does not take first place in this selected comparison, **ranking second on both metrics is still a strong result**: Top-1 $\color{blue}{\mathbf{87.35\%}}$ and Top-5 $\color{blue}{\mathbf{98.30\%}}$. Our project exceeds every peer-reviewed literature row in the table; the only higher row is SAMGA, which is currently a non-peer-reviewed preprint. This is **not** an unqualified state-of-the-art claim: the papers use different visual targets, pretrained encoders, seed counts, and checkpoint-selection rules. HCF and Shallow Alignment are also preprints, whereas our project reports one seed. The hierarchical-visual-embedding paper reports 94.60% in its main table, although the ten displayed per-subject Top-5 values average to approximately 94.91%.
+
+Two further reporting decisions prevent protocol mixing:
+
+- The original NICE-GA paper's 15.6% Top-1 and 42.8% Top-5 EEG results are **not** included. They evaluate 200-way class-template identification using other images from each concept, rather than retrieving the exact stimulus image. The NICE row above is Li et al.'s later exact-image reimplementation under the ATM retrieval protocol.
+- The final NeurIPS ATM paper reports 26.13%/55.32% in its formal Table 8. The often-cited 28.64%/58.47% comes from a different arXiv/ablation reporting rule, so it is not mixed into this table.
+
+Although every test concept in this split has exactly one stimulus image, making concept identity and image identity one-to-one at scoring time, the gallery representation still matters. Our project ranks the actual test-image embeddings; it does not replace them with class templates. All literature values above are paper-reported rather than rerun inside this repository.
 
 ### Subject 08 Hungarian one-to-one ablation
 
@@ -507,6 +520,12 @@ The direct training and evaluation commands above are the portable reference com
 - Gifford, A. T., Dwivedi, K., Roig, G., & Cichy, R. M. (2022). [A large and rich EEG dataset for modeling human visual object recognition](https://doi.org/10.1016/j.neuroimage.2022.119754). *NeuroImage, 264*, 119754.
 - Song, Y., Liu, B., Li, X., Shi, N., Wang, Y., & Gao, X. (2024). [Decoding Natural Images from EEG for Object Recognition](https://openreview.net/forum?id=dhLIno8FmH). *ICLR 2024*. Code: [NICE-EEG](https://github.com/eeyhsong/NICE-EEG).
 - Li, D., Wei, C., Li, S., Zou, J., & Liu, Q. (2024). [Visual Decoding and Reconstruction via EEG Embeddings with Guided Diffusion](https://proceedings.neurips.cc/paper_files/paper/2024/hash/ba5f1233efa77787ff9ec015877dbd1f-Abstract-Conference.html). *NeurIPS 2024*. Code: [EEG Image Decode](https://github.com/dongyangli-del/EEG_Image_decode).
+- Wu, H., Li, Q., Zhang, C., He, Z., & Ying, X. (2025). [Bridging the Vision-Brain Gap with an Uncertainty-Aware Blur Prior](https://openaccess.thecvf.com/content/CVPR2025/html/Wu_Bridging_the_Vision-Brain_Gap_with_an_Uncertainty-Aware_Blur_Prior_CVPR_2025_paper.html). *CVPR 2025*.
+- Zheng, J., Jia, H., Li, M., Zheng, Y., Zeng, Y., Gao, Y., & Liang, C. (2026). [Learning Brain Representation with Hierarchical Visual Embeddings](https://openreview.net/forum?id=IEq71qS8B7). *ICLR 2026*.
+- Zhou, J., Xu, C., Wang, W., Yang, E., & Deng, C. (2026). [EEGiT: Teaching Vision Transformers to Understand the EEG Signal](https://openaccess.thecvf.com/content/CVPR2026/html/Zhou_EEGiT_Teaching_Vision_Transformers_to_Understand_the_EEG_signal_CVPR_2026_paper.html). *CVPR 2026*.
+- Du, Y., Dai, S., Song, Y., Thompson, P. M., Tang, H., & Zhan, L. (2026). [Deep Models, Shallow Alignment: Uncovering the Granularity Mismatch in Neural Decoding](https://arxiv.org/abs/2601.21948). *arXiv preprint*.
+- Tang, J., Jiang, S., Su, F., & Zhao, Z. (2026). [Aligning What EEG Can See: Structural Representations for Brain-Vision Matching](https://arxiv.org/abs/2603.07077). *arXiv preprint*.
+- Jiang, L., She, Q., Xu, J., Xu, H., Wu, D., & Kuang, Z. (2026). [Subject-Aware Multi-Granularity Alignment for Zero-Shot EEG-to-Image Retrieval](https://arxiv.org/abs/2604.17782). *arXiv preprint*.
 
 ## License
 
