@@ -4,18 +4,18 @@
 
 **AIAA3800 — 以人为中心的人工智能（Human-Centered Artificial Intelligence）**课程项目。
 
-本仓库研究能否将非侵入式 EEG 记录映射到视觉语义嵌入空间，并用它检索受试者观看过的图像。正式标准协议覆盖 THINGS-EEG2 的全部十名受试者（`sub-01` 至 `sub-10`），并为每名受试者分别训练脑编码器与经过 LoRA 适配的 CLIP 视觉编码器。全局一对一匈牙利解码器仅保留为 `sub-08` 的传导式消融实验。
+本仓库研究能否将非侵入式 EEG 记录映射到视觉语义嵌入空间，并用它检索受试者观看过的图像。正式标准协议覆盖 THINGS-EEG2 的全部十名受试者（`sub-01` 至 `sub-10`）和五个随机种子（`42` 至 `46`），并为每个“受试者–随机种子”组合分别训练脑编码器与经过 LoRA 适配的 CLIP 视觉编码器。全局一对一匈牙利解码器仅保留为随机种子 `42`、`sub-08` 的传导式消融实验。
 
-> **范围说明。** 标准 Top-1/Top-5 结果覆盖全部十名受试者，统一使用随机种子 `42`，并同时报告逐被试结果与十人汇总。每名受试者使用独立训练的模型。匈牙利结果仅涵盖 `sub-08`，不计入十人汇总。
+> **范围说明。** 标准 Top-1/Top-5 结果覆盖完整的“10 名受试者 × 5 个随机种子”网格：随机种子为 `42`、`43`、`44`、`45`、`46`，共 50 个独立训练的“受试者–随机种子”模型。主统计量先在每个随机种子内计算十名受试者的宏平均准确率，再报告五个“单 seed 十人宏平均”之间的均值和样本标准差（`ddof=1`）。匈牙利结果仅涵盖随机种子 `42` / `sub-08`，不计入任何标准汇总。
 
 ## 项目亮点
 
 - 将试次平均后的后部脑区 EEG 信号映射到 512 维 CLIP 图像空间。
 - 联合训练脑 MLP 与 CLIP ViT-B/32 上秩为 32 的 LoRA 适配器。
 - 对脑分支和视觉分支采用不同的学习率（TTUR 风格优化）。
-- 为每名受试者报告固定的最终检查点结果，而不是选择测试集表现最好的 epoch。
-- 对十名受试者分别训练和评估，并汇总标准 Top-1/Top-5。
-- 为每个标准运行提供单元测试、独立检查点重载验证和逐查询预测，并为 `sub-08` 匈牙利消融保存相似度矩阵来源记录。
+- 为每个“受试者–随机种子”运行报告固定的最终检查点结果，而不是选择测试集表现最好的 epoch。
+- 对全部 50 个“受试者–随机种子”模型分别训练和评估，再报告逐随机种子十人汇总及五随机种子标准 Top-1/Top-5 汇总。
+- 为每个标准运行提供单元测试、独立检查点重载验证和逐查询预测，并为随机种子 `42` / `sub-08` 的匈牙利消融保存相似度矩阵来源记录。
 
 ## 方法
 
@@ -44,25 +44,46 @@ S_{ij} = b_i^\top v_j.
 
 ## 已验证结果
 
-### 十名受试者的标准独立检索
+### 五随机种子、十名受试者的标准独立检索
 
-每名受试者均独立训练一个模型。正式结果使用第 25 个 epoch 后保存的固定检查点，并为每名受试者在 200 个留出查询和 200 张唯一图库图像上进行评估。每名受试者的两次全新保存/重载评估均得到完全一致的指标与逐查询预测。本次数组任务训练了 `sub-01`–`sub-07` 和 `sub-09`–`sub-10`；`sub-08` 复用此前在相同协议下完成并通过重复验证的运行。
+正式实验覆盖随机种子 `42`、`43`、`44`、`45`、`46`。全部 50 个“受试者–随机种子”组合均独立训练模型，使用第 25 个 epoch 后保存的固定检查点，并在 200 个留出 EEG 查询和 200 张唯一图库图像上评估。每次运行均通过严格产物验证及独立检查点重载重复检查，指标与逐查询预测完全一致。
 
-| 受试者 | Top-1 | Top-5 | Top-1 正确数 | Top-5 正确数 |
+主结果为：
+
+- Top-1：**86.66% ± 0.69 个百分点**；
+- Top-5：**98.38% ± 0.14 个百分点**；
+- 合并计数：Top-1 **8666/10000**、Top-5 **9838/10000**。
+
+± 项是五个“单 seed 十名受试者宏平均准确率”之间的样本标准差（`ddof=1`）。由于每个“受试者–随机种子”运行均包含 200 个查询，五随机种子均值等于合并准确率。10,000 次查询评估会在五个随机种子间重复每名受试者的同一组留出刺激，因此并非 10,000 个独立测试样本。包含 200 张候选图像时，随机基线为 Top-1 0.5%、Top-5 2.5%。
+
+#### 各随机种子的十名受试者平均值
+
+| 随机种子 | Top-1 | Top-5 | Top-1 正确数 | Top-5 正确数 |
+|---:|---:|---:|---:|---:|
+| 42 | 87.35% | 98.30% | 1747/2000 | 1966/2000 |
+| 43 | 85.60% | 98.35% | 1712/2000 | 1967/2000 |
+| 44 | 87.10% | 98.20% | 1742/2000 | 1964/2000 |
+| 45 | 86.40% | 98.55% | 1728/2000 | 1971/2000 |
+| 46 | 86.85% | 98.50% | 1737/2000 | 1970/2000 |
+
+#### 各受试者的五随机种子结果
+
+对每名受试者，± 项是该受试者五个随机种子分数之间的样本标准差（`ddof=1`），单位为百分点。
+
+| 受试者 | Top-1 五随机种子均值 ± 样本标准差 | 范围 | Top-5 五随机种子均值 ± 样本标准差 | 范围 |
 |---|---:|---:|---:|---:|
-| sub-01 | 86.0% | 96.5% | 172/200 | 193/200 |
-| sub-02 | 90.5% | 100.0% | 181/200 | 200/200 |
-| sub-03 | 85.0% | 97.0% | 170/200 | 194/200 |
-| sub-04 | 83.5% | 97.0% | 167/200 | 194/200 |
-| sub-05 | 84.0% | 98.0% | 168/200 | 196/200 |
-| sub-06 | 94.0% | 99.5% | 188/200 | 199/200 |
-| sub-07 | 86.0% | 98.0% | 172/200 | 196/200 |
-| sub-08 | 91.0% | 99.5% | 182/200 | 199/200 |
-| sub-09 | 82.5% | 98.0% | 165/200 | 196/200 |
-| sub-10 | 91.0% | 99.5% | 182/200 | 199/200 |
-| **十名受试者平均 / 合并计数** | **87.35%** | **98.30%** | **1747/2000** | **1966/2000** |
+| sub-01 | 84.0% ± 1.84 | 81.0–86.0% | 96.6% ± 0.42 | 96.0–97.0% |
+| sub-02 | 89.7% ± 0.67 | 89.0–90.5% | 99.7% ± 0.27 | 99.5–100.0% |
+| sub-03 | 85.2% ± 1.25 | 83.5–87.0% | 97.4% ± 0.42 | 97.0–98.0% |
+| sub-04 | 83.4% ± 1.43 | 81.5–85.5% | 96.5% ± 0.35 | 96.0–97.0% |
+| sub-05 | 84.0% ± 1.27 | 82.0–85.5% | 98.3% ± 1.10 | 96.5–99.0% |
+| sub-06 | 92.8% ± 1.15 | 91.5–94.0% | 99.8% ± 0.27 | 99.5–100.0% |
+| sub-07 | 84.8% ± 2.25 | 82.0–87.5% | 98.0% ± 0.35 | 97.5–98.5% |
+| sub-08 | 90.9% ± 1.24 | 89.0–92.0% | 99.9% ± 0.22 | 99.5–100.0% |
+| sub-09 | 80.3% ± 2.02 | 77.0–82.5% | 97.7% ± 0.67 | 96.5–98.0% |
+| sub-10 | 91.5% ± 1.17 | 90.5–93.5% | 99.9% ± 0.22 | 99.5–100.0% |
 
-被试间总体标准差为 Top-1 3.74 个百分点、Top-5 1.19 个百分点。由于每名受试者均贡献 200 个查询，宏平均与合并准确率相同。包含 200 张候选图像时，随机基线为 Top-1 0.5%、Top-5 2.5%。
+元数据说明：复用的旧版随机种子 `42` / `sub-08` 指标没有记录 Conda 环境名和 SciPy 版本；其中已记录的 Python、PyTorch、Transformers、Datasets、PEFT、CUDA 设备和 dtype 均与其余运行一致。独立的数据来源限制见下文。
 
 ### 与既有 EEG 图像检索工作的比较
 
@@ -78,9 +99,9 @@ S_{ij} = b_i^\top v_j.
 | [Shallow Alignment](https://arxiv.org/abs/2601.21948) | arXiv 2026 预印本 | 82.60% | 97.70% | 五个随机种子的平均；选择最佳中间层视觉特征 |
 | [HCF](https://arxiv.org/abs/2603.07077) | arXiv 2026 预印本 | 84.60% | 98.20% | 分层融合中间层视觉特征 |
 | [SAMGA](https://arxiv.org/abs/2604.17782) | arXiv 2026 预印本 | **91.30%** | **98.80%** | 五个随机种子的平均；训练 60 个 epoch 并早停 |
-| 我们的项目（标准检索） | 课程项目，固定协议 | $`\color{blue}{\mathbf{87.35\%}}`$ | $`\color{blue}{\mathbf{98.30\%}}`$ | 一个随机种子；17 通道；固定第 25 个 epoch 检查点 |
+| 我们的项目（标准检索） | 课程项目，固定协议 | $\color{blue}{\mathbf{86.66\%}}$ | $\color{blue}{\mathbf{98.38\%}}$ | 五随机种子均值；17 通道；固定第 25 个 epoch 检查点 |
 
-虽然我们的项目没有在这组比较中取得第一名，但 **Top-1 和 Top-5 均排名第二仍然是一项很强的结果**：Top-1 $`\color{blue}{\mathbf{87.35\%}}`$、Top-5 $`\color{blue}{\mathbf{98.30\%}}`$。我们的项目超过表中所有经过同行评审的文献结果；唯一更高的是目前尚未经过同行评审的 SAMGA 预印本。这**不是**不加限定的 SOTA 声明：各论文使用的视觉目标、预训练编码器、随机种子数量和检查点选择规则并不完全相同。HCF 和 Shallow Alignment 同样是预印本，而我们的项目只报告一个随机种子。分层视觉嵌入论文的主表报告 Top-5 94.60%，但其列出的十个逐被试 Top-5 数值的算术平均约为 94.91%。
+虽然我们的项目没有在这组比较中取得第一名，但 **Top-1 和 Top-5 均排名第二仍然是一项很强的结果**：Top-1 $\color{blue}{\mathbf{86.66\%}}$、Top-5 $\color{blue}{\mathbf{98.38\%}}$。我们的项目超过表中所有经过同行评审的文献结果；唯一更高的是目前尚未经过同行评审的 SAMGA 预印本。这**不是**不加限定的 SOTA 声明：我们的五随机种子均值现在与 Shallow Alignment 和 SAMGA 报告所用的随机种子数量更接近，但各论文在视觉目标、预训练编码器、训练日程和检查点选择规则上仍有差异。HCF 和 Shallow Alignment 同样是预印本。分层视觉嵌入论文的主表报告 Top-5 94.60%，但其列出的十个逐被试 Top-5 数值的算术平均约为 94.91%。
 
 以下两项处理用于避免混淆不同协议：
 
@@ -89,16 +110,16 @@ S_{ij} = b_i^\top v_j.
 
 该测试划分中每个概念恰好只有一张刺激图像，所以评分时概念身份与图像身份一一对应；但图库表征方式仍会影响任务。本项目直接对真实测试图的嵌入进行排序，不使用类别模板。以上文献数值均为论文报告值，并未在本仓库中逐一重跑。
 
-### `sub-08` 匈牙利一对一消融实验
+### 随机种子 `42`、`sub-08` 匈牙利一对一消融实验
 
 ![EEG 图像检索中的匈牙利一对一分配实现流程](asserts/Hungarian_Algorithm.png)
 
-| 评估协议（仅 `sub-08`） | Top-1 / 分配准确率 | Top-5 |
+| 评估协议（仅随机种子 `42`、`sub-08`） | Top-1 / 分配准确率 | Top-5 |
 |---|---:|---:|
 | 标准逐查询独立检索 | **182/200 (91.0%)** | **199/200 (99.5%)** |
 | 全局匈牙利一对一分配 | **200/200 (100.0%)** | 不适用 |
 
-### 如何理解匈牙利算法结果
+### 如何理解随机种子 `42` / `sub-08` 的匈牙利算法结果
 
 匈牙利算法结果是一项**传导式闭集消融实验**，不能替代标准 Top-1：
 
@@ -107,21 +128,22 @@ S_{ij} = b_i^\top v_j.
 - 每张图库图像都必须且只能使用一次；
 - 一次全局分配只为每个查询返回一张图像，因此不存在可直接比较的 Top-5。
 
-在 `sub-08` 的本次运行中，独立 Top-1 预测只覆盖了 183 张不同的图库图像。匈牙利解码改变了 18 个分配，将全部 18 个标准 Top-1 错误转换为正确匹配，同时没有把任何原本正确的匹配改错。预先声明的九种行/列排序产生了相同的映射分配，从而排除了依靠对齐顺序打破平局而得到 100% 结果的解释。
+在随机种子 `42` / `sub-08` 的运行中，独立 Top-1 预测只覆盖了 183 张不同的图库图像。匈牙利解码改变了 18 个分配，将全部 18 个标准 Top-1 错误转换为正确匹配，同时没有把任何原本正确的匹配改错。预先声明的九种行/列排序产生了相同的映射分配，从而排除了依靠对齐顺序打破平局而得到 100% 结果的解释。
 
 因此，推荐采用以下报告方式：
 
-- **主要结果：**十名受试者标准平均 Top-1 87.35%、Top-5 98.30%，并同时报告上表中的逐被试结果、合并计数和总体标准差。
-- **次要消融结果：**`sub-08` 的全局一对一分配准确率 100.0%，并与该被试的标准 Top-1 91.0%、Top-5 99.5% 对照。
+- **主要结果：**五随机种子标准 Top-1 **86.66% ± 0.69 个百分点**、Top-5 **98.38% ± 0.14 个百分点**，并同时报告上文的逐随机种子表、逐被试表和合并计数。
+- **次要消融结果：**随机种子 `42` / `sub-08` 的全局一对一分配准确率 100.0%，并与该次运行的标准 Top-1 91.0%、Top-5 99.5% 对照。
 
-任何十名受试者汇总分数均未使用匈牙利分配。
+任何十名受试者、逐随机种子或五随机种子汇总分数均未使用匈牙利分配。
 
 ## 实验配置
 
 | 组件 | 设置 |
 |---|---|
 | 数据集 | THINGS-EEG2 |
-| 已验证受试者 / 随机种子 | `sub-01`–`sub-10`（分别训练） / `42` |
+| 已验证受试者 / 随机种子 | `sub-01`–`sub-10` / `42, 43, 44, 45, 46` |
+| 独立训练运行数 | 10 名受试者 × 5 个随机种子 = 50 个“受试者–随机种子”模型 |
 | 每名受试者加载后的训练 EEG 张量 | `(16540, 4, 63, 250)` |
 | 每名受试者加载后的测试 EEG 张量 | `(200, 80, 63, 250)` |
 | 试次处理 | 分别对 4 个训练试次和 80 个测试试次取平均 |
@@ -135,8 +157,9 @@ S_{ij} = b_i^\top v_j.
 | 调度器 / 权重衰减 | 余弦 / `0.05` |
 | 训练 / 评估批次大小 | 512 / 100 |
 | 训练 | 25 个 epoch、bf16、梯度检查点 |
-| 评估范围 | 每名受试者 200 个查询 × 200 张图库图像（共 2,000 个查询） |
-| 正式实验硬件 | 每个受试者任务使用一张 NVIDIA A40 |
+| 评估范围 | 每次运行 200 个查询 × 200 张图库图像（50 次运行；共 10,000 次重复查询评估） |
+| 主汇总方式 | 五个“单 seed 十人宏平均准确率”的均值 ± 样本标准差（`ddof=1`） |
+| 正式实验硬件 | 每个“受试者–随机种子”任务使用一张 NVIDIA A40 |
 
 ## 仓库结构
 
@@ -150,15 +173,20 @@ S_{ij} = b_i^\top v_j.
 ├── scripts/
 │   ├── evaluate_retrieval.py       # 标准评估与匈牙利评估
 │   ├── aggregate_subject_metrics.py # 验证并汇总十名受试者指标
+│   ├── aggregate_multiseed_metrics.py # 严格执行五随机种子汇总
 │   ├── finalize_results.py         # 标准结果验证/报告
 │   ├── finalize_hungarian_results.py
 │   ├── run_subject_reproduction.sh # 通用单受试者复现脚本
 │   ├── run_sub08_reproduction.sh   # 旧版 Subject 08 专用脚本
 │   ├── run_hungarian_evaluation.sh # 特定站点的匈牙利评估封装脚本
 │   ├── submit_subject_array.slurm  # 十名受试者 SLURM 数组任务
+│   ├── submit_multiseed_array.slurm # 缺失随机种子的“受试者 × seed”数组任务
 │   └── submit_*.slurm              # 其他 HKUST(GZ) SLURM 启动脚本
 ├── tests/
-│   └── test_hungarian_assignment.py
+│   ├── test_hungarian_assignment.py
+│   ├── test_multiseed_aggregation.py
+│   ├── test_subject_metric_validation.py
+│   └── test_submit_multiseed_array.py
 ├── docs/                            # 内部技术说明
 ├── train_clip_lora.py               # 主要训练入口
 ├── vanilla.py                       # 实验性重建路径
@@ -170,7 +198,7 @@ S_{ij} = b_i^\top v_j.
 
 ## 环境配置
 
-请从仓库根目录运行本节中的命令。每个正式受试者任务使用 Linux、一张 NVIDIA A40，以及以下经过完整测试的软件栈：
+请从仓库根目录运行本节中的命令。每个正式“受试者–随机种子”任务使用 Linux、一张 NVIDIA A40，以及以下经过完整测试的软件栈：
 
 | 软件包 | 已测试版本 |
 |---|---:|
@@ -332,14 +360,17 @@ export PROJECT_ROOT="$(pwd)"
 export THINGS_ROOT="/path/to/things_eeg_data"
 export BRAIN_DIR="$THINGS_ROOT/Preprocessed_data_250Hz_whiten"
 export CLIP_PATH="/path/to/CLIP-ViT-B-32-laion2B-s34B-b79K"
+export SEED=42
 export SUBJECT_ID=1
 printf -v SUBJECT_PADDED '%02d' "$SUBJECT_ID"
-export OUTPUT_DIR="$PROJECT_ROOT/runs/all_subjects/seed42/subj${SUBJECT_PADDED}"
-export RESULTS_DIR="$PROJECT_ROOT/results/all_subjects/seed42/subj${SUBJECT_PADDED}"
+export OUTPUT_DIR="$PROJECT_ROOT/runs/all_subjects/seed${SEED}/subj${SUBJECT_PADDED}"
+export RESULTS_DIR="$PROJECT_ROOT/results/all_subjects/seed${SEED}/subj${SUBJECT_PADDED}"
 export CHANNELS="P7,P5,P3,P1,Pz,P2,P4,P6,P8,PO7,PO3,POz,PO4,PO8,O1,Oz,O2"
 
 mkdir -p "$OUTPUT_DIR/cache" "$RESULTS_DIR"
 ```
+
+每当 `SUBJECT_ID` 或 `SEED` 改变时，都要重新计算 `SUBJECT_PADDED`、`OUTPUT_DIR` 和 `RESULTS_DIR`。
 
 如需完全离线运行：
 
@@ -353,7 +384,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 ## 训练
 
-以下命令无需依赖特定站点封装脚本中的路径，即可复现一名受试者。正式十被试协议需要将 `SUBJECT_ID` 依次设为 1 至 10，并为每名受试者单独运行训练；不要把不同受试者合并到一个模型中。
+以下命令无需依赖特定站点封装脚本中的路径，即可复现一个“受试者–随机种子”运行。正式实验网格需要将 `SUBJECT_ID` 依次设为 1 至 10、将 `SEED` 依次设为 42 至 46，并分别运行全部 50 个组合；不要把不同受试者或随机种子合并到一个模型中。
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=1 \
@@ -378,7 +409,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   --vision_learning_rate 5e-5 \
   --lr_scheduler_type cosine \
   --weight_decay 0.05 \
-  --seed 42 \
+  --seed "$SEED" \
   --dataloader_num_workers 8 \
   --mixed_precision bf16 \
   --output_dir "$OUTPUT_DIR" \
@@ -394,8 +425,8 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 通用封装脚本可以执行 smoke test，也可以执行 25 epochs 的正式训练并随后进行两次全新的 checkpoint 重载评估。默认情况下它会拒绝覆盖已有正式运行：
 
 ```bash
-bash scripts/run_subject_reproduction.sh smoke --subject-id 1
-bash scripts/run_subject_reproduction.sh formal --subject-id 1
+bash scripts/run_subject_reproduction.sh smoke --subject-id 1 --seed "$SEED"
+bash scripts/run_subject_reproduction.sh formal --subject-id 1 --seed "$SEED"
 ```
 
 如果使用新硬件或新准备的数据集，请在正式任务前先运行 smoke test。
@@ -420,7 +451,7 @@ EVAL_ARGS=(
   --device cuda
   --dtype bf16
   --cache-dir "$OUTPUT_DIR/cache"
-  --seed 42
+  --seed "$SEED"
   --expected-num-samples 200
   --local-files-only
 )
@@ -431,13 +462,13 @@ EVAL_ARGS=(
 ```bash
 python scripts/evaluate_retrieval.py \
   "${EVAL_ARGS[@]}" \
-  --metrics-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed42_formal_metrics.json" \
-  --predictions-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed42_formal_predictions.csv"
+  --metrics-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed${SEED}_formal_metrics.json" \
+  --predictions-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed${SEED}_formal_predictions.csv"
 ```
 
 ### 匈牙利一对一消融实验
 
-该消融仅在 `sub-08` 上完成验证。请先设置 `SUBJECT_ID=8`、重新计算 `SUBJECT_PADDED=08`，将 `OUTPUT_DIR` 和 `RESULTS_DIR` 指向该受试者的运行目录，然后重新执行上方完整的 `EVAL_ARGS=(...)` 定义，使 Bash 数组捕获更新后的值。评估器仍会写出标准逐查询指标，同时增加独立的受约束分配命名空间和 CSV：
+该消融仅在随机种子 `42` / `sub-08` 上完成验证。请先设置 `SEED=42` 和 `SUBJECT_ID=8`、重新计算 `SUBJECT_PADDED=08`，将 `OUTPUT_DIR` 和 `RESULTS_DIR` 指向该次运行，然后重新执行上方完整的 `EVAL_ARGS=(...)` 定义，使 Bash 数组捕获更新后的值。评估器仍会写出标准逐查询指标，同时增加独立的受约束分配命名空间和 CSV：
 
 ```bash
 python scripts/evaluate_retrieval.py \
@@ -454,41 +485,64 @@ python scripts/evaluate_retrieval.py \
 ## 测试
 
 ```bash
-python -m unittest -v tests/test_hungarian_assignment.py
+python -m unittest discover -s tests -v
 ```
 
-这些测试涵盖求解器最优性、冲突消解、无效矩阵、非对角 ID 映射，以及唯一最优解下的行/列置换不变性。
+这些测试涵盖匈牙利求解器最优性、冲突消解、无效矩阵、非对角 ID 映射，以及唯一最优解下的行/列置换不变性；同时验证随机种子列表解析、`ddof=1` 样本标准差、逐随机种子汇总顺序、逐被试跨 seed 汇总、预测字段语义，以及默认和自定义随机种子列表下的 SLURM 数组范围与任务映射。
 
 ## SLURM 封装脚本
 
 仓库包含在 HKUST(GZ) 集群上使用的启动脚本：
 
 ```bash
-# 全部十名受试者的标准运行；数组最多同时运行两个任务。
-sbatch scripts/submit_subject_array.slurm smoke
-sbatch scripts/submit_subject_array.slurm formal
+# 一个指定随机种子的全部十名受试者；数组最多同时运行两个任务。
+export SEED=42
+sbatch scripts/submit_subject_array.slurm smoke --seed "$SEED"
+sbatch scripts/submit_subject_array.slurm formal --seed "$SEED"
 
-# Subject 08 专用旧版/匈牙利启动脚本。
+# 本次复现使用以下默认设置，仅运行缺失的随机种子 43--46。
+# 随机种子 42 的十次运行已经验证，因此脚本有意将其排除。
+sbatch scripts/submit_multiseed_array.slurm formal
+
+# 从零运行完整五随机种子网格时，覆盖数组范围并列出全部五个随机种子。
+sbatch --array=0-49%2 scripts/submit_multiseed_array.slurm \
+  formal 42 43 44 45 46
+
+# 随机种子 42、Subject 08 专用旧版/匈牙利启动脚本。
 sbatch scripts/submit_sub08.slurm formal
 sbatch scripts/submit_hungarian_eval.slurm
 ```
 
-全部十名受试者的标准运行完成后，执行验证与汇总：
+汇总分为两个严格层级。首先在每个随机种子内验证并汇总十名受试者：
 
 ```bash
-python scripts/aggregate_subject_metrics.py \
-  --results-root "$PROJECT_ROOT/results/all_subjects/seed42" \
+for SEED in 42 43 44 45 46; do
+  python scripts/aggregate_subject_metrics.py \
+    --results-root "$PROJECT_ROOT/results/all_subjects/seed${SEED}" \
+    --subjects 1-10 \
+    --seed "$SEED" \
+    --expected-epochs 25
+done
+```
+
+逐随机种子聚合器会检查 query/gallery 数量、25 条验证记录、指标与正确数是否一致、检索协议、已保存模型配置、CLIP 基座路径以及关键环境版本。它还会根据预测中的图像 ID、排名和有序 Top-5 列表重新推导 Top-1/Top-5 正确性，验证重复重载预测完全一致，并记录模型配置、模型权重、指标、预测和训练历史的哈希。它会在每个 `results/all_subjects/seed${SEED}/` 目录下生成 `summary.json`、`per_subject_metrics.csv`、`RESULTS_EN.md` 和 `RESULTS_ZH.md`。
+
+然后重新验证完整的 50 次运行网格并计算五随机种子结果：
+
+```bash
+python scripts/aggregate_multiseed_metrics.py \
+  --results-root "$PROJECT_ROOT/results/all_subjects" \
+  --seeds 42,43,44,45,46 \
   --subjects 1-10 \
-  --seed 42 \
   --expected-epochs 25
 ```
 
-聚合器会检查 query/gallery 数量、25 条验证记录、指标与正确数是否一致、两次重载预测是否完全相同、检索协议、已保存模型配置、CLIP 基座路径以及关键环境版本。它会在 `results/all_subjects/seed42/` 下生成 `summary.json`、`per_subject_metrics.csv`、`RESULTS_EN.md` 和 `RESULTS_ZH.md`。
+跨随机种子聚合器会重新打开、从语义上重新验证每个源运行及其哈希，拒绝缺失或重复的“受试者–随机种子”单元格以及不兼容的模型/环境元数据，并检查逐随机种子、逐被试和合并均值是否一致。它会在 `results/all_subjects/seeds42-46/` 下生成 `summary.json`、`per_run_metrics.csv`、`per_seed_metrics.csv`、`per_subject_metrics.csv`、`RESULTS_EN.md` 和 `RESULTS_ZH.md`。主不确定性是五个“单 seed 十人宏平均准确率”之间的样本标准差（`ddof=1`），而不是 50 个单独单元格之间的离散程度。
 
 这些 shell 与 SLURM 文件目前包含特定站点的绝对路径。在其他克隆或集群中使用前，请更新：
 
 - `PROJECT_ROOT`、`THINGS_ROOT`、`BRAIN_DIR` 和 `CLIP_PATH`；
-- `#SBATCH --chdir`、`--output` 和 `--error`；
+- 当随机种子数量变化时，更新 `#SBATCH --array`、`--chdir`、`--output` 和 `--error`；
 - Conda 激活路径与环境名称；
 - 分区、GPU、CPU、内存和时间请求。
 
@@ -498,21 +552,26 @@ python scripts/aggregate_subject_metrics.py \
 
 - 正式指标使用第 25 个 epoch 后的固定最终检查点进行评估。
 - 测试集峰值 epoch 仅用于诊断，不用于选择检查点。
-- 十名受试者使用不同模型，不进行跨被试合并或联合训练。
+- 完整实验网格使用随机种子 `42`、`43`、`44`、`45`、`46`；全部 50 个“受试者–随机种子”组合均训练为独立模型，训练时不进行跨被试或跨随机种子合并。
 - 查询与图库身份通过唯一图像 ID 匹配，而不是假定目标位于对角线上。
-- 每个标准评估均在独立重新加载模型后重复执行。
-- 十名受试者汇总只包含标准独立 Top-1/Top-5。
-- `sub-08` 匈牙利评估会保存完整相似度矩阵、ID 顺序、哈希、转换记录和分配输出。
+- 每个标准评估均在独立重新加载模型后重复执行，并且重复评估必须复现相同的指标与逐查询预测。
+- 主均值由五个“单 seed 十人宏平均准确率”计算；其 ± 项是这五个值的样本标准差（`ddof=1`），而不是 50 个“受试者–随机种子”单元格的标准差。
+- 10,000 次查询评估是十名受试者各自同一组 200 个留出查询在五个随机种子下的重复评估，并非 10,000 个独立测试样本。
+- 所有标准汇总只包含逐查询独立 Top-1/Top-5；匈牙利分配绝不混入逐随机种子或五随机种子结果。
+- 随机种子 `42` / `sub-08` 的匈牙利评估会保存完整相似度矩阵、ID 顺序、哈希、转换记录和分配输出。
 - 真实标签仅在求解分配后使用，不属于匈牙利目标函数的一部分。
 - 审计多种预先声明的行/列顺序，确保输入的对齐顺序无法在完全平局时静默决定结果。
 
 ## 局限性与负责任使用
 
-- 当前结果覆盖 THINGS-EEG2 全部十名受试者，但仅使用一个随机种子，因此未量化跨随机种子不确定性。
+- 五个随机种子可以估计跨随机种子波动，但 `n=5` 仍然较小，所报告的样本标准差本身也存在不确定性。
 - 每名受试者使用独立模型；本实验不评估跨被试泛化。
-- 本次复现所用训练循环在 `backward()` 之前调用梯度裁剪，因此配置的最大梯度范数不会影响这些运行。十名受试者均沿用同一行为；修正调用顺序会形成不同协议，并需要完整重跑。
+- 设置随机种子后，训练过程仍未对所有 GPU 运算强制启用 PyTorch 确定性算法，因此重新训练同一“受试者–随机种子”组合不保证逐比特一致。独立检查点重载评估验证的是已保存产物，而不是一次全新训练的逐比特可复现性。
+- 10,000 次查询评估会在五个随机种子间复用每名受试者的同一组 200 个留出刺激，因此不能将其视为 10,000 个统计独立样本。
+- 本次复现所用训练循环在 `backward()` 之前调用梯度裁剪，因此配置的最大梯度范数不会影响这些运行。全部 50 个“受试者–随机种子”运行均沿用同一行为；修正调用顺序会形成不同协议，并需要完整重跑。
 - 试次平均使用了重复呈现的数据，并不等价于单试次解码。
-- 匈牙利消融仅在 `sub-08` 上验证，不能外推到全部十名受试者。它还需要完整的查询批次和已知的一对一图库先验，因此不是在线单查询检索协议。
+- 匈牙利消融仅在随机种子 `42` / `sub-08` 上验证，不能外推到其他受试者或随机种子。它还需要完整的查询批次和已知的一对一图库先验，因此不是在线单查询检索协议。
+- 复用的旧版随机种子 `42` / `sub-08` 指标记录了一个现已不可用的早期数据集路径，无法回溯验证它与当前 `EEG_Recon-RL` 数据集根目录的历史字节一致性。已保存的模型/结果产物、协议和重复重载检查仍通过验证，但该次运行的数据来源声明受到限制。
 - 数据集、预处理和模型权重的版本可能显著影响结果。
 - 重建路径仍处于实验阶段；本 README 不声称任何正式的重建指标。
 - EEG 属于敏感的人类受试者数据。请遵守数据集关于知情同意、隐私、许可和再分发的要求，且不要将本研究系统解释为临床或诊断工具。

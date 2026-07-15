@@ -127,6 +127,7 @@ def validate_predictions(
     *,
     subject_id: int,
     sample_count: int,
+    gallery_size: int,
     top1_count: int,
     top5_count: int,
 ) -> list[dict[str, str]]:
@@ -143,9 +144,120 @@ def validate_predictions(
         raise ValueError(f"sub-{subject_id:02d}: ground-truth image IDs are not unique")
     if any(int(row["subject_id"]) != subject_id for row in rows):
         raise ValueError(f"sub-{subject_id:02d}: prediction subject IDs disagree")
-    if sum(int(row["correct_top1"]) for row in rows) != top1_count:
+
+    query_indices = [int(row["query_index"]) for row in rows]
+    if query_indices != list(range(sample_count)):
+        raise ValueError(
+            f"sub-{subject_id:02d}: query indices are not the ordered range "
+            f"0..{sample_count - 1}"
+        )
+
+    derived_top1_count = 0
+    derived_top5_count = 0
+    for query_index, row in enumerate(rows):
+        try:
+            top5_image_ids = json.loads(row["top5_image_ids"])
+            top5_similarities = json.loads(row["top5_cosine_similarities"])
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ValueError(
+                f"sub-{subject_id:02d}: invalid JSON list at query {query_index}"
+            ) from error
+        if not isinstance(top5_image_ids, list) or len(top5_image_ids) != 5:
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-5 ID list has invalid length at query "
+                f"{query_index}"
+            )
+        if len(set(top5_image_ids)) != 5:
+            raise ValueError(
+                f"sub-{subject_id:02d}: duplicate Top-5 image ID at query "
+                f"{query_index}"
+            )
+        if not isinstance(top5_similarities, list) or len(top5_similarities) != 5:
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-5 similarity list has invalid length "
+                f"at query {query_index}"
+            )
+        top5_similarities = [float(value) for value in top5_similarities]
+        if not all(math.isfinite(value) for value in top5_similarities):
+            raise ValueError(
+                f"sub-{subject_id:02d}: non-finite Top-5 similarity at query "
+                f"{query_index}"
+            )
+        if any(
+            left < right
+            for left, right in zip(top5_similarities, top5_similarities[1:])
+        ):
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-5 similarities are not descending at "
+                f"query {query_index}"
+            )
+        if row["top1_image_id"] != top5_image_ids[0]:
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-1 is not the first Top-5 item at query "
+                f"{query_index}"
+            )
+        top1_similarity = float(row["top1_cosine_similarity"])
+        gt_similarity = float(row["gt_cosine_similarity"])
+        if not math.isfinite(top1_similarity) or not math.isfinite(gt_similarity):
+            raise ValueError(
+                f"sub-{subject_id:02d}: non-finite recorded similarity at query "
+                f"{query_index}"
+            )
+        if not math.isclose(
+            top1_similarity,
+            top5_similarities[0],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-1 similarity disagrees with Top-5 at "
+                f"query {query_index}"
+            )
+
+        gt_image_id = row["gt_image_id"]
+        gt_rank = int(row["gt_rank"])
+        if not 1 <= gt_rank <= gallery_size:
+            raise ValueError(
+                f"sub-{subject_id:02d}: invalid ground-truth rank at query "
+                f"{query_index}"
+            )
+        derived_top1 = int(row["top1_image_id"] == gt_image_id)
+        derived_top5 = int(gt_image_id in top5_image_ids)
+        if int(row["correct_top1"]) != derived_top1 or (gt_rank == 1) != bool(
+            derived_top1
+        ):
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-1 fields disagree at query {query_index}"
+            )
+        if int(row["correct_top5"]) != derived_top5 or (gt_rank <= 5) != bool(
+            derived_top5
+        ):
+            raise ValueError(
+                f"sub-{subject_id:02d}: Top-5 fields disagree at query {query_index}"
+            )
+        if derived_top5:
+            top5_rank = top5_image_ids.index(gt_image_id) + 1
+            if gt_rank != top5_rank:
+                raise ValueError(
+                    f"sub-{subject_id:02d}: ground-truth rank disagrees with Top-5 "
+                    f"order at query {query_index}"
+                )
+            if not math.isclose(
+                gt_similarity,
+                top5_similarities[top5_rank - 1],
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    f"sub-{subject_id:02d}: ground-truth similarity disagrees with "
+                    f"Top-5 at query {query_index}"
+                )
+        derived_top1_count += derived_top1
+        derived_top5_count += derived_top5
+
+    if derived_top1_count != top1_count:
         raise ValueError(f"sub-{subject_id:02d}: prediction Top-1 count disagrees")
-    if sum(int(row["correct_top5"]) for row in rows) != top5_count:
+    if derived_top5_count != top5_count:
         raise ValueError(f"sub-{subject_id:02d}: prediction Top-5 count disagrees")
     return rows
 
@@ -184,6 +296,7 @@ def validate_repeat(
         prediction_path_for(repeat_metrics_path),
         subject_id=int(first_metrics["subject_id"]),
         sample_count=int(first_metrics["sample_count"]),
+        gallery_size=int(first_metrics["gallery_size"]),
         top1_count=int(first_metrics["top1_count"]),
         top5_count=int(first_metrics["top5_count"]),
     )
@@ -296,12 +409,60 @@ def validate_subject(
             f"sub-{subject_id:02d}: expected {expected_epochs} validation records, "
             f"found {len(history)}"
         )
+    history_steps = [int(record["step"]) for record in history]
+    if any(
+        current <= previous
+        for previous, current in zip(history_steps, history_steps[1:])
+    ):
+        raise ValueError(
+            f"sub-{subject_id:02d}: validation-history steps are not strictly "
+            "increasing"
+        )
+    for record_index, record in enumerate(history):
+        history_samples = int(record["num_samples"])
+        history_top1_count = int(record["top1_count"])
+        history_top5_count = int(record["top5_count"])
+        if history_samples != sample_count:
+            raise ValueError(
+                f"sub-{subject_id:02d}: validation-history sample count differs "
+                f"at record {record_index}"
+            )
+        if not 0 <= history_top1_count <= history_top5_count <= history_samples:
+            raise ValueError(
+                f"sub-{subject_id:02d}: invalid validation-history counts at "
+                f"record {record_index}"
+            )
+        if not math.isclose(
+            float(record["top1_acc"]),
+            history_top1_count / history_samples,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ) or not math.isclose(
+            float(record["top5_acc"]),
+            history_top5_count / history_samples,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                f"sub-{subject_id:02d}: validation-history accuracy/count "
+                f"mismatch at record {record_index}"
+            )
+
+    brain_weights_path = brain_model_dir / "model.safetensors"
+    vision_weights_path = vision_model_dir / "adapter_model.safetensors"
+    for weights_path in (brain_weights_path, vision_weights_path):
+        if not weights_path.is_file():
+            raise FileNotFoundError(
+                f"sub-{subject_id:02d}: saved model weights are missing: "
+                f"{weights_path}"
+            )
 
     predictions_path = prediction_path_for(metrics_path)
     prediction_rows = validate_predictions(
         predictions_path,
         subject_id=subject_id,
         sample_count=sample_count,
+        gallery_size=gallery_size,
         top1_count=top1_count,
         top5_count=top5_count,
     )
@@ -333,6 +494,10 @@ def validate_subject(
         "clip_base_path": str(Path(metrics["paths"]["clip_base"]).resolve()),
         "brain_config_sha256": canonical_json_sha256(brain_config_path),
         "vision_adapter_config_sha256": canonical_json_sha256(vision_config_path),
+        "brain_weights_path": str(brain_weights_path),
+        "brain_weights_sha256": sha256(brain_weights_path),
+        "vision_adapter_weights_path": str(vision_weights_path),
+        "vision_adapter_weights_sha256": sha256(vision_weights_path),
         "metrics_path": str(metrics_path),
         "metrics_sha256": sha256(metrics_path),
         "predictions_path": str(predictions_path),
@@ -466,6 +631,10 @@ def main() -> None:
             "clip_base_path",
             "brain_config_sha256",
             "vision_adapter_config_sha256",
+            "brain_weights_path",
+            "brain_weights_sha256",
+            "vision_adapter_weights_path",
+            "vision_adapter_weights_sha256",
             "metrics_path",
             "metrics_sha256",
             "predictions_path",

@@ -30,13 +30,32 @@ def parse_seeds(value: str) -> list[int]:
         token = token.strip()
         if not token:
             continue
-        seed = int(token)
+        try:
+            seed = int(token)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"seed must be a non-negative integer: {token!r}"
+            ) from error
+        if seed < 0:
+            raise argparse.ArgumentTypeError(
+                f"seed must be non-negative: {seed}"
+            )
         if seed in seeds:
             raise argparse.ArgumentTypeError(f"duplicate seed: {seed}")
         seeds.append(seed)
     if not seeds:
         raise argparse.ArgumentTypeError("at least one seed is required")
     return seeds
+
+
+def default_output_name(seeds: list[int]) -> str:
+    """Return a compact, unambiguous directory name for an ordered seed list."""
+    if len(seeds) == 1:
+        # Avoid colliding with the source RESULTS_ROOT/seedN directory.
+        return f"seeds{seeds[0]}"
+    if all(current == previous + 1 for previous, current in zip(seeds, seeds[1:])):
+        return f"seeds{seeds[0]}-{seeds[-1]}"
+    return "seeds" + "_".join(map(str, seeds))
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +67,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        help="Defaults to RESULTS_ROOT/seeds<first>-<last>.",
+        help=(
+            "Defaults to RESULTS_ROOT/seeds<first>-<last> for an ascending "
+            "contiguous range, or an explicit ordered seed-list name otherwise."
+        ),
     )
     parser.add_argument(
         "--seeds",
@@ -106,6 +128,47 @@ def atomic_csv(
 def sample_stdev(values: Iterable[float]) -> float:
     materialized = list(values)
     return statistics.stdev(materialized) if len(materialized) > 1 else 0.0
+
+
+def build_cross_seed_metric_fields(
+    *,
+    seed_count: int,
+    mean_top1: float,
+    sd_top1: float,
+    mean_top5: float,
+    sd_top5: float,
+    between_subject_sd_top1: float,
+    between_subject_sd_top5: float,
+) -> dict[str, float]:
+    """Build generic primary fields plus five-seed compatibility aliases."""
+    fields = {
+        "cross_seed_mean_top1_percent": mean_top1,
+        "cross_seed_sample_sd_top1_points": sd_top1,
+        "cross_seed_mean_top5_percent": mean_top5,
+        "cross_seed_sample_sd_top5_points": sd_top5,
+        "between_subject_sample_sd_of_cross_seed_means_top1_points": (
+            between_subject_sd_top1
+        ),
+        "between_subject_sample_sd_of_cross_seed_means_top5_points": (
+            between_subject_sd_top5
+        ),
+    }
+    if seed_count == 5:
+        fields.update(
+            {
+                "five_seed_mean_top1_percent": mean_top1,
+                "five_seed_sample_sd_top1_points": sd_top1,
+                "five_seed_mean_top5_percent": mean_top5,
+                "five_seed_sample_sd_top5_points": sd_top5,
+                "between_subject_sample_sd_of_five_seed_means_top1_points": (
+                    between_subject_sd_top1
+                ),
+                "between_subject_sample_sd_of_five_seed_means_top5_points": (
+                    between_subject_sd_top5
+                ),
+            }
+        )
+    return fields
 
 
 def assert_close(actual: float, expected: float, message: str) -> None:
@@ -349,15 +412,21 @@ def render_seed_table(rows: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def render_subject_table(rows: list[dict[str, Any]], *, chinese: bool) -> list[str]:
+def render_subject_table(
+    rows: list[dict[str, Any]], *, chinese: bool, seed_count: int
+) -> list[str]:
+    english_seed_label = "five-seed" if seed_count == 5 else f"{seed_count}-seed"
+    chinese_seed_label = "五-seed" if seed_count == 5 else f"{seed_count}-seed"
     if chinese:
         lines = [
-            "| 受试者 | Top-1 五-seed 均值 ± SD | 范围 | Top-5 五-seed 均值 ± SD | 范围 |",
+            f"| 受试者 | Top-1 {chinese_seed_label} 均值 ± SD | 范围 | "
+            f"Top-5 {chinese_seed_label} 均值 ± SD | 范围 |",
             "|---|---:|---:|---:|---:|",
         ]
     else:
         lines = [
-            "| Subject | Top-1 five-seed mean ± SD | Range | Top-5 five-seed mean ± SD | Range |",
+            f"| Subject | Top-1 {english_seed_label} mean ± SD | Range | "
+            f"Top-5 {english_seed_label} mean ± SD | Range |",
             "|---|---:|---:|---:|---:|",
         ]
     for row in rows:
@@ -375,7 +444,7 @@ def render_subject_table(rows: list[dict[str, Any]], *, chinese: bool) -> list[s
 def main() -> None:
     args = parse_args()
     results_root = Path(args.results_root).resolve()
-    default_name = f"seeds{args.seeds[0]}-{args.seeds[-1]}"
+    default_name = default_output_name(args.seeds)
     output_dir = (
         Path(args.output_dir).resolve()
         if args.output_dir
@@ -442,6 +511,16 @@ def main() -> None:
         "seed-marginal/subject-marginal Top-5",
     )
 
+    seed_count = len(args.seeds)
+    subject_count = len(args.subjects)
+    run_count = len(all_rows)
+    subject_count_en = "ten" if subject_count == 10 else str(subject_count)
+    between_subject_sd_top1 = sample_stdev(
+        float(row["mean_top1_percent"]) for row in subject_rows
+    )
+    between_subject_sd_top5 = sample_stdev(
+        float(row["mean_top5_percent"]) for row in subject_rows
+    )
     aggregate = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -450,18 +529,23 @@ def main() -> None:
         "checkpoint_policy": "fixed final checkpoint",
         "checkpoint_epoch": args.expected_epochs,
         "seeds": args.seeds,
-        "seed_count": len(args.seeds),
+        "seed_count": seed_count,
         "subjects": [f"sub-{subject_id:02d}" for subject_id in args.subjects],
-        "subject_count": len(args.subjects),
-        "run_count": len(all_rows),
+        "subject_count": subject_count,
+        "run_count": run_count,
         "queries_per_run": 200,
         "total_query_evaluations": total_queries,
         "top1_count": total_top1,
         "top5_count": total_top5,
-        "five_seed_mean_top1_percent": grand_top1,
-        "five_seed_sample_sd_top1_points": seed_sd_top1,
-        "five_seed_mean_top5_percent": grand_top5,
-        "five_seed_sample_sd_top5_points": seed_sd_top5,
+        **build_cross_seed_metric_fields(
+            seed_count=seed_count,
+            mean_top1=grand_top1,
+            sd_top1=seed_sd_top1,
+            mean_top5=grand_top5,
+            sd_top5=seed_sd_top5,
+            between_subject_sd_top1=between_subject_sd_top1,
+            between_subject_sd_top5=between_subject_sd_top5,
+        ),
         "pooled_top1_percent": pooled_top1,
         "pooled_top5_percent": pooled_top5,
         "cell_level_descriptive_sample_sd_top1_points": sample_stdev(
@@ -470,14 +554,9 @@ def main() -> None:
         "cell_level_descriptive_sample_sd_top5_points": sample_stdev(
             float(row["top5_percent"]) for row in all_rows
         ),
-        "between_subject_sample_sd_of_five_seed_means_top1_points": sample_stdev(
-            float(row["mean_top1_percent"]) for row in subject_rows
-        ),
-        "between_subject_sample_sd_of_five_seed_means_top5_points": sample_stdev(
-            float(row["mean_top5_percent"]) for row in subject_rows
-        ),
         "primary_sd_definition": (
-            "sample SD (ddof=1) across seed-level ten-subject macro accuracies"
+            "sample SD (ddof=1) across seed-level "
+            f"{subject_count_en}-subject macro accuracies"
         ),
         "repeat_evaluation_verified_for_all_runs": all(
             bool(row["repeat_verified"]) for row in all_rows
@@ -523,6 +602,10 @@ def main() -> None:
         "clip_base_path",
         "brain_config_sha256",
         "vision_adapter_config_sha256",
+        "brain_weights_path",
+        "brain_weights_sha256",
+        "vision_adapter_weights_path",
+        "vision_adapter_weights_sha256",
         "metrics_path",
         "metrics_sha256",
         "predictions_path",
@@ -537,9 +620,19 @@ def main() -> None:
     atomic_csv(output_dir / "per_subject_metrics.csv", subject_fields, subject_rows)
 
     seed_table = render_seed_table(seed_rows)
-    subject_table_en = render_subject_table(subject_rows, chinese=False)
+    subject_table_en = render_subject_table(
+        subject_rows, chinese=False, seed_count=seed_count
+    )
+    seed_word = "seed" if seed_count == 1 else "seeds"
+    run_word = "run" if run_count == 1 else "runs"
+    seed_count_en = "five" if seed_count == 5 else str(seed_count)
+    title_en = (
+        "# Five-Seed, Ten-Subject THINGS-EEG Retrieval Results"
+        if seed_count == 5 and subject_count == 10
+        else f"# {seed_count}-Seed, {subject_count}-Subject THINGS-EEG Retrieval Results"
+    )
     en_lines = [
-        "# Five-Seed, Ten-Subject THINGS-EEG Retrieval Results",
+        title_en,
         "",
         f"Seeds: `{', '.join(map(str, args.seeds))}`. Fixed final checkpoint: "
         f"epoch `{args.expected_epochs}`. Protocol: standard independent 200-way "
@@ -552,26 +645,26 @@ def main() -> None:
         f"- Pooled counts: Top-1 **{total_top1}/{total_queries}**; Top-5 "
         f"**{total_top5}/{total_queries}**.",
         "",
-        "The ± term is the sample SD (ddof=1) across the five seed-level "
-        "ten-subject macro accuracies. The 10,000 query evaluations are repeated "
-        "subject × seed evaluations on the same held-out stimulus set, not 10,000 "
-        "independent test examples.",
+        f"The ± term is the sample SD (ddof=1) across the {seed_count_en} seed-level "
+        f"{subject_count_en}-subject macro accuracies. The {total_queries:,} query "
+        "evaluations are repeated subject × seed evaluations on the same held-out "
+        f"stimulus set, not {total_queries:,} independent test examples.",
         "",
-        "## Per-seed ten-subject means",
+        f"## Per-seed {subject_count_en}-subject means",
         "",
         *seed_table,
         "",
-        "## Per-subject results across five seeds",
+        f"## Per-subject results across {seed_count_en} {seed_word}",
         "",
         *subject_table_en,
         "",
-        "Every one of the 50 subject–seed runs passed strict artifact validation "
-        "and an independent checkpoint-reload repeat check.",
+        f"Every one of the {run_count} subject–seed {run_word} passed strict "
+        "artifact validation and an independent checkpoint-reload repeat check.",
         *(
             [
                 "",
-                "Provenance note: the reused legacy seed-42 sub-08 metrics omit "
-                "the Conda-environment and SciPy metadata fields. Their recorded "
+                "Provenance note: some reused legacy metrics omit the Conda-"
+                "environment or SciPy metadata fields. Their recorded "
                 "Python, PyTorch, Transformers, Datasets, PEFT, CUDA device, and "
                 "dtype values match the other runs.",
             ]
@@ -581,9 +674,9 @@ def main() -> None:
         *(
             [
                 "",
-                "Dataset-provenance limitation: the reused legacy seed-42 sub-08 "
-                "metrics record an earlier dataset root that is no longer available. "
-                "Its historical byte identity with the current EEG_Recon-RL root "
+                "Dataset-provenance limitation: one or more reused legacy metrics "
+                "record an earlier dataset root that is no longer available. Its "
+                "historical byte identity with the current dataset root "
                 "cannot be verified retrospectively; this does not invalidate the "
                 "saved model/result and repeat-reload checks, but it limits the data-"
                 "source claim for that one run.",
@@ -601,9 +694,19 @@ def main() -> None:
         .replace("Correct@5", "Top-5 正确数")
         for line in seed_table
     ]
-    subject_table_zh = render_subject_table(subject_rows, chinese=True)
+    subject_table_zh = render_subject_table(
+        subject_rows, chinese=True, seed_count=seed_count
+    )
+    seed_count_zh = "五" if seed_count == 5 else str(seed_count)
+    seed_quantity_zh = "五个" if seed_count == 5 else f"{seed_count} 个"
+    subject_quantity_zh = "十名" if subject_count == 10 else f"{subject_count} 名"
+    title_zh = (
+        "# THINGS-EEG 十名受试者五随机种子检索结果"
+        if seed_count == 5 and subject_count == 10
+        else f"# THINGS-EEG {subject_count} 名受试者 {seed_count} 个随机种子检索结果"
+    )
     zh_lines = [
-        "# THINGS-EEG 十名受试者五随机种子检索结果",
+        title_zh,
         "",
         f"随机种子：`{', '.join(map(str, args.seeds))}`。固定最终检查点：第 "
         f"`{args.expected_epochs}` 个 epoch。协议：标准 200-way 逐查询独立检索；"
@@ -616,24 +719,26 @@ def main() -> None:
         f"- 合并计数：Top-1 **{total_top1}/{total_queries}**；Top-5 "
         f"**{total_top5}/{total_queries}**。",
         "",
-        "± 项是五个“单 seed 十名受试者宏平均”之间的样本标准差（ddof=1）。"
-        "这里的 10,000 次查询评估是同一留出刺激集上的受试者 × seed 重复评估，"
-        "并非 10,000 个相互独立的测试样本。",
+        f"± 项是{seed_quantity_zh}“单 seed {subject_quantity_zh}受试者宏平均”之间的"
+        f"样本标准差（ddof=1）。这里的 {total_queries:,} 次查询评估是同一留出"
+        f"刺激集上的受试者 × seed 重复评估，并非 {total_queries:,} 个相互独立的"
+        "测试样本。",
         "",
-        "## 各 seed 的十名受试者平均值",
+        f"## 各 seed 的{subject_quantity_zh}受试者平均值",
         "",
         *zh_seed_table,
         "",
-        "## 各受试者的五-seed 结果",
+        f"## 各受试者的{seed_count_zh}-seed 结果",
         "",
         *subject_table_zh,
         "",
-        "全部 50 个 subject–seed 运行均通过严格产物验证及独立检查点重载重复验证。",
+        f"全部 {run_count} 个 subject–seed 运行均通过严格产物验证及独立检查点"
+        "重载重复验证。",
         *(
             [
                 "",
-                "来源说明：复用的 seed-42 sub-08 旧版指标没有记录 Conda 环境名和 "
-                "SciPy 版本；其已记录的 Python、PyTorch、Transformers、Datasets、"
+                "来源说明：部分复用的旧版指标没有记录 Conda 环境名或 SciPy "
+                "版本；其已记录的 Python、PyTorch、Transformers、Datasets、"
                 "PEFT、CUDA 设备和 dtype 均与其余运行一致。",
             ]
             if environment_metadata_exceptions
@@ -642,8 +747,8 @@ def main() -> None:
         *(
             [
                 "",
-                "数据来源局限：复用的 seed-42 sub-08 旧版指标记录了一个现已不可用的"
-                "早期数据根，因而无法事后验证它与当前 EEG_Recon-RL 根逐字节相同。"
+                "数据来源局限：一个或多个复用的旧版指标记录了现已不可用的早期"
+                "数据根，因而无法事后验证它与当前数据根逐字节相同。"
                 "这不影响已保存模型、结果与重复重载检查的有效性，但限制了对这一次运行"
                 "的数据来源声明。",
             ]

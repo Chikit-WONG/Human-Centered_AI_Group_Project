@@ -4,18 +4,18 @@ English | [简体中文](README_ZH.md)
 
 Course project for **AIAA3800 — Human-Centered Artificial Intelligence**.
 
-This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The formal standard protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`). A global one-to-one Hungarian decoder is retained only as a transductive Subject 08 ablation.
+This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The formal standard protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`) at each of five seeds (`42` through `46`). A global one-to-one Hungarian decoder is retained only as a transductive seed-42 Subject-08 ablation.
 
-> **Scope.** Standard Top-1/Top-5 results cover all ten subjects at seed `42` and are reported per subject and as a ten-subject aggregate. Each subject has an independently trained model. The Hungarian result covers only `sub-08` and is excluded from the aggregate.
+> **Scope.** Standard Top-1/Top-5 results cover a complete 10-subject × 5-seed grid: seeds `42`, `43`, `44`, `45`, and `46`, with 50 independently trained subject–seed models. The primary statistic first computes the ten-subject macro accuracy within each seed, then reports the mean and sample standard deviation (`ddof=1`) across the five seed-level accuracies. The Hungarian result covers only seed `42` / `sub-08` and is excluded from every standard aggregate.
 
 ## Highlights
 
 - Maps trial-averaged posterior EEG signals to the 512-dimensional CLIP image space.
 - Jointly trains a brain MLP and rank-32 LoRA adapters on CLIP ViT-B/32.
 - Uses different learning rates for the brain and vision branches (TTUR-style optimization).
-- Reports a fixed final-checkpoint result for every subject rather than selecting the best test epoch.
-- Trains and evaluates all ten subjects independently, then aggregates standard Top-1/Top-5.
-- Provides unit tests, independent checkpoint-reload checks, and per-query predictions for every standard run, plus similarity-matrix provenance for the `sub-08` Hungarian ablation.
+- Reports a fixed final-checkpoint result for every subject–seed run rather than selecting the best test epoch.
+- Trains and evaluates all 50 subject–seed models independently, then reports both per-seed ten-subject and five-seed standard Top-1/Top-5 aggregates.
+- Provides unit tests, independent checkpoint-reload checks, and per-query predictions for every standard run, plus similarity-matrix provenance for the seed-42 / `sub-08` Hungarian ablation.
 
 ## Method
 
@@ -44,25 +44,46 @@ The second protocol can assign an image that is not a query's row-wise maximum b
 
 ## Verified Results
 
-### Ten-subject standard independent retrieval
+### Five-seed, ten-subject standard independent retrieval
 
-Each subject has a separately trained model. The official result uses the fixed checkpoint saved after epoch 25 and evaluates 200 held-out queries against 200 unique gallery images per subject. Two fresh save/reload evaluations produced identical metrics and per-query predictions for every subject. The new array trained `sub-01`–`sub-07` and `sub-09`–`sub-10`; `sub-08` reuses the previously completed, repeat-verified run under the identical protocol.
+The formal study covers seeds `42`, `43`, `44`, `45`, and `46`. Each of the 50 subject–seed combinations has a separately trained model, uses the fixed checkpoint saved after epoch 25, and evaluates 200 held-out EEG queries against 200 unique gallery images. Every run passed strict artifact validation and an independent checkpoint-reload repeat check with identical metrics and per-query predictions.
 
-| Subject | Top-1 | Top-5 | Correct@1 | Correct@5 |
+The primary result is:
+
+- Top-1: **86.66% ± 0.69 percentage points**;
+- Top-5: **98.38% ± 0.14 percentage points**;
+- pooled counts: Top-1 **8666/10000** and Top-5 **9838/10000**.
+
+The ± term is the sample SD (`ddof=1`) across the five seed-level ten-subject macro accuracies. Because every subject–seed run contains 200 queries, the five-seed mean equals the pooled accuracy. The 10,000 query evaluations repeat each subject's same held-out stimulus set across five seeds; they are not 10,000 independent test examples. The random 200-way baselines are 0.5% Top-1 and 2.5% Top-5.
+
+#### Per-seed ten-subject means
+
+| Seed | Top-1 | Top-5 | Correct@1 | Correct@5 |
+|---:|---:|---:|---:|---:|
+| 42 | 87.35% | 98.30% | 1747/2000 | 1966/2000 |
+| 43 | 85.60% | 98.35% | 1712/2000 | 1967/2000 |
+| 44 | 87.10% | 98.20% | 1742/2000 | 1964/2000 |
+| 45 | 86.40% | 98.55% | 1728/2000 | 1971/2000 |
+| 46 | 86.85% | 98.50% | 1737/2000 | 1970/2000 |
+
+#### Per-subject results across five seeds
+
+For each subject, the ± term is the sample SD (`ddof=1`) across that subject's five seed scores, in percentage points.
+
+| Subject | Top-1 five-seed mean ± sample SD | Range | Top-5 five-seed mean ± sample SD | Range |
 |---|---:|---:|---:|---:|
-| sub-01 | 86.0% | 96.5% | 172/200 | 193/200 |
-| sub-02 | 90.5% | 100.0% | 181/200 | 200/200 |
-| sub-03 | 85.0% | 97.0% | 170/200 | 194/200 |
-| sub-04 | 83.5% | 97.0% | 167/200 | 194/200 |
-| sub-05 | 84.0% | 98.0% | 168/200 | 196/200 |
-| sub-06 | 94.0% | 99.5% | 188/200 | 199/200 |
-| sub-07 | 86.0% | 98.0% | 172/200 | 196/200 |
-| sub-08 | 91.0% | 99.5% | 182/200 | 199/200 |
-| sub-09 | 82.5% | 98.0% | 165/200 | 196/200 |
-| sub-10 | 91.0% | 99.5% | 182/200 | 199/200 |
-| **Ten-subject mean / pooled count** | **87.35%** | **98.30%** | **1747/2000** | **1966/2000** |
+| sub-01 | 84.0% ± 1.84 | 81.0–86.0% | 96.6% ± 0.42 | 96.0–97.0% |
+| sub-02 | 89.7% ± 0.67 | 89.0–90.5% | 99.7% ± 0.27 | 99.5–100.0% |
+| sub-03 | 85.2% ± 1.25 | 83.5–87.0% | 97.4% ± 0.42 | 97.0–98.0% |
+| sub-04 | 83.4% ± 1.43 | 81.5–85.5% | 96.5% ± 0.35 | 96.0–97.0% |
+| sub-05 | 84.0% ± 1.27 | 82.0–85.5% | 98.3% ± 1.10 | 96.5–99.0% |
+| sub-06 | 92.8% ± 1.15 | 91.5–94.0% | 99.8% ± 0.27 | 99.5–100.0% |
+| sub-07 | 84.8% ± 2.25 | 82.0–87.5% | 98.0% ± 0.35 | 97.5–98.5% |
+| sub-08 | 90.9% ± 1.24 | 89.0–92.0% | 99.9% ± 0.22 | 99.5–100.0% |
+| sub-09 | 80.3% ± 2.02 | 77.0–82.5% | 97.7% ± 0.67 | 96.5–98.0% |
+| sub-10 | 91.5% ± 1.17 | 90.5–93.5% | 99.9% ± 0.22 | 99.5–100.0% |
 
-The between-subject population standard deviation is 3.74 percentage points for Top-1 and 1.19 points for Top-5. The macro mean equals pooled accuracy because every subject contributes 200 queries. The random 200-way baselines are 0.5% Top-1 and 2.5% Top-5.
+Metadata note: the reused legacy seed-42 / `sub-08` metrics omit the Conda-environment and SciPy-version fields. Their recorded Python, PyTorch, Transformers, Datasets, PEFT, CUDA device, and dtype values match the other runs; the separate dataset-provenance limitation is documented below.
 
 ### Comparison with prior EEG-to-image retrieval work
 
@@ -78,9 +99,9 @@ The table below uses the closest identifiable protocol in the literature: **intr
 | [Shallow Alignment](https://arxiv.org/abs/2601.21948) | arXiv 2026 preprint | 82.60% | 97.70% | Five-seed mean; best intermediate visual layer |
 | [HCF](https://arxiv.org/abs/2603.07077) | arXiv 2026 preprint | 84.60% | 98.20% | Hierarchically fused intermediate visual features |
 | [SAMGA](https://arxiv.org/abs/2604.17782) | arXiv 2026 preprint | **91.30%** | **98.80%** | Five-seed mean; 60 epochs with early stopping |
-| Our project (standard retrieval) | Course project, fixed protocol | $\color{blue}{\mathbf{87.35\%}}$ | $\color{blue}{\mathbf{98.30\%}}$ | One seed; 17 channels; fixed epoch-25 checkpoint |
+| Our project (standard retrieval) | Course project, fixed protocol | $\color{blue}{\mathbf{86.66\%}}$ | $\color{blue}{\mathbf{98.38\%}}$ | Five-seed mean; 17 channels; fixed epoch-25 checkpoint |
 
-Although our project does not take first place in this selected comparison, **ranking second on both metrics is still a strong result**: Top-1 $\color{blue}{\mathbf{87.35\%}}$ and Top-5 $\color{blue}{\mathbf{98.30\%}}$. Our project exceeds every peer-reviewed literature row in the table; the only higher row is SAMGA, which is currently a non-peer-reviewed preprint. This is **not** an unqualified state-of-the-art claim: the papers use different visual targets, pretrained encoders, seed counts, and checkpoint-selection rules. HCF and Shallow Alignment are also preprints, whereas our project reports one seed. The hierarchical-visual-embedding paper reports 94.60% in its main table, although the ten displayed per-subject Top-5 values average to approximately 94.91%.
+Although our project does not take first place in this selected comparison, **ranking second on both metrics is still a strong result**: Top-1 $\color{blue}{\mathbf{86.66\%}}$ and Top-5 $\color{blue}{\mathbf{98.38\%}}$. Our project exceeds every peer-reviewed literature row in the table; the only higher row is SAMGA, which is currently a non-peer-reviewed preprint. This is **not** an unqualified state-of-the-art claim: our five-seed mean is now closer in seed count to the reporting of Shallow Alignment and SAMGA, but the papers still differ in visual targets, pretrained encoders, training schedules, and checkpoint-selection rules. HCF and Shallow Alignment are also preprints. The hierarchical-visual-embedding paper reports 94.60% in its main table, although the ten displayed per-subject Top-5 values average to approximately 94.91%.
 
 Two further reporting decisions prevent protocol mixing:
 
@@ -89,16 +110,16 @@ Two further reporting decisions prevent protocol mixing:
 
 Although every test concept in this split has exactly one stimulus image, making concept identity and image identity one-to-one at scoring time, the gallery representation still matters. Our project ranks the actual test-image embeddings; it does not replace them with class templates. All literature values above are paper-reported rather than rerun inside this repository.
 
-### Subject 08 Hungarian one-to-one ablation
+### Seed-42 Subject-08 Hungarian one-to-one ablation
 
 ![Hungarian one-to-one assignment implementation for EEG-to-image retrieval](asserts/Hungarian_Algorithm.png)
 
-| Evaluation protocol (`sub-08` only) | Top-1 / assignment accuracy | Top-5 |
+| Evaluation protocol (seed `42`, `sub-08` only) | Top-1 / assignment accuracy | Top-5 |
 |---|---:|---:|
 | Standard independent per-query retrieval | **182/200 (91.0%)** | **199/200 (99.5%)** |
 | Global Hungarian one-to-one assignment | **200/200 (100.0%)** | N/A |
 
-### Interpreting the Hungarian result
+### Interpreting the seed-42 / `sub-08` Hungarian result
 
 The Hungarian result is a **transductive closed-set ablation**, not a replacement for standard Top-1:
 
@@ -107,21 +128,22 @@ The Hungarian result is a **transductive closed-set ablation**, not a replacemen
 - every gallery image must be used exactly once;
 - a single global assignment returns one image per query, so it has no directly comparable Top-5.
 
-In the `sub-08` run, independent Top-1 predictions covered only 183 unique gallery images. Hungarian decoding changed 18 assignments, converting all 18 standard Top-1 errors to correct matches without changing any correct match to an error. Nine predeclared row/column orderings produced the same mapped assignment, ruling out an aligned-order tie-break explanation for the 100% result.
+In the seed-42 / `sub-08` run, independent Top-1 predictions covered only 183 unique gallery images. Hungarian decoding changed 18 assignments, converting all 18 standard Top-1 errors to correct matches without changing any correct match to an error. Nine predeclared row/column orderings produced the same mapped assignment, ruling out an aligned-order tie-break explanation for the 100% result.
 
 The recommended reporting convention is therefore:
 
-- **Primary result:** ten-subject standard mean Top-1 87.35% and Top-5 98.30%, accompanied by the per-subject table, pooled counts, and population standard deviations above.
-- **Secondary ablation:** `sub-08` global one-to-one assignment accuracy 100.0%, compared with that subject's standard Top-1 91.0% and Top-5 99.5%.
+- **Primary result:** five-seed standard Top-1 **86.66% ± 0.69 percentage points** and Top-5 **98.38% ± 0.14 percentage points**, accompanied by the per-seed and per-subject tables and pooled counts above.
+- **Secondary ablation:** seed-42 / `sub-08` global one-to-one assignment accuracy 100.0%, compared with that run's standard Top-1 91.0% and Top-5 99.5%.
 
-Hungarian assignment is not used in any ten-subject score.
+Hungarian assignment is not used in any ten-subject, per-seed, or five-seed score.
 
 ## Experiment Configuration
 
 | Component | Setting |
 |---|---|
 | Dataset | THINGS-EEG2 |
-| Verified subjects / seed | `sub-01`–`sub-10` (trained separately) / `42` |
+| Verified subjects / seeds | `sub-01`–`sub-10` / `42, 43, 44, 45, 46` |
+| Independent training runs | 10 subjects × 5 seeds = 50 subject–seed models |
 | Per-subject loaded train EEG tensor | `(16540, 4, 63, 250)` |
 | Per-subject loaded test EEG tensor | `(200, 80, 63, 250)` |
 | Trial handling | Average 4 train trials and 80 test trials separately |
@@ -135,8 +157,9 @@ Hungarian assignment is not used in any ten-subject score.
 | Scheduler / weight decay | Cosine / `0.05` |
 | Train / evaluation batch size | 512 / 100 |
 | Training | 25 epochs, bf16, gradient checkpointing |
-| Evaluation scope | 200 queries × 200-image gallery per subject (2,000 queries total) |
-| Formal hardware | One NVIDIA A40 per subject job |
+| Evaluation scope | 200 queries × 200-image gallery per run (50 runs; 10,000 repeated query evaluations) |
+| Primary aggregation | Mean ± sample SD (`ddof=1`) across five seed-level ten-subject macro accuracies |
+| Formal hardware | One NVIDIA A40 per subject–seed job |
 
 ## Repository Layout
 
@@ -150,15 +173,20 @@ Hungarian assignment is not used in any ten-subject score.
 ├── scripts/
 │   ├── evaluate_retrieval.py       # Standard and Hungarian evaluation
 │   ├── aggregate_subject_metrics.py # Validate/aggregate ten-subject metrics
+│   ├── aggregate_multiseed_metrics.py # Strict five-seed aggregation
 │   ├── finalize_results.py         # Standard-result validation/reporting
 │   ├── finalize_hungarian_results.py
 │   ├── run_subject_reproduction.sh # Generic single-subject reproduction
 │   ├── run_sub08_reproduction.sh   # Legacy Subject 08-specific wrapper
 │   ├── run_hungarian_evaluation.sh # Site-specific Hungarian wrapper
 │   ├── submit_subject_array.slurm  # Ten-subject SLURM array launcher
+│   ├── submit_multiseed_array.slurm # Missing-seed subject × seed array
 │   └── submit_*.slurm              # Other HKUST(GZ) SLURM launchers
 ├── tests/
-│   └── test_hungarian_assignment.py
+│   ├── test_hungarian_assignment.py
+│   ├── test_multiseed_aggregation.py
+│   ├── test_subject_metric_validation.py
+│   └── test_submit_multiseed_array.py
 ├── docs/                            # Internal technical notes
 ├── train_clip_lora.py               # Main training entry point
 ├── vanilla.py                       # Experimental reconstruction path
@@ -170,7 +198,7 @@ Generated checkpoints, caches, logs, plans, and result artifacts are intentional
 
 ## Environment Setup
 
-Run the commands in this section from the repository root. Each formal subject run used Linux, one NVIDIA A40, and the following fully tested software stack:
+Run the commands in this section from the repository root. Each formal subject–seed run used Linux, one NVIDIA A40, and the following fully tested software stack:
 
 | Package | Tested version |
 |---|---:|
@@ -332,14 +360,17 @@ export PROJECT_ROOT="$(pwd)"
 export THINGS_ROOT="/path/to/things_eeg_data"
 export BRAIN_DIR="$THINGS_ROOT/Preprocessed_data_250Hz_whiten"
 export CLIP_PATH="/path/to/CLIP-ViT-B-32-laion2B-s34B-b79K"
+export SEED=42
 export SUBJECT_ID=1
 printf -v SUBJECT_PADDED '%02d' "$SUBJECT_ID"
-export OUTPUT_DIR="$PROJECT_ROOT/runs/all_subjects/seed42/subj${SUBJECT_PADDED}"
-export RESULTS_DIR="$PROJECT_ROOT/results/all_subjects/seed42/subj${SUBJECT_PADDED}"
+export OUTPUT_DIR="$PROJECT_ROOT/runs/all_subjects/seed${SEED}/subj${SUBJECT_PADDED}"
+export RESULTS_DIR="$PROJECT_ROOT/results/all_subjects/seed${SEED}/subj${SUBJECT_PADDED}"
 export CHANNELS="P7,P5,P3,P1,Pz,P2,P4,P6,P8,PO7,PO3,POz,PO4,PO8,O1,Oz,O2"
 
 mkdir -p "$OUTPUT_DIR/cache" "$RESULTS_DIR"
 ```
+
+Recompute `SUBJECT_PADDED`, `OUTPUT_DIR`, and `RESULTS_DIR` whenever `SUBJECT_ID` or `SEED` changes.
 
 For a fully offline run:
 
@@ -353,7 +384,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 ## Training
 
-The following command reproduces one subject without relying on site-specific wrapper paths. For the formal ten-subject protocol, set `SUBJECT_ID` to each value from 1 through 10 and run a separate training job; do not combine subjects in one model.
+The following command reproduces one subject–seed run without relying on site-specific wrapper paths. For the formal grid, set `SUBJECT_ID` to each value from 1 through 10 and `SEED` to each value from 42 through 46, then run all 50 combinations separately; do not combine subjects or seeds in one model.
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=1 \
@@ -378,7 +409,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   --vision_learning_rate 5e-5 \
   --lr_scheduler_type cosine \
   --weight_decay 0.05 \
-  --seed 42 \
+  --seed "$SEED" \
   --dataloader_num_workers 8 \
   --mixed_precision bf16 \
   --output_dir "$OUTPUT_DIR" \
@@ -394,8 +425,8 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 The generic wrapper performs a smoke run or a 25-epoch formal run followed by two fresh checkpoint-reload evaluations. It refuses to overwrite an existing formal run by default:
 
 ```bash
-bash scripts/run_subject_reproduction.sh smoke --subject-id 1
-bash scripts/run_subject_reproduction.sh formal --subject-id 1
+bash scripts/run_subject_reproduction.sh smoke --subject-id 1 --seed "$SEED"
+bash scripts/run_subject_reproduction.sh formal --subject-id 1 --seed "$SEED"
 ```
 
 Run a smoke test before the formal job if using new hardware or a newly prepared dataset.
@@ -420,7 +451,7 @@ EVAL_ARGS=(
   --device cuda
   --dtype bf16
   --cache-dir "$OUTPUT_DIR/cache"
-  --seed 42
+  --seed "$SEED"
   --expected-num-samples 200
   --local-files-only
 )
@@ -431,13 +462,13 @@ EVAL_ARGS=(
 ```bash
 python scripts/evaluate_retrieval.py \
   "${EVAL_ARGS[@]}" \
-  --metrics-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed42_formal_metrics.json" \
-  --predictions-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed42_formal_predictions.csv"
+  --metrics-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed${SEED}_formal_metrics.json" \
+  --predictions-output "$RESULTS_DIR/sub${SUBJECT_PADDED}_seed${SEED}_formal_predictions.csv"
 ```
 
 ### Hungarian one-to-one ablation
 
-This ablation was verified only for `sub-08`. First set `SUBJECT_ID=8`, recompute `SUBJECT_PADDED=08`, point `OUTPUT_DIR` and `RESULTS_DIR` to its run, and then rebuild the complete `EVAL_ARGS=(...)` array above so Bash captures the updated values. The evaluator still writes the standard per-query metrics while adding a separate constrained-assignment namespace and CSV:
+This ablation was verified only for seed `42` / `sub-08`. First set `SEED=42` and `SUBJECT_ID=8`, recompute `SUBJECT_PADDED=08`, point `OUTPUT_DIR` and `RESULTS_DIR` to that run, and then rebuild the complete `EVAL_ARGS=(...)` array above so Bash captures the updated values. The evaluator still writes the standard per-query metrics while adding a separate constrained-assignment namespace and CSV:
 
 ```bash
 python scripts/evaluate_retrieval.py \
@@ -454,41 +485,64 @@ Do not label `assignment_accuracy` as standard Top-1, and do not invent a Hungar
 ## Tests
 
 ```bash
-python -m unittest -v tests/test_hungarian_assignment.py
+python -m unittest discover -s tests -v
 ```
 
-The tests cover solver optimality, collision resolution, invalid matrices, non-diagonal ID mappings, and row/column permutation invariance for a unique optimum.
+The tests cover Hungarian solver optimality, collision resolution, invalid matrices, non-diagonal ID mappings, and row/column permutation invariance for a unique optimum. They also verify seed-list parsing, `ddof=1` sample-standard-deviation behavior, seed-level aggregation order, per-subject cross-seed summaries, prediction-field semantics, and SLURM array range/task mapping for default and custom seed lists.
 
 ## SLURM Wrappers
 
 The repository includes launchers used on the HKUST(GZ) cluster:
 
 ```bash
-# All ten standard subject runs; the array permits at most two concurrent jobs.
-sbatch scripts/submit_subject_array.slurm smoke
-sbatch scripts/submit_subject_array.slurm formal
+# One chosen seed across all ten subjects; at most two concurrent jobs.
+export SEED=42
+sbatch scripts/submit_subject_array.slurm smoke --seed "$SEED"
+sbatch scripts/submit_subject_array.slurm formal --seed "$SEED"
 
-# Subject 08-specific legacy/Hungarian launchers.
+# Reproduction used this default to run only missing seeds 43--46.
+# Seed 42 is deliberately excluded because its ten runs were already verified.
+sbatch scripts/submit_multiseed_array.slurm formal
+
+# For a fresh five-seed grid, override the array range and list all five seeds.
+sbatch --array=0-49%2 scripts/submit_multiseed_array.slurm \
+  formal 42 43 44 45 46
+
+# Seed-42 Subject-08-specific legacy/Hungarian launchers.
 sbatch scripts/submit_sub08.slurm formal
 sbatch scripts/submit_hungarian_eval.slurm
 ```
 
-After all ten standard runs finish, validate and aggregate them:
+Aggregation has two strict levels. First validate and aggregate the ten subjects within each seed:
 
 ```bash
-python scripts/aggregate_subject_metrics.py \
-  --results-root "$PROJECT_ROOT/results/all_subjects/seed42" \
+for SEED in 42 43 44 45 46; do
+  python scripts/aggregate_subject_metrics.py \
+    --results-root "$PROJECT_ROOT/results/all_subjects/seed${SEED}" \
+    --subjects 1-10 \
+    --seed "$SEED" \
+    --expected-epochs 25
+done
+```
+
+The per-seed aggregator checks query/gallery cardinality, all 25 validation records, metric/count agreement, retrieval protocol, saved model configurations, CLIP base path, and key environment versions. It also rederives Top-1/Top-5 correctness from the prediction IDs, ranks, and ordered Top-5 lists; verifies repeat-reload prediction identity; and records hashes for model configurations, model weights, metrics, predictions, and training history. It writes `summary.json`, `per_subject_metrics.csv`, `RESULTS_EN.md`, and `RESULTS_ZH.md` under each `results/all_subjects/seed${SEED}/` directory.
+
+Then revalidate the complete 50-run grid and compute the five-seed result:
+
+```bash
+python scripts/aggregate_multiseed_metrics.py \
+  --results-root "$PROJECT_ROOT/results/all_subjects" \
+  --seeds 42,43,44,45,46 \
   --subjects 1-10 \
-  --seed 42 \
   --expected-epochs 25
 ```
 
-The aggregator checks query/gallery cardinality, all 25 validation records, metric/count agreement, repeat-reload prediction identity, retrieval protocol, saved model configurations, CLIP base path, and key environment versions. It writes `summary.json`, `per_subject_metrics.csv`, `RESULTS_EN.md`, and `RESULTS_ZH.md` under `results/all_subjects/seed42/`.
+The cross-seed aggregator reopens and semantically revalidates every source run and its hashes, rejects missing or duplicate subject–seed cells and incompatible model/environment metadata, and checks that seed-level, subject-level, and pooled means agree. It writes `summary.json`, `per_run_metrics.csv`, `per_seed_metrics.csv`, `per_subject_metrics.csv`, `RESULTS_EN.md`, and `RESULTS_ZH.md` under `results/all_subjects/seeds42-46/`. Its primary uncertainty is the sample SD (`ddof=1`) across the five seed-level ten-subject macro accuracies, not the spread across the 50 individual cells.
 
 These shell and SLURM files currently contain site-specific absolute paths. Before using them in another clone or cluster, update:
 
 - `PROJECT_ROOT`, `THINGS_ROOT`, `BRAIN_DIR`, and `CLIP_PATH`;
-- `#SBATCH --chdir`, `--output`, and `--error`;
+- `#SBATCH --array`, `--chdir`, `--output`, and `--error` when changing the seed count;
 - the Conda activation path and environment name;
 - partition, GPU, CPU, memory, and time requests.
 
@@ -498,21 +552,26 @@ The direct training and evaluation commands above are the portable reference com
 
 - The official metric is evaluated from the fixed final checkpoint after epoch 25.
 - Test-set peak epochs are diagnostic only and are not used for checkpoint selection.
-- The ten subjects use distinct models; there is no cross-subject pooling or joint training.
+- The complete grid uses seeds `42`, `43`, `44`, `45`, and `46`; all 50 subject–seed combinations are trained as distinct models, with no cross-subject or cross-seed pooling during training.
 - Query and gallery identity are matched by unique image ID rather than by assuming a diagonal target.
-- Every standard evaluation is repeated after an independent model reload.
-- The ten-subject aggregate contains only standard independent Top-1/Top-5 scores.
-- The `sub-08` Hungarian evaluation saves the full similarity matrix, ID ordering, hashes, transition ledger, and assignment output.
+- Every standard evaluation is repeated after an independent model reload, and the repeat must reproduce both metrics and per-query predictions.
+- The primary mean is computed from the five seed-level ten-subject macro accuracies; its ± term is their sample SD (`ddof=1`), not the SD across 50 subject–seed cells.
+- The 10,000 query evaluations are five repeated seed evaluations of the same 200 held-out queries for each of ten subjects, not 10,000 independent test examples.
+- Every standard aggregate contains only independent per-query Top-1/Top-5 scores; Hungarian assignment is never mixed into a per-seed or five-seed result.
+- The seed-42 / `sub-08` Hungarian evaluation saves the full similarity matrix, ID ordering, hashes, transition ledger, and assignment output.
 - Ground-truth labels are used only after the assignment is solved; they are not part of the Hungarian objective.
 - Multiple predeclared row/column orderings are audited so aligned input order cannot silently determine an exact tie.
 
 ## Limitations and Responsible Use
 
-- Results cover all ten THINGS-EEG2 subjects but only one random seed, so across-seed uncertainty is not measured.
+- Five seeds provide an across-seed estimate, but `n=5` is still small and the reported sample SD is itself uncertain.
 - Each subject uses an independent model; this experiment does not evaluate cross-subject generalization.
-- The reproduced training loop invokes gradient clipping before `backward()`, so the configured maximum gradient norm does not affect these runs. All ten subjects use this same behavior; correcting the order would define a different protocol and require a full rerun.
+- Seeded training does not enforce PyTorch deterministic algorithms for every GPU operation, so retraining the same subject and seed is not guaranteed to be bitwise identical. The independent checkpoint-reload evaluation verifies saved artifacts, not bitwise reproducibility of a new training run.
+- The 10,000 query evaluations reuse each subject's same 200 held-out stimuli across five seeds and therefore must not be treated as 10,000 statistically independent examples.
+- The reproduced training loop invokes gradient clipping before `backward()`, so the configured maximum gradient norm does not affect these runs. All 50 subject–seed runs use this same behavior; correcting the order would define a different protocol and require a full rerun.
 - Trial averaging uses repeated presentations and is not equivalent to single-trial decoding.
-- The Hungarian ablation was verified only for `sub-08`; it must not be extrapolated to all ten subjects. It also requires the complete query batch and a known one-to-one gallery prior, so it is not an online single-query retrieval protocol.
+- The Hungarian ablation was verified only for seed `42` / `sub-08`; it must not be extrapolated to other subjects or seeds. It also requires the complete query batch and a known one-to-one gallery prior, so it is not an online single-query retrieval protocol.
+- The reused legacy seed-42 / `sub-08` metrics record an earlier dataset root that is no longer available. Its historical byte identity with the current `EEG_Recon-RL` dataset root cannot be verified retrospectively; the saved model/result artifacts, protocol, and repeat-reload checks remain validated, but the data-source claim for that one run is limited.
 - Dataset, preprocessing, and model-weight versions can materially affect the result.
 - The reconstruction path is experimental; no formal reconstruction metric is claimed in this README.
 - EEG is sensitive human-participant data. Follow the dataset's consent, privacy, licensing, and redistribution requirements, and do not interpret this research system as a clinical or diagnostic tool.
