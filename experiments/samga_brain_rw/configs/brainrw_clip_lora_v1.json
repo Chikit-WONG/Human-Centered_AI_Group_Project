@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "config_type": "brainrw_clip_lora",
+  "config_id": "brainrw_clip_lora_v1",
+  "clip": {
+    "model_id": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+    "path": "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/CLIP-ViT-B-32-laion2B-s34B-b79K",
+    "config_sha256": "1284cbff35169abb23a1c5525a8b0f543c7bd191d4b9aed63880c1571bc4191c",
+    "weights_sha256": "74813fbcdc750f235c9784c367ca1394d2a5c25eb0aac92761752ac239db7cff"
+  },
+  "brain_mlp": {
+    "dropout": 0.1
+  },
+  "lora": {
+    "targets": ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "visual_projection"],
+    "rank": 32,
+    "alpha": 32,
+    "dropout": 0.0
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "brain_learning_rate": 0.0005,
+    "visual_learning_rate": 0.00005,
+    "weight_decay": 0.05,
+    "schedule": "cosine"
+  },
+  "training": {
+    "epochs": 25,
+    "epoch_policy": "fixed",
+    "precision": "bf16",
+    "batch_size": 512,
+    "trial_averaging": 4,
+    "channels": ["P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2"]
+  }
+}

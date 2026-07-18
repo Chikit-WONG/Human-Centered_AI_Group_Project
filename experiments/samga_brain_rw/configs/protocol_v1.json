@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "split_salt": "AIAA3800-SAMGA-SPLIT-v1\n",
+  "stimulus_salt": "AIAA3800-SAMGA-STIM-v1\n",
+  "expected_non_test_concepts": 1654,
+  "split_sizes": {
+    "train": 1254,
+    "val-dev": 200,
+    "val-confirm": 200
+  },
+  "pilot_subjects": [1, 5, 8],
+  "pilot_seeds": [42, 43],
+  "confirmation_subjects": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "confirmation_seeds": [42, 43, 44, 45, 46],
+  "historical_top1": 0.8902,
+  "historical_top5": 0.9887,
+  "paper_top1": 0.913,
+  "paper_top5": 0.988,
+  "pilot_gate": {
+    "stage1_min_top1_delta": 0.003,
+    "other_min_top1_delta": 0.005,
+    "minimum_positive_cells": 4,
+    "minimum_top5_delta": -0.002,
+    "minimum_subject_mean_top1_delta": -0.02
+  },
+  "confirmation_gate": {
+    "minimum_top1_delta": 0.005,
+    "ci95_lower_must_exceed": 0.0,
+    "minimum_top5_delta": -0.002,
+    "minimum_positive_subjects": 8,
+    "minimum_subject_mean_top1_delta": -0.02
+  },
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 20260719,
+    "resampling": "independent_subject_and_seed_indices_with_replacement_cartesian_mean",
+    "quantile_method": "linear"
+  },
+  "retrieval": {
+    "method": "standard_independent_cosine",
+    "similarity": "cosine",
+    "assignment": "independent",
+    "hungarian": false
+  },
+  "output_paths": {
+    "artifacts": "artifacts/samga_brain_rw",
+    "logs": "logs/samga_brain_rw",
+    "results": "results/samga_brain_rw"
+  }
+}

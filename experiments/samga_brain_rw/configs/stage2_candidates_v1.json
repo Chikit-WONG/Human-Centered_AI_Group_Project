@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "config_type": "stage2_candidates",
+  "config_id": "stage2_candidates_v1",
+  "combination_policy": "one_factor_only_no_post_hoc_combinations",
+  "layernorm": [
+    {"config_id": "s2-layernorm-off", "enabled": false, "role": "baseline", "fit_scope": "none"},
+    {"config_id": "s2-layernorm-on", "enabled": true, "role": "candidate", "fit_scope": "runtime_no_fit"}
+  ],
+  "whitening": [
+    {"config_id": "s2-whitening-off", "enabled": false, "role": "baseline", "fit_scope": "none"},
+    {"config_id": "s2-whitening-on", "enabled": true, "role": "candidate", "fit_scope": "train_only"}
+  ],
+  "preprojectors": [
+    {"config_id": "s2-preproj-shared", "mode": "shared", "role": "baseline"},
+    {"config_id": "s2-preproj-separate", "mode": "separate_per_layer", "role": "candidate"}
+  ],
+  "checkpoint_averaging": [
+    {"config_id": "s2-raw-epoch60-control", "method": "raw", "window": 1, "epochs": [60], "role": "control"},
+    {"config_id": "s2-avg-last5", "method": "arithmetic", "window": 5, "epochs": [56, 57, 58, 59, 60], "role": "candidate"},
+    {"config_id": "s2-avg-last10", "method": "arithmetic", "window": 10, "epochs": [51, 52, 53, 54, 55, 56, 57, 58, 59, 60], "role": "candidate"},
+    {"config_id": "s2-swa-last5", "method": "swa", "window": 5, "epochs": [56, 57, 58, 59, 60], "role": "candidate"},
+    {"config_id": "s2-swa-last10", "method": "swa", "window": 10, "epochs": [51, 52, 53, 54, 55, 56, 57, 58, 59, 60], "role": "candidate"}
+  ],
+  "feature_adapter": {
+    "label": "cached InternViT feature adapter",
+    "formula": "h'_l = h_l + gamma_l * B_l GELU(A_l LayerNorm(h_l))",
+    "zero_initialized": "B_l",
+    "gamma_initial": 1.0,
+    "ranks": [8, 16, 32],
+    "learning_rate_ratios": [0.05, 0.1],
+    "candidates": [
+      {"config_id": "s2-adapter-r8-lr0.05", "rank": 8, "learning_rate_ratio": 0.05},
+      {"config_id": "s2-adapter-r8-lr0.10", "rank": 8, "learning_rate_ratio": 0.1},
+      {"config_id": "s2-adapter-r16-lr0.05", "rank": 16, "learning_rate_ratio": 0.05},
+      {"config_id": "s2-adapter-r16-lr0.10", "rank": 16, "learning_rate_ratio": 0.1},
+      {"config_id": "s2-adapter-r32-lr0.05", "rank": 32, "learning_rate_ratio": 0.05},
+      {"config_id": "s2-adapter-r32-lr0.10", "rank": 32, "learning_rate_ratio": 0.1}
+    ],
+    "controls": [
+      {"config_id": "s2-adapter-identity-control", "kind": "identity", "parameter_match_tolerance": 0.0},
+      {"config_id": "s2-adapter-global-dense-control", "kind": "global_dense", "parameter_match_tolerance": 0.01},
+      {"config_id": "s2-adapter-matched-projector-control", "kind": "matched_projector", "parameter_match_tolerance": 0.01}
+    ],
+    "tie_break": ["higher_val_dev_top5", "lower_parameter_count", "config_id"]
+  }
+}

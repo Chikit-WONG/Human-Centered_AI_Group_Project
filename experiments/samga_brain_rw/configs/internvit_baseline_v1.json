@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "config_type": "internvit_baseline",
+  "config_id": "internvit_baseline_v1",
+  "upstream": {
+    "path": "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/reference_code/codes_for_papers/SAMGA",
+    "git_commit": "1a63745b7ff6f98dad34b0f0b8246a9b5260d9c1"
+  },
+  "model": {
+    "repo": "OpenGVLab/InternViT-6B-448px-V2_5",
+    "revision": "9d1a4344077479c93d42584b6941c64d795d508d",
+    "path": "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/InternViT-6B-448px-V2_5/9d1a4344077479c93d42584b6941c64d795d508d",
+    "config_sha256": "4fc4a1187b20575c0da8d27df2ad17f5ad6e8ac1c8b2af707bc8b263bd40c0a2",
+    "preprocessor_sha256": "0658115064c561026539aeeead9ed3b1a8e0cc90967df8c142849199f955d2b4",
+    "weight_sha256": {
+      "model-00001-of-00003.safetensors": "9818659d13d932da8bc0c3b8ee15f5b5d68d8c94d66eb525be566066630111da",
+      "model-00002-of-00003.safetensors": "4f0c10e72d6f6513f421baa6ec843d5508657435059c1d18b6b5fd7789f9d5b7",
+      "model-00003-of-00003.safetensors": "d21c4fe0bc4af1425cfae1a59a8f5fbb00fde9d8e2888325a60913ac61b0494d"
+    }
+  },
+  "cache": {
+    "path": "artifacts/samga_reproduction/features/internvit_v2_5_multi_variant/variants/train_idx0_patch_mean/features.npy",
+    "sha256": "539c7b62ae41c8112e22b3ddc3a6566d997465a10c36d16c8f2378855ba94c71",
+    "generator_git_revision": "a97b97a110c0fea7d4adafd5abce477c6cce525c",
+    "canonical_train_manifest_sha256": "42fd7316314eb02d69ee2234d4d8430afcfcc2a5f6834e9c7be64f38eccdbc85",
+    "shape": [16540, 5, 3200],
+    "dtype": "float16",
+    "layer_route": "idx0",
+    "pooling": "patch_mean",
+    "normalization": "none"
+  },
+  "task": {
+    "layer_ids": [20, 24, 28, 32, 36],
+    "image_dim": 3200,
+    "prior_center": 28,
+    "router_eval_mode": "global",
+    "force_global": true,
+    "channels": ["P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2"],
+    "trial_averaging": 4,
+    "smooth_probability": 0.3,
+    "batch_size": 512,
+    "epochs": 60,
+    "stage1_epochs": 20,
+    "stage1_learning_rate": 0.0001,
+    "stage2_learning_rate": 0.00005,
+    "mmd_start": 0.9,
+    "mmd_end": 0.5,
+    "image_l2_normalization": true,
+    "eeg_l2_normalization": false
+  }
+}
