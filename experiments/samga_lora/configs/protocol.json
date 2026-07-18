@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "dataset": "THINGS-EEG2",
+  "setting": "intra-subject",
+  "retrieval_protocol": "standard_independent_exact_image",
+  "gallery_size": 200,
+  "subjects": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "formal_seeds": [42, 43, 44, 45, 46],
+  "pilot_subjects": [1, 5, 8],
+  "pilot_seeds": [42, 43],
+  "pilot_vision_lr_ratios": [0.05, 0.1, 0.2],
+  "candidate_epochs": [20, 25, 30, 35, 40, 45, 50, 55, 60],
+  "channels": [
+    "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
+    "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2"
+  ],
+  "trial_average": true,
+  "visual_backbone": "CLIP ViT-B/32 laion2B-s34B-b79K",
+  "clip_layers": [4, 6, 8, 10, 12],
+  "clip_prior_center": 8,
+  "lora_rank": 32,
+  "lora_alpha": 32,
+  "lora_targets": ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+  "batch_size": 512,
+  "stage1_epochs": 20,
+  "stage1_lr": 0.0001,
+  "stage2_lr": 0.00005,
+  "stage1_mmd_start": 0.9,
+  "stage1_mmd_end": 0.5,
+  "contrastive_eeg_l2norm": false,
+  "contrastive_image_l2norm": true,
+  "pilot_gate": {
+    "minimum_mean_top1_delta": 0.005,
+    "minimum_positive_cells": 4,
+    "minimum_subject_mean_delta": -0.02
+  },
+  "formal_success": {
+    "minimum_mean_top1_delta": 0.005,
+    "top1_ci95_lower_must_exceed": 0.0,
+    "minimum_mean_top5_delta": -0.002
+  }
+}

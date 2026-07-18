@@ -83,8 +83,9 @@ The optional second argument selects an A40 partition when the shared queue is
 blocked by reservations, for example `... submit_formal_chunk.sh 0
 i64m1tga40ue`. The default remains the low-priority shared partition.
 
-The full rationale and thresholds are in the paired English and Chinese plans in
-`plan/`.
+The full rationale and thresholds are in the paired
+[English protocol plan](../../docs/protocols/SAMGA_LORA_EXPERIMENT_PLAN_EN.md)
+and [中文协议计划](../../docs/protocols/SAMGA_LORA_EXPERIMENT_PLAN_ZH.md).
 
 ## Environment
 

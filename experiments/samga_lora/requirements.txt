@@ -1,0 +1,14 @@
+# Runtime versions verified in the cluster's `test` environment for this experiment.
+# Install a CUDA-compatible PyTorch/TorchVision build for the target GPU first.
+torch==2.10.0
+torchvision==0.25.0
+transformers==4.57.6
+peft==0.18.1
+accelerate==1.13.0
+numpy==1.26.4
+scipy==1.15.3
+Pillow==10.4.0
+safetensors==0.5.3
+einops==0.8.2
+timm==1.0.26
+tqdm==4.67.1
