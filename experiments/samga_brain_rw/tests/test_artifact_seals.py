@@ -3,10 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+
+import samga_brain_rw.artifacts as artifacts_module
 
 from samga_brain_rw.artifacts import (
     ArtifactIntegrityError,
@@ -17,6 +22,7 @@ from samga_brain_rw.artifacts import (
     FinalRunSeal,
     FormalCellLedger,
     FormalInputLedger,
+    FormalInputLedgerSnapshot,
     FormalPreparationAudit,
     FormalPreparationSeal,
     RefitArtifactLedger,
@@ -441,3 +447,493 @@ def test_formal_grid_and_claims_are_exactly_candidate_control_10_by_5(
             subject=1,
             seed=47,
         )
+
+
+def test_artifact_reader_rejects_symlinked_parent_components(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    seal = ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        real / "seal.json",
+    )
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ArtifactIntegrityError, match="symlink"):
+        ConfirmationSeal.verify(alias / seal.path.name)
+
+
+def test_artifact_reader_rejects_change_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seal = ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        tmp_path / "seal.json",
+    )
+    original_read = artifacts_module.os.read
+    changed = False
+
+    def read_then_touch(fd: int, count: int) -> bytes:
+        nonlocal changed
+        chunk = original_read(fd, count)
+        if chunk and not changed:
+            changed = True
+            current = seal.path.stat()
+            os.utime(
+                seal.path,
+                ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000),
+            )
+        return chunk
+
+    monkeypatch.setattr(artifacts_module.os, "read", read_then_touch)
+    with pytest.raises(ArtifactIntegrityError, match="changed during read"):
+        ConfirmationSeal.verify(seal.path)
+
+
+def test_artifact_reader_rejects_short_read_against_stable_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "bytes.bin"
+    path.write_bytes(b"x" * 128)
+    original_read = artifacts_module.os.read
+    calls = 0
+
+    def truncated_read(fd: int, count: int) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_read(fd, 16)
+        return b""
+
+    monkeypatch.setattr(artifacts_module.os, "read", truncated_read)
+    with pytest.raises(ArtifactIntegrityError, match="byte count"):
+        artifacts_module._read_regular_file(path)
+
+
+def test_verifier_rejects_noncanonical_raw_json(tmp_path: Path) -> None:
+    seal = ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        tmp_path / "seal.json",
+    )
+    document = json.loads(seal.path.read_text(encoding="utf-8"))
+    seal.path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError, match="canonical"):
+        ConfirmationSeal.verify(seal.path)
+
+
+def test_verifier_requires_exact_integer_schema(tmp_path: Path) -> None:
+    seal = ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        tmp_path / "seal.json",
+    )
+    document = json.loads(seal.path.read_text(encoding="utf-8"))
+    document["schema_version"] = True
+    seal.path.write_bytes(artifacts_module.canonical_json_bytes(document))
+
+    with pytest.raises(ArtifactIntegrityError, match="schema_version"):
+        ConfirmationSeal.verify(seal.path)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_verifier_rejects_non_finite_json_constants(
+    tmp_path: Path,
+    constant: str,
+) -> None:
+    seal = ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        tmp_path / "seal.json",
+    )
+    raw = seal.path.read_text(encoding="utf-8").replace(
+        '"schema_version":1',
+        f'"schema_version":{constant}',
+    )
+    seal.path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError, match="non-finite"):
+        ConfirmationSeal.verify(seal.path)
+
+
+def test_frozen_records_expose_recursively_immutable_payloads(
+    tmp_path: Path,
+) -> None:
+    seal = ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        tmp_path / "seal.json",
+    )
+
+    with pytest.raises(TypeError):
+        seal.payload["registry_sha256"] = _h("mutated")  # type: ignore[index]
+    survivors = seal.payload["survivor_config_sha256"]
+    assert isinstance(survivors, tuple)
+    with pytest.raises(AttributeError):
+        survivors.append(_h("mutated"))  # type: ignore[union-attr]
+
+
+def test_publication_rejects_symlinked_parent(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ArtifactIntegrityError, match="symlink"):
+        ConfirmationSeal.create(
+            [_h("candidate")],
+            _h("registry"),
+            _h("job-map"),
+            alias / "seal.json",
+        )
+    assert not (real / "seal.json").exists()
+
+
+def test_publication_unlinks_temp_before_parent_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_fsync = artifacts_module.os.fsync
+    directory_fsyncs = 0
+
+    def checked_fsync(fd: int) -> None:
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fsyncs += 1
+            assert not list(tmp_path.glob(".seal.json.tmp-*"))
+        original_fsync(fd)
+
+    monkeypatch.setattr(artifacts_module.os, "fsync", checked_fsync)
+    ConfirmationSeal.create(
+        [_h("candidate")],
+        _h("registry"),
+        _h("job-map"),
+        tmp_path / "seal.json",
+    )
+    assert directory_fsyncs == 1
+
+
+def test_failed_publication_unlinks_fsyncs_and_closes_parent_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "seal.json"
+    ConfirmationSeal.create(
+        [_h("winner")],
+        _h("registry"),
+        _h("job-map"),
+        output,
+    )
+    original_fsync = artifacts_module.os.fsync
+    directory_fsyncs = 0
+
+    def checked_fsync(fd: int) -> None:
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fsyncs += 1
+            assert not list(tmp_path.glob(".seal.json.tmp-*"))
+        original_fsync(fd)
+
+    monkeypatch.setattr(artifacts_module.os, "fsync", checked_fsync)
+    before_fds = set(os.listdir("/proc/self/fd"))
+    with pytest.raises(FileExistsError):
+        ConfirmationSeal.create(
+            [_h("loser")],
+            _h("registry"),
+            _h("job-map"),
+            output,
+        )
+    after_fds = set(os.listdir("/proc/self/fd"))
+
+    assert directory_fsyncs == 1
+    assert after_fds == before_fds
+
+
+def test_confirmation_claim_loads_and_completes_across_processes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "confirmation"
+    job_map_sha256 = _h("confirmation-job-map")
+    claim = ConfirmationCellLedger(
+        root,
+        job_map_sha256=job_map_sha256,
+    ).claim(
+        seal_sha256=_h("confirmation-seal"),
+        stage=2,
+        role="candidate",
+        subject=8,
+        seed=42,
+    )
+    code = """
+import sys
+from pathlib import Path
+from samga_brain_rw.artifacts import ConfirmationCellLedger
+ledger = ConfirmationCellLedger(Path(sys.argv[1]), job_map_sha256=sys.argv[2])
+claim = ledger.load_claim(stage=2, role="candidate", subject=8, seed=42)
+claim.complete({"metrics_sha256": sys.argv[3]})
+"""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(root),
+            job_map_sha256,
+            _h("metrics"),
+        ],
+        check=True,
+        env={**os.environ, "PYTHONPATH": "experiments/samga_brain_rw"},
+    )
+    assert claim.is_complete()
+
+
+def test_formal_cell_ledger_loads_current_recovered_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "formal-cells"
+    job_map_sha256 = _h("formal-job-map")
+    ledger = FormalCellLedger(root, formal_job_map_sha256=job_map_sha256)
+    first = ledger.claim(
+        final_run_seal_sha256=_h("final-seal"),
+        final_run_audit_sha256=_h("final-audit"),
+        role="control",
+        subject=3,
+        seed=44,
+    )
+    recovered = ledger.recover(first, _h("recovery-audit"))
+
+    loaded = FormalCellLedger(
+        root,
+        formal_job_map_sha256=job_map_sha256,
+    ).load_claim(role="control", subject=3, seed=44)
+
+    assert loaded.generation == 2
+    assert loaded.sha256 == recovered.sha256
+    loaded.assert_unconsumed()
+
+
+def test_formal_input_ledger_loads_current_recovered_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "formal-input"
+    ledger = FormalInputLedger(root)
+    first = ledger.claim(
+        preparation_seal_sha256=_h("preparation-seal"),
+        preparation_audit_sha256=_h("preparation-audit"),
+        recipe_id="candidate-cache",
+    )
+    recovered = ledger.recover(first, _h("recovery-audit"))
+
+    loaded = FormalInputLedger(root).load_claim("candidate-cache")
+
+    assert loaded.generation == 2
+    assert loaded.sha256 == recovered.sha256
+    loaded.assert_unconsumed()
+
+
+def _complete_formal_input_recipe(
+    ledger: FormalInputLedger,
+    recipe_id: str,
+) -> None:
+    claim = ledger.claim(
+        preparation_seal_sha256=_h("preparation-seal"),
+        preparation_audit_sha256=_h("preparation-audit"),
+        recipe_id=recipe_id,
+    )
+    claim.complete(
+        manifest_sha256=_h(f"{recipe_id}-manifest"),
+        ordered_ids_sha256=_h(f"{recipe_id}-ordered-ids"),
+        preprocessing_sha256=_h(f"{recipe_id}-preprocessing"),
+        base_model_sha256=_h(f"{recipe_id}-base"),
+        payload_sha256=_h(f"{recipe_id}-payload"),
+    )
+
+
+def test_formal_input_snapshot_verifies_self_contained_claim_and_completion(
+    tmp_path: Path,
+) -> None:
+    ledger = FormalInputLedger(tmp_path / "formal-input")
+    _complete_formal_input_recipe(ledger, "candidate-cache")
+    snapshot = ledger.finalize(tmp_path / "ledger.json")
+
+    verified = FormalInputLedgerSnapshot.verify(
+        snapshot.path,
+        expected_payload_sha256=snapshot.payload_sha256,
+    )
+
+    assert verified.sha256 == snapshot.sha256
+    entry = verified.payload["entries"][0]
+    assert entry["claim_generation"] == 1
+    assert entry["claim_path"].endswith("generation-000001/claim.json")
+    assert entry["claim_payload"]["recipe_id"] == "candidate-cache"
+    assert entry["completion_payload"]["claim_sha256"] == entry["claim_sha256"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda entry: entry.update({"unknown": True}),
+        lambda entry: entry.update({"claim_sha256": _h("wrong-claim")}),
+        lambda entry: entry["claim_payload"].update(
+            {"preparation_seal_sha256": _h("wrong-seal")}
+        ),
+        lambda entry: entry.update({"completion_sha256": _h("wrong-completion")}),
+        lambda entry: entry.update(
+            {"claim_path": "recipe-wrong/generation-000001/claim.json"}
+        ),
+    ],
+)
+def test_formal_input_snapshot_rejects_broken_embedded_bindings(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    ledger = FormalInputLedger(tmp_path / "formal-input")
+    _complete_formal_input_recipe(ledger, "candidate-cache")
+    snapshot = ledger.finalize(tmp_path / "ledger.json")
+    document = json.loads(snapshot.path.read_text(encoding="utf-8"))
+    mutation(document["payload"]["entries"][0])
+    document["payload_sha256"] = artifacts_module.sha256_json(document["payload"])
+    snapshot.path.write_bytes(artifacts_module.canonical_json_bytes(document))
+
+    with pytest.raises(ArtifactIntegrityError):
+        FormalInputLedgerSnapshot.verify(snapshot.path)
+
+
+def test_formal_input_snapshot_rejects_unsorted_entries(
+    tmp_path: Path,
+) -> None:
+    ledger = FormalInputLedger(tmp_path / "formal-input")
+    _complete_formal_input_recipe(ledger, "a-recipe")
+    _complete_formal_input_recipe(ledger, "b-recipe")
+    snapshot = ledger.finalize(tmp_path / "ledger.json")
+    document = json.loads(snapshot.path.read_text(encoding="utf-8"))
+    document["payload"]["entries"].reverse()
+    document["payload_sha256"] = artifacts_module.sha256_json(document["payload"])
+    snapshot.path.write_bytes(artifacts_module.canonical_json_bytes(document))
+
+    with pytest.raises(ArtifactIntegrityError, match="sorted"):
+        FormalInputLedgerSnapshot.verify(snapshot.path)
+
+
+def test_claim_loader_rejects_unknown_fields_and_broken_recovery_chain(
+    tmp_path: Path,
+) -> None:
+    confirmation_root = tmp_path / "confirmation"
+    confirmation = ConfirmationCellLedger(
+        confirmation_root,
+        job_map_sha256=_h("confirmation-map"),
+    )
+    confirmation_claim = confirmation.claim(
+        seal_sha256=_h("confirmation-seal"),
+        stage=1,
+        role="candidate",
+        subject=1,
+        seed=42,
+    )
+    document = json.loads(
+        confirmation_claim.path.read_text(encoding="utf-8")
+    )
+    document["payload"]["unknown"] = True
+    document["payload_sha256"] = artifacts_module.sha256_json(
+        document["payload"]
+    )
+    confirmation_claim.path.write_bytes(
+        artifacts_module.canonical_json_bytes(document)
+    )
+    with pytest.raises(ArtifactIntegrityError, match="keys"):
+        ConfirmationCellLedger(
+            confirmation_root,
+            job_map_sha256=_h("confirmation-map"),
+        ).load_claim(stage=1, role="candidate", subject=1, seed=42)
+
+    formal_root = tmp_path / "formal"
+    formal = FormalCellLedger(
+        formal_root,
+        formal_job_map_sha256=_h("formal-map"),
+    )
+    first = formal.claim(
+        final_run_seal_sha256=_h("final-seal"),
+        final_run_audit_sha256=_h("final-audit"),
+        role="candidate",
+        subject=2,
+        seed=43,
+    )
+    recovered = formal.recover(first, _h("recovery-audit"))
+    recovered_document = json.loads(
+        recovered.path.read_text(encoding="utf-8")
+    )
+    recovered_document["payload"]["recovered_from_claim_sha256"] = _h(
+        "wrong-previous-claim"
+    )
+    recovered_document["payload_sha256"] = artifacts_module.sha256_json(
+        recovered_document["payload"]
+    )
+    recovered.path.write_bytes(
+        artifacts_module.canonical_json_bytes(recovered_document)
+    )
+    with pytest.raises(ArtifactIntegrityError, match="recovery chain"):
+        FormalCellLedger(
+            formal_root,
+            formal_job_map_sha256=_h("formal-map"),
+        ).load_claim(role="candidate", subject=2, seed=43)
+
+
+
+def test_claim_loader_requires_exact_integer_recovery_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "formal"
+    job_map_sha256 = _h("formal-map")
+    ledger = FormalCellLedger(
+        root,
+        formal_job_map_sha256=job_map_sha256,
+    )
+    first = ledger.claim(
+        final_run_seal_sha256=_h("final-seal"),
+        final_run_audit_sha256=_h("final-audit"),
+        role="candidate",
+        subject=2,
+        seed=43,
+    )
+    recovered = ledger.recover(first, _h("recovery-audit"))
+
+    recovery_document = json.loads(
+        first.recovery_path.read_text(encoding="utf-8")
+    )
+    recovery_document["payload"]["next_generation"] = 2.0
+    recovery_document["payload_sha256"] = artifacts_module.sha256_json(
+        recovery_document["payload"]
+    )
+    recovery_bytes = artifacts_module.canonical_json_bytes(recovery_document)
+    first.recovery_path.write_bytes(recovery_bytes)
+
+    recovered_document = json.loads(
+        recovered.path.read_text(encoding="utf-8")
+    )
+    recovered_document["payload"]["recovery_record_sha256"] = (
+        hashlib.sha256(recovery_bytes).hexdigest()
+    )
+    recovered_document["payload_sha256"] = artifacts_module.sha256_json(
+        recovered_document["payload"]
+    )
+    recovered.path.write_bytes(
+        artifacts_module.canonical_json_bytes(recovered_document)
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="generation"):
+        FormalCellLedger(
+            root,
+            formal_job_map_sha256=job_map_sha256,
+        ).load_claim(role="candidate", subject=2, seed=43)

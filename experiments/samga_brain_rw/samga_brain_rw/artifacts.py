@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, ClassVar, Iterator
 
 from .hashing import canonical_json_bytes, sha256_json
@@ -93,10 +94,18 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
+def _reject_non_finite_json(value: str) -> object:
+    raise ArtifactIntegrityError(f"non-finite JSON value is forbidden: {value}")
+
+
 def _strict_load_bytes(data: bytes, path: Path) -> dict[str, object]:
     try:
         decoded = data.decode("utf-8")
-        value = json.loads(decoded, object_pairs_hook=_strict_object)
+        value = json.loads(
+            decoded,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_non_finite_json,
+        )
     except ArtifactIntegrityError:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -106,19 +115,73 @@ def _strict_load_bytes(data: bytes, path: Path) -> dict[str, object]:
     return value
 
 
-def _read_regular_file(path: Path) -> bytes:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_directory_nofollow(path: Path) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    flags = os.O_RDONLY | _O_CLOEXEC | _O_DIRECTORY
     try:
-        fd = os.open(path, flags)
+        directory_fd = os.open(absolute.anchor, flags)
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(
+                    component,
+                    flags | _O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                raise ArtifactIntegrityError(
+                    f"symlink or invalid directory component: {absolute}"
+                ) from exc
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        if "directory_fd" in locals():
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+        raise
+
+
+def _open_regular_file_nofollow(path: Path) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.name:
+        raise ArtifactIntegrityError(f"artifact path has no filename: {path}")
+    directory_fd = _open_directory_nofollow(absolute.parent)
+    try:
+        return os.open(
+            absolute.name,
+            os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
     except OSError as exc:
-        raise ArtifactIntegrityError(f"cannot open immutable artifact: {path}") from exc
+        raise ArtifactIntegrityError(
+            f"cannot open immutable artifact without symlinks: {path}"
+        ) from exc
+    finally:
+        os.close(directory_fd)
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_regular_file(path: Path) -> bytes:
+    fd = _open_regular_file_nofollow(Path(path))
     try:
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ArtifactIntegrityError(f"artifact is not a regular file: {path}")
         chunks: list[bytes] = []
         while True:
@@ -126,16 +189,21 @@ def _read_regular_file(path: Path) -> bytes:
             if not chunk:
                 break
             chunks.append(chunk)
-        return b"".join(chunks)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+        if _file_identity(before) != _file_identity(after):
+            raise ArtifactIntegrityError(f"artifact changed during read: {path}")
+        if len(data) != before.st_size:
+            raise ArtifactIntegrityError(
+                f"artifact byte count differs from stable file size: {path}"
+            )
+        return data
     finally:
         os.close(fd)
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    fd = os.open(path, flags)
+    fd = _open_directory_nofollow(Path(path))
     try:
         os.fsync(fd)
     finally:
@@ -150,30 +218,83 @@ def _exclusive_publish(path: Path, data: bytes) -> None:
     """
 
     path = Path(path)
+    if not path.name:
+        raise ArtifactIntegrityError("immutable artifact path has no filename")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.tmp-",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
+    parent_fd = _open_directory_nofollow(path.parent)
+    fd = -1
+    temporary_name_only: str | None = None
     try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.tmp-",
+            dir=path.parent,
+        )
+        temporary_name_only = Path(temporary_name).name
+        temporary_stat = os.stat(
+            temporary_name_only,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if _file_identity(temporary_stat)[:2] != _file_identity(os.fstat(fd))[:2]:
+            raise ArtifactIntegrityError("temporary artifact escaped parent directory")
         with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        try:
-            os.link(temporary, path, follow_symlinks=False)
-        except TypeError:
-            os.link(temporary, path)
-        _fsync_directory(path.parent)
+        os.link(
+            temporary_name_only,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
     finally:
+        if fd >= 0:
+            os.close(fd)
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            if temporary_name_only is not None:
+                try:
+                    os.unlink(temporary_name_only, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            try:
+                if temporary_name_only is not None:
+                    os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
 
 
-def _artifact_document(artifact_type: str, payload: dict[str, object]) -> dict[str, object]:
+def _deep_freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw(item) for item in value]
+    return value
+
+
+def _freeze_payload(payload: Mapping[str, object]) -> Mapping[str, object]:
+    frozen = _deep_freeze(payload)
+    if not isinstance(frozen, Mapping):
+        raise TypeError("record payload must freeze to a mapping")
+    return frozen
+
+
+def _artifact_document(
+    artifact_type: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
     return {
         "artifact_type": artifact_type,
         "payload": payload,
@@ -186,13 +307,13 @@ def _create_record(
     artifact_type: str,
     payload: dict[str, object],
     output_path: Path,
-) -> tuple[Path, dict[str, object], str, str]:
+) -> tuple[Path, Mapping[str, object], str, str]:
     document = _artifact_document(artifact_type, payload)
     data = canonical_json_bytes(document)
     _exclusive_publish(Path(output_path), data)
     return (
         Path(output_path),
-        payload,
+        _freeze_payload(payload),
         str(document["payload_sha256"]),
         hashlib.sha256(data).hexdigest(),
     )
@@ -209,7 +330,18 @@ def _read_record(
     data = _read_regular_file(Path(path))
     document = _strict_load_bytes(data, Path(path))
     _require_exact_keys(document, _DOCUMENT_KEYS, artifact_type)
-    if document["schema_version"] != SCHEMA_VERSION:
+    try:
+        canonical = canonical_json_bytes(document)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            f"artifact cannot be serialized canonically: {path}"
+        ) from exc
+    if data != canonical:
+        raise ArtifactIntegrityError(f"artifact bytes are not canonical JSON: {path}")
+    if (
+        type(document["schema_version"]) is not int
+        or document["schema_version"] != SCHEMA_VERSION
+    ):
         raise ArtifactIntegrityError(
             f"unsupported schema_version for {artifact_type}: "
             f"{document['schema_version']!r}"
@@ -248,20 +380,30 @@ def _read_record(
 @contextmanager
 def _transition_lock(directory: Path) -> Iterator[None]:
     directory.mkdir(parents=True, exist_ok=True)
-    lock_path = directory / ".transition.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    directory_fd = _open_directory_nofollow(directory)
+    try:
+        fd = os.open(
+            ".transition.lock",
+            os.O_CREAT | os.O_RDWR | _O_CLOEXEC | _O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        os.close(directory_fd)
+        raise ArtifactIntegrityError("cannot open transition lock securely") from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+        os.close(directory_fd)
 
 
 @dataclass(frozen=True)
 class _ImmutableRecord:
     path: Path
-    payload: dict[str, object]
+    payload: Mapping[str, object]
     payload_sha256: str
     sha256: str
 
@@ -280,7 +422,7 @@ class _ImmutableRecord:
     @classmethod
     def _from_created(
         cls,
-        created: tuple[Path, dict[str, object], str, str],
+        created: tuple[Path, Mapping[str, object], str, str],
     ) -> "_ImmutableRecord":
         return cls(*created)
 
@@ -299,7 +441,12 @@ class _ImmutableRecord:
             expected_payload_sha256=expected_payload_sha256,
             expected_artifact_sha256=expected_artifact_sha256,
         )
-        return cls(Path(path), payload, payload_sha256, artifact_sha256)
+        return cls(
+            Path(path),
+            _freeze_payload(payload),
+            payload_sha256,
+            artifact_sha256,
+        )
 
 
 _REFIT_CELL_KEYS = {
@@ -458,7 +605,11 @@ class RefitArtifactLedger(_ImmutableRecord):
         record = cls._read(path, expected_payload_sha256=expected_payload_sha256)
         cells = record.payload["cells"]
         count = record.payload["cell_count"]
-        if not isinstance(cells, list) or not isinstance(count, int):
+        if (
+            not isinstance(cells, Sequence)
+            or isinstance(cells, (str, bytes, bytearray))
+            or type(count) is not int
+        ):
             raise ArtifactIntegrityError("invalid refit ledger payload types")
         parsed = [RefitCell.from_payload(cell) for cell in cells]
         if count != len(parsed) or not parsed:
@@ -515,14 +666,21 @@ class ConfirmationSeal(_ImmutableRecord):
     ) -> "ConfirmationSeal":
         record = cls._read(path, expected_payload_sha256=expected_payload_sha256)
         survivors = record.payload["survivor_config_sha256"]
-        if not isinstance(survivors, list) or not survivors:
+        if (
+            not isinstance(survivors, Sequence)
+            or isinstance(survivors, (str, bytes, bytearray))
+            or not survivors
+        ):
             raise ArtifactIntegrityError("confirmation survivors must be nonempty")
         try:
             for index, value in enumerate(survivors):
                 _require_sha256(value, f"survivor_config_sha256[{index}]")
         except ValueError as exc:
             raise ArtifactIntegrityError("invalid confirmation survivor hash") from exc
-        if survivors != sorted(survivors) or len(set(survivors)) != len(survivors):
+        if (
+            tuple(survivors) != tuple(sorted(survivors))
+            or len(set(survivors)) != len(survivors)
+        ):
             raise ArtifactIntegrityError("confirmation survivors are not unique/canonical")
         try:
             _require_sha256(
@@ -814,7 +972,7 @@ class ClaimCompletion(_ImmutableRecord):
 
 def _completion_from_created(
     artifact_type: str,
-    created: tuple[Path, dict[str, object], str, str],
+    created: tuple[Path, Mapping[str, object], str, str],
 ) -> ClaimCompletion:
     return ClaimCompletion(*created, artifact_type=artifact_type)
 
@@ -830,6 +988,141 @@ def _validate_output_hashes(output_hashes: Mapping[str, str]) -> dict[str, str]:
             raise ValueError(f"duplicate output hash key: {key}")
         normalized[key] = _require_sha256(value, key)
     return dict(sorted(normalized.items()))
+
+
+_RECOVERY_PAYLOAD_KEYS = {
+    "claim_sha256",
+    "next_generation",
+    "recovery_audit_sha256",
+}
+_CONFIRMATION_CLAIM_KEYS = {
+    "cell_key",
+    "generation",
+    "job_map_sha256",
+    "recovered_from_claim_sha256",
+    "recovery_record_sha256",
+    "role",
+    "seal_sha256",
+    "seed",
+    "stage",
+    "subject",
+}
+_FORMAL_CELL_CLAIM_KEYS = {
+    "cell_key",
+    "final_run_audit_sha256",
+    "final_run_seal_sha256",
+    "formal_job_map_sha256",
+    "generation",
+    "recovered_from_claim_sha256",
+    "recovery_record_sha256",
+    "role",
+    "seed",
+    "subject",
+}
+_FORMAL_INPUT_CLAIM_KEYS = {
+    "generation",
+    "preparation_audit_sha256",
+    "preparation_seal_sha256",
+    "recipe_id",
+    "recovered_from_claim_sha256",
+    "recovery_record_sha256",
+}
+_FORMAL_INPUT_COMPLETION_KEYS = {
+    "adapter_sha256",
+    "base_model_sha256",
+    "claim_sha256",
+    "manifest_sha256",
+    "ordered_ids_sha256",
+    "payload_sha256",
+    "preprocessing_sha256",
+}
+_GENERATION_RE = re.compile(r"^generation-([0-9]{6})$")
+
+
+def _generation_numbers(base_dir: Path) -> tuple[int, ...]:
+    directory_fd = _open_directory_nofollow(base_dir)
+    try:
+        names = os.listdir(directory_fd)
+        numbers: list[int] = []
+        for name in names:
+            if not name.startswith("generation-"):
+                continue
+            match = _GENERATION_RE.fullmatch(name)
+            if match is None:
+                raise ArtifactIntegrityError(
+                    f"invalid claim generation directory: {name}"
+                )
+            value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(value.st_mode):
+                raise ArtifactIntegrityError(
+                    f"claim generation is not a real directory: {name}"
+                )
+            numbers.append(int(match.group(1)))
+    finally:
+        os.close(directory_fd)
+    if not numbers:
+        raise ArtifactStateError(f"claim has no generation: {base_dir}")
+    ordered = tuple(sorted(numbers))
+    if ordered != tuple(range(1, ordered[-1] + 1)):
+        raise ArtifactIntegrityError("claim generations must be contiguous from 1")
+    return ordered
+
+
+def _validate_generation_fields(
+    payload: Mapping[str, object],
+    generation: int,
+) -> None:
+    if type(payload["generation"]) is not int or payload["generation"] != generation:
+        raise ArtifactIntegrityError("claim generation field mismatch")
+    recovered_from = payload["recovered_from_claim_sha256"]
+    recovery_record = payload["recovery_record_sha256"]
+    if generation == 1:
+        if recovered_from is not None or recovery_record is not None:
+            raise ArtifactIntegrityError("initial claim has recovery chain fields")
+        return
+    try:
+        _require_sha256(recovered_from, "recovered_from_claim_sha256")  # type: ignore[arg-type]
+        _require_sha256(recovery_record, "recovery_record_sha256")  # type: ignore[arg-type]
+    except ValueError as exc:
+        raise ArtifactIntegrityError("invalid claim recovery chain fields") from exc
+
+
+def _validate_recovery_link(
+    previous: "CellClaim",
+    current_payload: Mapping[str, object],
+) -> None:
+    payload, _, artifact_sha256 = _read_record(
+        previous.recovery_path,
+        previous.recovery_artifact_type,
+        expected_payload_keys=_RECOVERY_PAYLOAD_KEYS,
+    )
+    if payload["claim_sha256"] != previous.sha256:
+        raise ArtifactIntegrityError("recovery chain binds a different claim")
+    if (
+        type(payload["next_generation"]) is not int
+        or payload["next_generation"] != previous.generation + 1
+    ):
+        raise ArtifactIntegrityError("recovery chain generation mismatch")
+    try:
+        _require_sha256(
+            payload["recovery_audit_sha256"],  # type: ignore[arg-type]
+            "recovery_audit_sha256",
+        )
+    except ValueError as exc:
+        raise ArtifactIntegrityError("invalid recovery chain audit hash") from exc
+    if current_payload["recovered_from_claim_sha256"] != previous.sha256:
+        raise ArtifactIntegrityError("recovery chain previous claim mismatch")
+    if current_payload["recovery_record_sha256"] != artifact_sha256:
+        raise ArtifactIntegrityError("recovery chain record hash mismatch")
+    expected_current = dict(previous.payload)
+    expected_current["generation"] = previous.generation + 1
+    expected_current["recovered_from_claim_sha256"] = previous.sha256
+    expected_current["recovery_record_sha256"] = artifact_sha256
+    if dict(current_payload) != expected_current:
+        raise ArtifactIntegrityError("recovery chain claim payload mismatch")
+    if previous.completion_path.exists():
+        previous._verify_completion()
+        raise ArtifactIntegrityError("completed claim also has a recovery successor")
 
 
 @dataclass(frozen=True)
@@ -874,7 +1167,7 @@ class CellClaim(_ImmutableRecord):
             raise ArtifactIntegrityError("completion outputs are not canonical")
         return ClaimCompletion(
             self.completion_path,
-            payload,
+            _freeze_payload(payload),
             payload_sha256,
             artifact_sha256,
             artifact_type=self.completion_artifact_type,
@@ -884,15 +1177,14 @@ class CellClaim(_ImmutableRecord):
         payload, _, _ = _read_record(
             self.recovery_path,
             self.recovery_artifact_type,
-            expected_payload_keys={
-                "claim_sha256",
-                "next_generation",
-                "recovery_audit_sha256",
-            },
+            expected_payload_keys=_RECOVERY_PAYLOAD_KEYS,
         )
         if payload["claim_sha256"] != self.sha256:
             raise ArtifactIntegrityError("recovery binds a different claim")
-        if payload["next_generation"] != self.generation + 1:
+        if (
+            type(payload["next_generation"]) is not int
+            or payload["next_generation"] != self.generation + 1
+        ):
             raise ArtifactIntegrityError("recovery next generation mismatch")
         try:
             _require_sha256(
@@ -938,7 +1230,7 @@ class CellClaim(_ImmutableRecord):
 
 
 def _make_cell_claim(
-    created: tuple[Path, dict[str, object], str, str],
+    created: tuple[Path, Mapping[str, object], str, str],
     *,
     generation: int,
     base_dir: Path,
@@ -960,6 +1252,7 @@ class _CellLedger:
     _CLAIM_TYPE = ""
     _COMPLETION_TYPE = ""
     _RECOVERY_TYPE = ""
+    _CLAIM_KEYS: set[str] = set()
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -984,6 +1277,46 @@ class _CellLedger:
             completion_artifact_type=self._COMPLETION_TYPE,
             recovery_artifact_type=self._RECOVERY_TYPE,
         )
+
+    def _validate_loaded_claim_payload(
+        self,
+        payload: Mapping[str, object],
+        generation: int,
+        cell_key: str,
+    ) -> None:
+        raise NotImplementedError
+
+    def _load_current_claim(self, cell_key: str) -> CellClaim:
+        base_dir = self.root / cell_key
+        claims: list[CellClaim] = []
+        for generation in _generation_numbers(base_dir):
+            path = base_dir / f"generation-{generation:06d}" / "claim.json"
+            payload, payload_sha256, artifact_sha256 = _read_record(
+                path,
+                self._CLAIM_TYPE,
+                expected_payload_keys=self._CLAIM_KEYS,
+            )
+            _validate_generation_fields(payload, generation)
+            self._validate_loaded_claim_payload(payload, generation, cell_key)
+            claim = CellClaim(
+                path,
+                _freeze_payload(payload),
+                payload_sha256,
+                artifact_sha256,
+                generation=generation,
+                base_dir=base_dir,
+                claim_artifact_type=self._CLAIM_TYPE,
+                completion_artifact_type=self._COMPLETION_TYPE,
+                recovery_artifact_type=self._RECOVERY_TYPE,
+            )
+            if claims:
+                _validate_recovery_link(claims[-1], claim.payload)
+            claims.append(claim)
+        current = claims[-1]
+        if current.recovery_path.exists():
+            current._verify_recovery()
+            raise ArtifactStateError("current claim recovery has no next generation")
+        return current
 
     def recover(
         self,
@@ -1034,12 +1367,57 @@ class ConfirmationCellLedger(_CellLedger):
     _CLAIM_TYPE = "confirmation_cell_claim"
     _COMPLETION_TYPE = "confirmation_cell_completion"
     _RECOVERY_TYPE = "confirmation_cell_recovery"
+    _CLAIM_KEYS = _CONFIRMATION_CLAIM_KEYS
 
     def __init__(self, root: Path, *, job_map_sha256: str) -> None:
         super().__init__(root)
         self.job_map_sha256 = _require_sha256(
             job_map_sha256, "job_map_sha256"
         )
+
+    def _validate_loaded_claim_payload(
+        self,
+        payload: Mapping[str, object],
+        generation: int,
+        cell_key: str,
+    ) -> None:
+        try:
+            _require_sha256(payload["seal_sha256"], "seal_sha256")  # type: ignore[arg-type]
+            _require_sha256(payload["job_map_sha256"], "job_map_sha256")  # type: ignore[arg-type]
+            _require_safe_id(payload["role"], "role")  # type: ignore[arg-type]
+            stage = payload["stage"]
+            subject = payload["subject"]
+            seed = payload["seed"]
+            if type(stage) is not int or stage < 1:
+                raise ValueError("stage must be a positive integer")
+            _require_subject_seed(subject, seed, formal=False)  # type: ignore[arg-type]
+        except (KeyError, ValueError) as exc:
+            raise ArtifactIntegrityError("invalid confirmation claim payload") from exc
+        expected_key = (
+            f"stage-{stage:02d}_role-{payload['role']}_"
+            f"sub-{subject:02d}_seed-{seed}"
+        )
+        if payload["cell_key"] != cell_key or cell_key != expected_key:
+            raise ArtifactIntegrityError("confirmation claim cell key mismatch")
+        if payload["job_map_sha256"] != self.job_map_sha256:
+            raise ArtifactIntegrityError("confirmation claim job map mismatch")
+
+    def load_claim(
+        self,
+        *,
+        stage: int,
+        role: str,
+        subject: int,
+        seed: int,
+    ) -> CellClaim:
+        if type(stage) is not int or stage < 1:
+            raise ValueError("stage must be a positive integer")
+        _require_safe_id(role, "role")
+        _require_subject_seed(subject, seed, formal=False)
+        cell_key = (
+            f"stage-{stage:02d}_role-{role}_sub-{subject:02d}_seed-{seed}"
+        )
+        return self._load_current_claim(cell_key)
 
     def claim(
         self,
@@ -1110,11 +1488,59 @@ class FormalCellLedger(_CellLedger):
     _CLAIM_TYPE = "formal_cell_claim"
     _COMPLETION_TYPE = "formal_cell_completion"
     _RECOVERY_TYPE = "formal_cell_recovery"
+    _CLAIM_KEYS = _FORMAL_CELL_CLAIM_KEYS
 
     def __init__(self, root: Path, *, formal_job_map_sha256: str) -> None:
         super().__init__(root)
         self.formal_job_map_sha256 = _require_sha256(
             formal_job_map_sha256, "formal_job_map_sha256"
+        )
+
+    def _validate_loaded_claim_payload(
+        self,
+        payload: Mapping[str, object],
+        generation: int,
+        cell_key: str,
+    ) -> None:
+        try:
+            _require_sha256(
+                payload["final_run_seal_sha256"],  # type: ignore[arg-type]
+                "final_run_seal_sha256",
+            )
+            _require_sha256(
+                payload["final_run_audit_sha256"],  # type: ignore[arg-type]
+                "final_run_audit_sha256",
+            )
+            _require_sha256(
+                payload["formal_job_map_sha256"],  # type: ignore[arg-type]
+                "formal_job_map_sha256",
+            )
+            role = payload["role"]
+            subject = payload["subject"]
+            seed = payload["seed"]
+            if role not in {"candidate", "control"}:
+                raise ValueError("invalid formal role")
+            _require_subject_seed(subject, seed, formal=True)  # type: ignore[arg-type]
+        except (KeyError, ValueError) as exc:
+            raise ArtifactIntegrityError("invalid formal cell claim payload") from exc
+        expected_key = f"role-{role}_sub-{subject:02d}_seed-{seed}"
+        if payload["cell_key"] != cell_key or cell_key != expected_key:
+            raise ArtifactIntegrityError("formal cell claim key mismatch")
+        if payload["formal_job_map_sha256"] != self.formal_job_map_sha256:
+            raise ArtifactIntegrityError("formal cell claim job map mismatch")
+
+    def load_claim(
+        self,
+        *,
+        role: str,
+        subject: int,
+        seed: int,
+    ) -> CellClaim:
+        if role not in {"candidate", "control"}:
+            raise ValueError("formal role must be candidate or control")
+        _require_subject_seed(subject, seed, formal=True)
+        return self._load_current_claim(
+            f"role-{role}_sub-{subject:02d}_seed-{seed}"
         )
 
     def claim(
@@ -1162,24 +1588,18 @@ class FormalInputClaim(_ImmutableRecord):
         return self.path.parent / "recovery.json"
 
     def _verify_completion(self) -> ClaimCompletion:
-        expected_keys = {
-            "adapter_sha256",
-            "base_model_sha256",
-            "claim_sha256",
-            "manifest_sha256",
-            "ordered_ids_sha256",
-            "payload_sha256",
-            "preprocessing_sha256",
-        }
         payload, payload_hash, artifact_hash = _read_record(
             self.completion_path,
             "formal_input_completion",
-            expected_payload_keys=expected_keys,
+            expected_payload_keys=_FORMAL_INPUT_COMPLETION_KEYS,
         )
         if payload["claim_sha256"] != self.sha256:
             raise ArtifactIntegrityError("formal input completion claim mismatch")
         try:
-            for field in expected_keys - {"adapter_sha256", "claim_sha256"}:
+            for field in _FORMAL_INPUT_COMPLETION_KEYS - {
+                "adapter_sha256",
+                "claim_sha256",
+            }:
                 _require_sha256(payload[field], field)  # type: ignore[arg-type]
             if payload["adapter_sha256"] is not None:
                 _require_sha256(
@@ -1190,11 +1610,32 @@ class FormalInputClaim(_ImmutableRecord):
             raise ArtifactIntegrityError("invalid formal input completion") from exc
         return ClaimCompletion(
             self.completion_path,
-            payload,
+            _freeze_payload(payload),
             payload_hash,
             artifact_hash,
             artifact_type="formal_input_completion",
         )
+
+    def _verify_recovery(self) -> None:
+        payload, _, _ = _read_record(
+            self.recovery_path,
+            "formal_input_recovery",
+            expected_payload_keys=_RECOVERY_PAYLOAD_KEYS,
+        )
+        if payload["claim_sha256"] != self.sha256:
+            raise ArtifactIntegrityError("formal input recovery claim mismatch")
+        if (
+            type(payload["next_generation"]) is not int
+            or payload["next_generation"] != self.generation + 1
+        ):
+            raise ArtifactIntegrityError("formal input recovery generation mismatch")
+        try:
+            _require_sha256(
+                payload["recovery_audit_sha256"],  # type: ignore[arg-type]
+                "recovery_audit_sha256",
+            )
+        except ValueError as exc:
+            raise ArtifactIntegrityError("invalid formal input recovery audit") from exc
 
     def is_complete(self) -> bool:
         if not self.completion_path.exists():
@@ -1208,15 +1649,7 @@ class FormalInputClaim(_ImmutableRecord):
             self._verify_completion()
             raise ArtifactStateError("formal input claim is already consumed")
         if self.recovery_path.exists():
-            _read_record(
-                self.recovery_path,
-                "formal_input_recovery",
-                expected_payload_keys={
-                    "claim_sha256",
-                    "next_generation",
-                    "recovery_audit_sha256",
-                },
-            )
+            self._verify_recovery()
             raise ArtifactStateError("formal input claim was recovered")
 
     def complete(
@@ -1266,6 +1699,134 @@ class FormalInputClaim(_ImmutableRecord):
             )
 
 
+def _validate_formal_input_claim_payload(
+    payload: Mapping[str, object],
+    generation: int,
+    *,
+    expected_recipe_id: str | None = None,
+) -> str:
+    _require_exact_keys(
+        payload,
+        _FORMAL_INPUT_CLAIM_KEYS,
+        "formal_input_claim payload",
+    )
+    _validate_generation_fields(payload, generation)
+    try:
+        recipe_id = _require_safe_id(
+            payload["recipe_id"],  # type: ignore[arg-type]
+            "recipe_id",
+        )
+        _require_sha256(
+            payload["preparation_seal_sha256"],  # type: ignore[arg-type]
+            "preparation_seal_sha256",
+        )
+        _require_sha256(
+            payload["preparation_audit_sha256"],  # type: ignore[arg-type]
+            "preparation_audit_sha256",
+        )
+    except ValueError as exc:
+        raise ArtifactIntegrityError("invalid formal input claim payload") from exc
+    if expected_recipe_id is not None and recipe_id != expected_recipe_id:
+        raise ArtifactIntegrityError("formal input claim recipe mismatch")
+    return recipe_id
+
+
+def _validate_formal_input_completion_payload(
+    payload: Mapping[str, object],
+    *,
+    expected_claim_sha256: str,
+) -> None:
+    _require_exact_keys(
+        payload,
+        _FORMAL_INPUT_COMPLETION_KEYS,
+        "formal_input_completion payload",
+    )
+    if payload["claim_sha256"] != expected_claim_sha256:
+        raise ArtifactIntegrityError("formal input completion claim mismatch")
+    try:
+        _require_sha256(
+            payload["claim_sha256"],  # type: ignore[arg-type]
+            "claim_sha256",
+        )
+        for field in _FORMAL_INPUT_COMPLETION_KEYS - {
+            "adapter_sha256",
+            "claim_sha256",
+        }:
+            _require_sha256(payload[field], field)  # type: ignore[arg-type]
+        if payload["adapter_sha256"] is not None:
+            _require_sha256(
+                payload["adapter_sha256"],  # type: ignore[arg-type]
+                "adapter_sha256",
+            )
+    except ValueError as exc:
+        raise ArtifactIntegrityError("invalid formal input completion") from exc
+
+
+def _canonical_record_hashes(
+    artifact_type: str,
+    payload: Mapping[str, object],
+) -> tuple[str, str]:
+    thawed = _deep_thaw(payload)
+    if not isinstance(thawed, dict):
+        raise ArtifactIntegrityError("embedded artifact payload must be an object")
+    document = _artifact_document(artifact_type, thawed)
+    data = canonical_json_bytes(document)
+    return str(document["payload_sha256"]), hashlib.sha256(data).hexdigest()
+
+
+def _validate_formal_input_recovery_link(
+    previous: FormalInputClaim,
+    current_payload: Mapping[str, object],
+) -> None:
+    payload, _, artifact_sha256 = _read_record(
+        previous.recovery_path,
+        "formal_input_recovery",
+        expected_payload_keys=_RECOVERY_PAYLOAD_KEYS,
+    )
+    if payload["claim_sha256"] != previous.sha256:
+        raise ArtifactIntegrityError("formal input recovery chain claim mismatch")
+    if (
+        type(payload["next_generation"]) is not int
+        or payload["next_generation"] != previous.generation + 1
+    ):
+        raise ArtifactIntegrityError("formal input recovery chain generation mismatch")
+    try:
+        _require_sha256(
+            payload["recovery_audit_sha256"],  # type: ignore[arg-type]
+            "recovery_audit_sha256",
+        )
+    except ValueError as exc:
+        raise ArtifactIntegrityError(
+            "invalid formal input recovery chain audit"
+        ) from exc
+    expected_current = dict(previous.payload)
+    expected_current["generation"] = previous.generation + 1
+    expected_current["recovered_from_claim_sha256"] = previous.sha256
+    expected_current["recovery_record_sha256"] = artifact_sha256
+    if dict(current_payload) != expected_current:
+        raise ArtifactIntegrityError("formal input recovery chain payload mismatch")
+    if previous.completion_path.exists():
+        previous._verify_completion()
+        raise ArtifactIntegrityError(
+            "completed formal input claim also has a recovery successor"
+        )
+
+
+_FORMAL_INPUT_LEDGER_ENTRY_KEYS = {
+    "claim_generation",
+    "claim_path",
+    "claim_payload",
+    "claim_payload_sha256",
+    "claim_sha256",
+    "completion_payload",
+    "completion_payload_sha256",
+    "completion_sha256",
+    "preparation_audit_sha256",
+    "preparation_seal_sha256",
+    "recipe_id",
+}
+
+
 @dataclass(frozen=True)
 class FormalInputLedgerSnapshot(_ImmutableRecord):
     _ARTIFACT_TYPE: ClassVar[str] = "formal_input_ledger"
@@ -1275,6 +1836,184 @@ class FormalInputLedgerSnapshot(_ImmutableRecord):
         "preparation_audit_sha256",
         "preparation_seal_sha256",
     }
+
+    @classmethod
+    def verify(
+        cls,
+        path: Path,
+        *,
+        expected_payload_sha256: str | None = None,
+    ) -> "FormalInputLedgerSnapshot":
+        if expected_payload_sha256 is not None:
+            _require_sha256(
+                expected_payload_sha256,
+                "expected_payload_sha256",
+            )
+        record = cls._read(
+            path,
+            expected_payload_sha256=expected_payload_sha256,
+        )
+        payload = record.payload
+        entries = payload["entries"]
+        entry_count = payload["entry_count"]
+        if (
+            not isinstance(entries, Sequence)
+            or isinstance(entries, (str, bytes, bytearray))
+        ):
+            raise ArtifactIntegrityError(
+                "formal input ledger entries must be an array"
+            )
+        if type(entry_count) is not int or entry_count < 1:
+            raise ArtifactIntegrityError(
+                "formal input ledger entry_count must be a positive integer"
+            )
+        if entry_count != len(entries):
+            raise ArtifactIntegrityError(
+                "formal input ledger entry_count mismatch"
+            )
+        try:
+            preparation_seal_sha256 = _require_sha256(
+                payload["preparation_seal_sha256"],  # type: ignore[arg-type]
+                "preparation_seal_sha256",
+            )
+            preparation_audit_sha256 = _require_sha256(
+                payload["preparation_audit_sha256"],  # type: ignore[arg-type]
+                "preparation_audit_sha256",
+            )
+        except ValueError as exc:
+            raise ArtifactIntegrityError(
+                "invalid formal input ledger preparation chain"
+            ) from exc
+
+        recipe_ids: list[str] = []
+        for raw_entry in entries:
+            if not isinstance(raw_entry, Mapping):
+                raise ArtifactIntegrityError(
+                    "formal input ledger entry must be an object"
+                )
+            _require_exact_keys(
+                raw_entry,
+                _FORMAL_INPUT_LEDGER_ENTRY_KEYS,
+                "formal input ledger entry",
+            )
+            try:
+                recipe_id = _require_safe_id(
+                    raw_entry["recipe_id"],  # type: ignore[arg-type]
+                    "recipe_id",
+                )
+                claim_sha256 = _require_sha256(
+                    raw_entry["claim_sha256"],  # type: ignore[arg-type]
+                    "claim_sha256",
+                )
+                claim_payload_sha256 = _require_sha256(
+                    raw_entry["claim_payload_sha256"],  # type: ignore[arg-type]
+                    "claim_payload_sha256",
+                )
+                completion_sha256 = _require_sha256(
+                    raw_entry["completion_sha256"],  # type: ignore[arg-type]
+                    "completion_sha256",
+                )
+                completion_payload_sha256 = _require_sha256(
+                    raw_entry["completion_payload_sha256"],  # type: ignore[arg-type]
+                    "completion_payload_sha256",
+                )
+                entry_seal_sha256 = _require_sha256(
+                    raw_entry["preparation_seal_sha256"],  # type: ignore[arg-type]
+                    "preparation_seal_sha256",
+                )
+                entry_audit_sha256 = _require_sha256(
+                    raw_entry["preparation_audit_sha256"],  # type: ignore[arg-type]
+                    "preparation_audit_sha256",
+                )
+            except ValueError as exc:
+                raise ArtifactIntegrityError(
+                    "invalid formal input ledger entry"
+                ) from exc
+
+            generation = raw_entry["claim_generation"]
+            if type(generation) is not int or generation < 1:
+                raise ArtifactIntegrityError(
+                    "formal input claim_generation must be a positive integer"
+                )
+            claim_payload = raw_entry["claim_payload"]
+            completion_payload = raw_entry["completion_payload"]
+            if not isinstance(claim_payload, Mapping):
+                raise ArtifactIntegrityError(
+                    "embedded formal input claim payload must be an object"
+                )
+            if not isinstance(completion_payload, Mapping):
+                raise ArtifactIntegrityError(
+                    "embedded formal input completion payload must be an object"
+                )
+            _validate_formal_input_claim_payload(
+                claim_payload,
+                generation,
+                expected_recipe_id=recipe_id,
+            )
+            if (
+                claim_payload["preparation_seal_sha256"]
+                != preparation_seal_sha256
+                or claim_payload["preparation_audit_sha256"]
+                != preparation_audit_sha256
+                or entry_seal_sha256 != preparation_seal_sha256
+                or entry_audit_sha256 != preparation_audit_sha256
+            ):
+                raise ArtifactIntegrityError(
+                    "formal input ledger preparation chain mismatch"
+                )
+
+            expected_claim_path = (
+                f"recipe-{hashlib.sha256(recipe_id.encode('utf-8')).hexdigest()}/"
+                f"generation-{generation:06d}/claim.json"
+            )
+            if raw_entry["claim_path"] != expected_claim_path:
+                raise ArtifactIntegrityError(
+                    "formal input ledger claim path mismatch"
+                )
+            actual_claim_payload_sha256, actual_claim_sha256 = (
+                _canonical_record_hashes(
+                    "formal_input_claim",
+                    claim_payload,
+                )
+            )
+            if (
+                claim_payload_sha256 != actual_claim_payload_sha256
+                or claim_sha256 != actual_claim_sha256
+            ):
+                raise ArtifactIntegrityError(
+                    "embedded formal input claim hash mismatch"
+                )
+
+            _validate_formal_input_completion_payload(
+                completion_payload,
+                expected_claim_sha256=claim_sha256,
+            )
+            (
+                actual_completion_payload_sha256,
+                actual_completion_sha256,
+            ) = _canonical_record_hashes(
+                "formal_input_completion",
+                completion_payload,
+            )
+            if (
+                completion_payload_sha256
+                != actual_completion_payload_sha256
+                or completion_sha256 != actual_completion_sha256
+            ):
+                raise ArtifactIntegrityError(
+                    "embedded formal input completion hash mismatch"
+                )
+            recipe_ids.append(recipe_id)
+
+        if recipe_ids != sorted(recipe_ids):
+            raise ArtifactIntegrityError(
+                "formal input ledger entries must be sorted by recipe_id"
+            )
+        if len(recipe_ids) != len(set(recipe_ids)):
+            raise ArtifactIntegrityError(
+                "formal input ledger recipe IDs must be unique"
+            )
+        return record  # type: ignore[return-value]
 
 
 class FormalInputLedger:
@@ -1356,37 +2095,61 @@ class FormalInputLedger:
             base_dir=claim.base_dir,
         )
 
-    def _current_claim(self, recipe_dir: Path) -> FormalInputClaim:
-        generations = sorted(recipe_dir.glob("generation-*"))
-        if not generations:
-            raise ArtifactStateError(f"formal input recipe has no claim: {recipe_dir}")
-        generation_dir = generations[-1]
-        try:
-            generation = int(generation_dir.name.removeprefix("generation-"))
-        except ValueError as exc:
-            raise ArtifactIntegrityError("invalid formal input generation") from exc
-        path = generation_dir / "claim.json"
-        payload, payload_hash, artifact_hash = _read_record(
-            path,
-            "formal_input_claim",
-            expected_payload_keys={
-                "generation",
-                "preparation_audit_sha256",
-                "preparation_seal_sha256",
-                "recipe_id",
-                "recovered_from_claim_sha256",
-                "recovery_record_sha256",
-            },
-        )
-        if payload["generation"] != generation:
-            raise ArtifactIntegrityError("formal input generation mismatch")
-        return FormalInputClaim(
-            path,
-            payload,
-            payload_hash,
-            artifact_hash,
-            generation=generation,
-            base_dir=recipe_dir,
+    def _current_claim(
+        self,
+        recipe_dir: Path,
+        *,
+        expected_recipe_id: str | None = None,
+    ) -> FormalInputClaim:
+        claims: list[FormalInputClaim] = []
+        for generation in _generation_numbers(recipe_dir):
+            path = (
+                recipe_dir
+                / f"generation-{generation:06d}"
+                / "claim.json"
+            )
+            payload, payload_hash, artifact_hash = _read_record(
+                path,
+                "formal_input_claim",
+                expected_payload_keys=_FORMAL_INPUT_CLAIM_KEYS,
+            )
+            recipe_id = _validate_formal_input_claim_payload(
+                payload,
+                generation,
+                expected_recipe_id=expected_recipe_id,
+            )
+            if recipe_dir.name != self._recipe_dir_name(recipe_id):
+                raise ArtifactIntegrityError(
+                    "formal input recipe directory mismatch"
+                )
+            claim = FormalInputClaim(
+                path,
+                _freeze_payload(payload),
+                payload_hash,
+                artifact_hash,
+                generation=generation,
+                base_dir=recipe_dir,
+            )
+            if claims:
+                _validate_formal_input_recovery_link(
+                    claims[-1],
+                    claim.payload,
+                )
+            claims.append(claim)
+        current = claims[-1]
+        if current.recovery_path.exists():
+            current._verify_recovery()
+            raise ArtifactStateError(
+                "current formal input recovery has no next generation"
+            )
+        return current
+
+    def load_claim(self, recipe_id: str) -> FormalInputClaim:
+        _require_safe_id(recipe_id, "recipe_id")
+        recipe_dir = self.root / self._recipe_dir_name(recipe_id)
+        return self._current_claim(
+            recipe_dir,
+            expected_recipe_id=recipe_id,
         )
 
     def finalize(self, output_path: Path) -> FormalInputLedgerSnapshot:
@@ -1425,8 +2188,13 @@ class FormalInputLedger:
             audit_hashes.add(audit_hash)  # type: ignore[arg-type]
             entries.append(
                 {
+                    "claim_generation": claim.generation,
+                    "claim_path": claim.path.relative_to(self.root).as_posix(),
+                    "claim_payload": _deep_thaw(claim.payload),
+                    "claim_payload_sha256": claim.payload_sha256,
                     "claim_sha256": claim.sha256,
-                    "completion_payload": completion.payload,
+                    "completion_payload": _deep_thaw(completion.payload),
+                    "completion_payload_sha256": completion.payload_sha256,
                     "completion_sha256": completion.sha256,
                     "preparation_audit_sha256": audit_hash,
                     "preparation_seal_sha256": seal_hash,
