@@ -27,20 +27,241 @@
     "formula": "h'_l = h_l + gamma_l * B_l GELU(A_l LayerNorm(h_l))",
     "zero_initialized": "B_l",
     "gamma_initial": 1.0,
+    "dimensions": {
+      "layer_order": [20, 24, 28, 32, 36],
+      "input_dimension": 3200,
+      "output_dimension": 512,
+      "layers": 5
+    },
+    "normalization": {
+      "kind": "LayerNorm",
+      "axis": "last",
+      "affine": false,
+      "compute_dtype": "float32",
+      "eps": 0.000001,
+      "applies_to": ["adapter", "global_dense", "matched_projector"]
+    },
+    "identity_architecture": {
+      "kind": "adapter_off_identity",
+      "formula": "h'_l = h_l",
+      "added_parameters": 0
+    },
+    "adapter_architecture": {
+      "kind": "per_layer_residual_low_rank",
+      "formula": "h'_l = h_l + gamma_l * B_l GELU(A_l LayerNorm(h_l))",
+      "activation": "GELU",
+      "down_projection": "A_l: Linear(D,r,bias=False)",
+      "up_projection": "B_l: Linear(r,D,bias=False)",
+      "zero_initialized": "B_l",
+      "gamma": "per_layer_trainable_scalar",
+      "gamma_initial": 1.0
+    },
+    "global_dense_architecture": {
+      "kind": "global_dense_flattened_residual_bottleneck",
+      "input_layout": "[B,L*D]",
+      "formula": "h' = h + gamma * B_global GELU(A_global LayerNorm(h))",
+      "activation": "GELU",
+      "down_projection": "A_global: Linear(L*D,r,bias=False)",
+      "up_projection": "B_global: Linear(r,L*D,bias=False)",
+      "zero_initialized": "B_global",
+      "gamma": "single_trainable_scalar",
+      "gamma_initial": 1.0
+    },
+    "matched_projector_architecture": {
+      "kind": "per_layer_residual_output_space",
+      "formula": "q'_l = q_l + gamma_l * Q_l GELU(R_l LayerNorm(h_l))",
+      "activation": "GELU",
+      "down_projection": "R_l: Linear(D,m_l,bias=False)",
+      "up_projection": "Q_l: Linear(m_l,O,bias=False)",
+      "zero_initialized": "Q_l",
+      "gamma": "per_layer_trainable_scalar",
+      "gamma_initial": 1.0
+    },
     "ranks": [8, 16, 32],
     "learning_rate_ratios": [0.05, 0.1],
     "candidates": [
-      {"config_id": "s2-adapter-r8-lr0.05", "rank": 8, "learning_rate_ratio": 0.05},
-      {"config_id": "s2-adapter-r8-lr0.10", "rank": 8, "learning_rate_ratio": 0.1},
-      {"config_id": "s2-adapter-r16-lr0.05", "rank": 16, "learning_rate_ratio": 0.05},
-      {"config_id": "s2-adapter-r16-lr0.10", "rank": 16, "learning_rate_ratio": 0.1},
-      {"config_id": "s2-adapter-r32-lr0.05", "rank": 32, "learning_rate_ratio": 0.05},
-      {"config_id": "s2-adapter-r32-lr0.10", "rank": 32, "learning_rate_ratio": 0.1}
+      {
+        "config_id": "s2-adapter-r8-lr0.05",
+        "rank": 8,
+        "learning_rate_ratio": 0.05,
+        "adapter_parameters": 256005,
+        "control_bindings": {
+          "identity": {
+            "config_id": "s2-adapter-identity-control"
+          },
+          "global_dense": {
+            "config_id": "s2-adapter-global-dense-control",
+            "rank": 8,
+            "learning_rate_ratio": 0.05,
+            "parameters": 256001
+          },
+          "matched_projector": {
+            "config_id": "s2-adapter-matched-projector-control",
+            "rank": 8,
+            "learning_rate_ratio": 0.05,
+            "widths": [14, 14, 14, 14, 13],
+            "adapter_parameters": 256005,
+            "control_parameters": 256133,
+            "absolute_parameter_error": 128,
+            "relative_parameter_error": 0.0004999902345657311
+          }
+        }
+      },
+      {
+        "config_id": "s2-adapter-r8-lr0.10",
+        "rank": 8,
+        "learning_rate_ratio": 0.1,
+        "adapter_parameters": 256005,
+        "control_bindings": {
+          "identity": {
+            "config_id": "s2-adapter-identity-control"
+          },
+          "global_dense": {
+            "config_id": "s2-adapter-global-dense-control",
+            "rank": 8,
+            "learning_rate_ratio": 0.1,
+            "parameters": 256001
+          },
+          "matched_projector": {
+            "config_id": "s2-adapter-matched-projector-control",
+            "rank": 8,
+            "learning_rate_ratio": 0.1,
+            "widths": [14, 14, 14, 14, 13],
+            "adapter_parameters": 256005,
+            "control_parameters": 256133,
+            "absolute_parameter_error": 128,
+            "relative_parameter_error": 0.0004999902345657311
+          }
+        }
+      },
+      {
+        "config_id": "s2-adapter-r16-lr0.05",
+        "rank": 16,
+        "learning_rate_ratio": 0.05,
+        "adapter_parameters": 512005,
+        "control_bindings": {
+          "identity": {
+            "config_id": "s2-adapter-identity-control"
+          },
+          "global_dense": {
+            "config_id": "s2-adapter-global-dense-control",
+            "rank": 16,
+            "learning_rate_ratio": 0.05,
+            "parameters": 512001
+          },
+          "matched_projector": {
+            "config_id": "s2-adapter-matched-projector-control",
+            "rank": 16,
+            "learning_rate_ratio": 0.05,
+            "widths": [28, 28, 28, 27, 27],
+            "adapter_parameters": 512005,
+            "control_parameters": 512261,
+            "absolute_parameter_error": 256,
+            "relative_parameter_error": 0.0004999951172351833
+          }
+        }
+      },
+      {
+        "config_id": "s2-adapter-r16-lr0.10",
+        "rank": 16,
+        "learning_rate_ratio": 0.1,
+        "adapter_parameters": 512005,
+        "control_bindings": {
+          "identity": {
+            "config_id": "s2-adapter-identity-control"
+          },
+          "global_dense": {
+            "config_id": "s2-adapter-global-dense-control",
+            "rank": 16,
+            "learning_rate_ratio": 0.1,
+            "parameters": 512001
+          },
+          "matched_projector": {
+            "config_id": "s2-adapter-matched-projector-control",
+            "rank": 16,
+            "learning_rate_ratio": 0.1,
+            "widths": [28, 28, 28, 27, 27],
+            "adapter_parameters": 512005,
+            "control_parameters": 512261,
+            "absolute_parameter_error": 256,
+            "relative_parameter_error": 0.0004999951172351833
+          }
+        }
+      },
+      {
+        "config_id": "s2-adapter-r32-lr0.05",
+        "rank": 32,
+        "learning_rate_ratio": 0.05,
+        "adapter_parameters": 1024005,
+        "control_bindings": {
+          "identity": {
+            "config_id": "s2-adapter-identity-control"
+          },
+          "global_dense": {
+            "config_id": "s2-adapter-global-dense-control",
+            "rank": 32,
+            "learning_rate_ratio": 0.05,
+            "parameters": 1024001
+          },
+          "matched_projector": {
+            "config_id": "s2-adapter-matched-projector-control",
+            "rank": 32,
+            "learning_rate_ratio": 0.05,
+            "widths": [56, 55, 55, 55, 55],
+            "adapter_parameters": 1024005,
+            "control_parameters": 1024517,
+            "absolute_parameter_error": 512,
+            "relative_parameter_error": 0.0004999975586056709
+          }
+        }
+      },
+      {
+        "config_id": "s2-adapter-r32-lr0.10",
+        "rank": 32,
+        "learning_rate_ratio": 0.1,
+        "adapter_parameters": 1024005,
+        "control_bindings": {
+          "identity": {
+            "config_id": "s2-adapter-identity-control"
+          },
+          "global_dense": {
+            "config_id": "s2-adapter-global-dense-control",
+            "rank": 32,
+            "learning_rate_ratio": 0.1,
+            "parameters": 1024001
+          },
+          "matched_projector": {
+            "config_id": "s2-adapter-matched-projector-control",
+            "rank": 32,
+            "learning_rate_ratio": 0.1,
+            "widths": [56, 55, 55, 55, 55],
+            "adapter_parameters": 1024005,
+            "control_parameters": 1024517,
+            "absolute_parameter_error": 512,
+            "relative_parameter_error": 0.0004999975586056709
+          }
+        }
+      }
     ],
     "controls": [
-      {"config_id": "s2-adapter-identity-control", "kind": "identity", "parameter_match_tolerance": 0.0},
-      {"config_id": "s2-adapter-global-dense-control", "kind": "global_dense", "parameter_match_tolerance": 0.01},
-      {"config_id": "s2-adapter-matched-projector-control", "kind": "matched_projector", "parameter_match_tolerance": 0.01}
+      {
+        "config_id": "s2-adapter-identity-control",
+        "kind": "identity",
+        "architecture": "identity_architecture",
+        "parameter_match_tolerance": 0.0
+      },
+      {
+        "config_id": "s2-adapter-global-dense-control",
+        "kind": "global_dense",
+        "architecture": "global_dense_architecture",
+        "parameter_match_tolerance": 0.01
+      },
+      {
+        "config_id": "s2-adapter-matched-projector-control",
+        "kind": "matched_projector",
+        "architecture": "matched_projector_architecture",
+        "parameter_match_tolerance": 0.01
+      }
     ],
     "tie_break": ["higher_val_dev_top5", "lower_parameter_count", "config_id"]
   }

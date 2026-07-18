@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .contracts import stage1_v1_payload, stage2_v1_payload
+
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -696,7 +698,7 @@ def _validate_brainrw(payload: dict[str, object]) -> None:
     _string_tuple(sections["training"]["channels"], "training.channels")
 
 
-def _validate_stage1(payload: dict[str, object]) -> None:
+def _validate_stage1_structure(payload: dict[str, object]) -> None:
     _keys(
         payload,
         {
@@ -798,7 +800,7 @@ def _validate_entry_list(
     return entries
 
 
-def _validate_stage2(payload: dict[str, object]) -> None:
+def _validate_stage2_structure(payload: dict[str, object]) -> None:
     _keys(
         payload,
         {
@@ -892,6 +894,77 @@ def _validate_stage2(payload: dict[str, object]) -> None:
             f"feature_adapter.controls[{index}].parameter_match_tolerance",
         )
     _string_tuple(adapter["tie_break"], "feature_adapter.tie_break")
+
+
+def _validate_exact_shape(actual: object, expected: object, context: str) -> None:
+    """Reject missing/unknown nested keys before exact semantic comparison."""
+    if isinstance(expected, dict):
+        actual_object = _object(actual, context)
+        expected_keys = set(expected)
+        actual_keys = set(actual_object)
+        unknown = actual_keys - expected_keys
+        missing = expected_keys - actual_keys
+        if unknown:
+            raise ValueError(f"{context} has unknown keys: {sorted(unknown)}")
+        if missing:
+            raise ValueError(f"{context} is missing keys: {sorted(missing)}")
+        for key, expected_value in expected.items():
+            _validate_exact_shape(
+                actual_object[key], expected_value, f"{context}.{key}"
+            )
+        return
+    if isinstance(expected, list):
+        actual_sequence = _sequence(actual, context)
+        for index, (actual_item, expected_item) in enumerate(
+            zip(actual_sequence, expected)
+        ):
+            _validate_exact_shape(
+                actual_item, expected_item, f"{context}[{index}]"
+            )
+
+
+def _validate_stage2_unique_registry_ids(payload: dict[str, object]) -> None:
+    adapter = _object(payload["feature_adapter"], "feature_adapter")
+    registries = (
+        ("layernorm", payload["layernorm"]),
+        ("whitening", payload["whitening"]),
+        ("preprojectors", payload["preprojectors"]),
+        ("checkpoint_averaging", payload["checkpoint_averaging"]),
+        ("feature_adapter.candidates", adapter["candidates"]),
+        ("feature_adapter.controls", adapter["controls"]),
+    )
+    seen: set[str] = set()
+    for context, raw_entries in registries:
+        for index, raw_entry in enumerate(_sequence(raw_entries, context)):
+            entry = _object(raw_entry, f"{context}[{index}]")
+            config_id = _identifier(
+                entry.get("config_id"), f"{context}[{index}].config_id"
+            )
+            if config_id in seen:
+                raise ValueError(
+                    "stage2 config must match the exact preregistered Stage 2 v1 "
+                    f"contract: duplicate Stage 2 config_id: {config_id}"
+                )
+            seen.add(config_id)
+
+
+def _validate_stage1(payload: dict[str, object]) -> None:
+    _validate_stage1_structure(payload)
+    expected = stage1_v1_payload()
+    if _canonical_json(payload) != _canonical_json(expected):
+        raise ValueError(
+            "stage1 config must match the exact preregistered Stage 1 v1 contract"
+        )
+
+
+def _validate_stage2(payload: dict[str, object]) -> None:
+    expected = stage2_v1_payload()
+    _validate_exact_shape(payload, expected, "stage2 config")
+    _validate_stage2_unique_registry_ids(payload)
+    if _canonical_json(payload) != _canonical_json(expected):
+        raise ValueError(
+            "stage2 config must match the exact preregistered Stage 2 v1 contract"
+        )
 
 
 @dataclass(frozen=True)
@@ -1060,6 +1133,18 @@ def resolve_run_config(
     inputs = _object(input_hashes, "input_hashes")
     if not inputs:
         raise ValueError("input_hashes must not be empty")
+    required_input_hashes = {
+        "model_sha256",
+        "cache_sha256",
+        "checkpoint_sha256",
+        "manifest_sha256",
+    }
+    missing_input_hashes = required_input_hashes - set(inputs)
+    if missing_input_hashes:
+        raise ValueError(
+            "input_hashes missing required provenance SHA-256 keys: "
+            + ", ".join(sorted(missing_input_hashes))
+        )
     normalized_inputs: dict[str, str] = {}
     for key, digest in inputs.items():
         safe_key = _identifier(key, "input_hashes key")
