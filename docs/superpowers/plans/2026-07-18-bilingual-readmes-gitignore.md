@@ -6,7 +6,7 @@
 
 **Architecture:** The root README pair remains the project-wide overview, while the SAMGA reproduction README pair owns detailed public-code reproduction instructions. The root documents link to the same-language reproduction guide. A minimal anchored ignore rule hides only local agent progress state; existing artifact, run, log, result, model-weight, cache, and dataset exclusions remain unchanged.
 
-**Tech Stack:** Git ignore patterns, GitHub-flavored Markdown, Bash validation with `rg`, `find`, `git check-ignore`, and `git diff --check`.
+**Tech Stack:** Git ignore patterns, GitHub-flavored Markdown, Bash validation with `rg`, `git ls-files`, `stat`, `git check-ignore`, and `git diff --check`.
 
 ## Global Constraints
 
@@ -294,7 +294,8 @@ git commit -m "docs: link project READMEs to bilingual SAMGA guides"
 Run:
 
 ```bash
-git diff --check HEAD~3..HEAD
+BASE="$(git merge-base main HEAD)"
+git diff --check "$BASE"..HEAD
 rg -n 'TODO|TBD|PLACEHOLDER|FINAL_|/fixed/local/model' \
   README.md README_ZH.md \
   experiments/samga_reproduction/README.md \
@@ -376,9 +377,10 @@ and no unignored experiment file exceeds 10 MiB.
 Run:
 
 ```bash
-git log -4 --oneline
+BASE="$(git merge-base main HEAD)"
+git log --oneline "$BASE"..HEAD
 git status --short
 ```
 
-Expected: the design and three implementation commits are visible; unrelated
+Expected: the design and all implementation/review-fix commits are visible; unrelated
 pre-existing untracked experiment files remain untouched.
