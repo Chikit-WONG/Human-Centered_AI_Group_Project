@@ -884,6 +884,11 @@ def _reject_denied_scalar(
         raise ValueError(f"{context} denied: canonical formal-test digest")
     if _has_named_path_component(value, "test_images"):
         raise ValueError(f"{context} denied: test_images provenance")
+    if any(
+        _SUBJECT_TEST_FILENAME_RE.fullmatch(part)
+        for part in re.split(r"[\\/]+", value)
+    ):
+        raise ValueError(f"{context} denied: formal-test subject filename")
 
     if (
         not is_key

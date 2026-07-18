@@ -296,6 +296,7 @@ def test_generic_envelope_recomputes_every_bound_hash(
     "forbidden_metadata",
     [
         {"nested": {"split": "test"}},
+        {"nested": {"source_manifest": "/sealed/sub-01_test.json"}},
         {
             "nested": {
                 "digest": (
