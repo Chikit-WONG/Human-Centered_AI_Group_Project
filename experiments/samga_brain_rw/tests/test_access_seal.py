@@ -193,6 +193,8 @@ def test_sensitive_scope_rejects_even_object_new_forgery(
     [
         "samga_brain_rw.protocol_config",
         "samga_brain_rw.semantic_config",
+        "samga_brain_rw.split_assignment",
+        "samga_brain_rw.manifest_summary",
         "samga_brain_rw.source_manifest",
         "samga_brain_rw.source_train_pt",
         "samga_brain_rw.model_config",

@@ -96,6 +96,8 @@ _GENERIC_PAYLOAD_TYPES = frozenset(
         "samga_brain_rw.feature_cache",
         "samga_brain_rw.model_config",
         "samga_brain_rw.model_preprocessor",
+        "samga_brain_rw.split_assignment",
+        "samga_brain_rw.manifest_summary",
         "samga_brain_rw.model_source",
         "samga_brain_rw.model_weights",
         "samga_brain_rw.protocol_config",
