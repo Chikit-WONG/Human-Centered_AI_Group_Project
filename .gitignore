@@ -8,6 +8,9 @@ Thumbs.db
 *.swo
 *~
 
+# Local agent workflow state
+/.superpowers/
+
 # Python bytecode, caches, and test artifacts
 __pycache__/
 *.py[cod]
