@@ -8,10 +8,10 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+import samga_brain_rw.access as access_module
 
 from samga_brain_rw.access import (
     AccessAuthorization,
-    _issue_access_authorization,
     TypedArtifact,
     VerifiedArtifact,
     require_typed_artifacts,
@@ -168,6 +168,23 @@ def test_access_authorization_cannot_be_publicly_forged() -> None:
             seal_sha256=digest,
             job_map_sha256=digest,
             claim_sha256=digest,
+        )
+
+
+def test_sensitive_scope_rejects_even_object_new_forgery(
+    tmp_path: Path,
+) -> None:
+    artifact, _ = _generic_artifact(tmp_path)
+    forged = object.__new__(AccessAuthorization)
+    object.__setattr__(forged, "scope", "val-confirm")
+    object.__setattr__(forged, "seal_sha256", "0" * 64)
+    object.__setattr__(forged, "job_map_sha256", "0" * 64)
+    object.__setattr__(forged, "claim_sha256", "0" * 64)
+    object.__setattr__(forged, "audit_sha256", None)
+
+    with pytest.raises(PermissionError, match="generic authorization issuance"):
+        verify_typed_artifacts(
+            "val-confirm", [artifact], authorization=forged
         )
 
 
@@ -485,28 +502,12 @@ def test_task2_validates_only_selected_role_and_recomputes_it(
     ],
 )
 def test_formal_input_rejects_output_semantics_in_bound_metadata(
-    tmp_path: Path,
     forbidden_metadata: dict[str, object],
 ) -> None:
-    artifact, envelope = _generic_artifact(
-        tmp_path,
-        scope="formal-input",
-        payload_type="formal-image",
-    )
-    envelope["metadata"].update(forbidden_metadata)  # type: ignore[union-attr]
-    envelope["metadata_sha256"] = _sha256_json(envelope["metadata"])
-    _rewrite_envelope(artifact, envelope)
-    digest = "a" * 64
-    authorization = _issue_access_authorization(
-        scope="formal-input",
-        seal_sha256=digest,
-        job_map_sha256=digest,
-        claim_sha256=digest,
-        audit_sha256=digest,
-    )
     with pytest.raises(PermissionError, match="formal-input output semantics"):
-        verify_typed_artifacts(
-            "formal-input",
-            [artifact],
-            authorization=authorization,
+        access_module._reject_denied_metadata(
+            forbidden_metadata,
+            requested_scope="formal-input",
+            artifact_scope="formal-input",
+            context="metadata",
         )

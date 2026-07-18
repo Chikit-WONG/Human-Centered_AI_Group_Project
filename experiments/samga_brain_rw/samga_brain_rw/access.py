@@ -55,7 +55,6 @@ _SCOPE_INPUTS = {
 _AUTHORIZATION_SCOPES = frozenset(
     {"val-confirm", "formal-refit", "formal-input", "formal-test"}
 )
-_AUDITED_AUTHORIZATION_SCOPES = frozenset({"formal-input", "formal-test"})
 
 _CANONICAL_FORMAL_TEST_RECORD_SHA256 = (
     "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84feae7ba64636f1a"
@@ -198,17 +197,13 @@ class TypedArtifact:
             raise ValueError("role must be a non-empty string or None")
 
 
-_AUTHORIZATION_ISSUER_TOKEN = object()
-_ISSUED_AUTHORIZATIONS: dict[int, "AccessAuthorization"] = {}
-
-
 @dataclass(frozen=True, init=False)
 class AccessAuthorization:
-    """Opaque proof capability issued only after specialized chain checks.
+    """Reserved opaque proof for scope-specific verified chain validators.
 
-    The public constructor intentionally fails.  Phase-B seal validation calls
-    the module-internal issuer after it has verified the referenced immutable
-    seal, audit, job-map row, and claim.
+    No generic issuer exists. Until scope-specific validators are wired to
+    immutable job maps and cross-process claim loaders, every sensitive scope
+    remains deliberately unavailable.
     """
 
     scope: AccessScope
@@ -227,47 +222,9 @@ class AccessAuthorization:
         *,
         _issuer_token: object | None = None,
     ) -> None:
-        if _issuer_token is not _AUTHORIZATION_ISSUER_TOKEN:
-            raise PermissionError(
-                "AccessAuthorization is an opaque verified capability"
-            )
-        _require_access_scope(scope)
-        _require_sha256(seal_sha256, "authorization seal_sha256")
-        _require_sha256(job_map_sha256, "authorization job_map_sha256")
-        _require_sha256(claim_sha256, "authorization claim_sha256")
-        if audit_sha256 is not None:
-            _require_sha256(audit_sha256, "authorization audit_sha256")
-        object.__setattr__(self, "scope", scope)
-        object.__setattr__(self, "seal_sha256", seal_sha256)
-        object.__setattr__(self, "job_map_sha256", job_map_sha256)
-        object.__setattr__(self, "claim_sha256", claim_sha256)
-        object.__setattr__(self, "audit_sha256", audit_sha256)
-
-
-def _issue_access_authorization(
-    *,
-    scope: AccessScope,
-    seal_sha256: str,
-    job_map_sha256: str,
-    claim_sha256: str,
-    audit_sha256: str | None = None,
-) -> AccessAuthorization:
-    """Issue a capability after the caller has verified the immutable chain.
-
-    This is an internal integration point for ``artifacts.py``.  Development
-    entry points must not call it directly.
-    """
-
-    authorization = AccessAuthorization(
-        scope=scope,
-        seal_sha256=seal_sha256,
-        job_map_sha256=job_map_sha256,
-        claim_sha256=claim_sha256,
-        audit_sha256=audit_sha256,
-        _issuer_token=_AUTHORIZATION_ISSUER_TOKEN,
-    )
-    _ISSUED_AUTHORIZATIONS[id(authorization)] = authorization
-    return authorization
+        raise PermissionError(
+            "AccessAuthorization is an opaque verified capability"
+        )
 
 
 @dataclass(frozen=True)
@@ -460,27 +417,10 @@ def _validate_authorization(
                 f"{scope} does not accept an authorization capability"
             )
         return
-    if authorization is None:
-        raise PermissionError(f"{scope} requires verified authorization")
-    if not isinstance(authorization, AccessAuthorization):
-        raise PermissionError("invalid access authorization capability")
-    if _ISSUED_AUTHORIZATIONS.get(id(authorization)) is not authorization:
-        raise PermissionError("access authorization was not genuinely issued")
-    if authorization.scope != scope:
-        raise PermissionError(
-            "access authorization scope does not match requested scope"
-        )
-    _require_sha256(authorization.seal_sha256, "authorization seal_sha256")
-    _require_sha256(
-        authorization.job_map_sha256, "authorization job_map_sha256"
+    raise PermissionError(
+        f"{scope} requires its verified seal/job-map/audit/claim chain; "
+        "generic authorization issuance is disabled"
     )
-    _require_sha256(authorization.claim_sha256, "authorization claim_sha256")
-    if scope in _AUDITED_AUTHORIZATION_SCOPES:
-        if authorization.audit_sha256 is None:
-            raise PermissionError(f"{scope} requires an audit proof")
-        _require_sha256(
-            authorization.audit_sha256, "authorization audit_sha256"
-        )
 
 
 def _preflight_artifact_paths(artifact: TypedArtifact) -> None:
