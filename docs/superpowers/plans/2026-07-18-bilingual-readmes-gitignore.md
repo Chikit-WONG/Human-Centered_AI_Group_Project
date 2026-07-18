@@ -176,9 +176,16 @@ Run:
 ```bash
 rg -q 'English \| \[简体中文\]\(README_ZH\.md\)' experiments/samga_reproduction/README.md
 rg -q '\[English\]\(README\.md\) \| 简体中文' experiments/samga_reproduction/README_ZH.md
-for value in '91.30%' '98.80%' '89.55%' '98.65%' '91.95%' '98.95%' '88.95%' '98.90%' '91.50%' '98.75%' '89.02%' '98.87%' '91.82%'; do
-  rg -q "$value" experiments/samga_reproduction/README.md
-  rg -q "$value" experiments/samga_reproduction/README_ZH.md
+for value in \
+  '91.30%' '98.80%' \
+  '89.55%' '98.65%' \
+  '91.95%' '98.95%' \
+  '88.95%' '98.90%' \
+  '91.50%' '98.75%' \
+  '89.02% ± 0.36' '98.87% ± 0.06' \
+  '91.82% ± 0.20' '98.87% ± 0.16'; do
+  rg -Fq "$value" experiments/samga_reproduction/README.md
+  rg -Fq "$value" experiments/samga_reproduction/README_ZH.md
 done
 test "$(rg -c '^```' experiments/samga_reproduction/README.md)" -eq "$(rg -c '^```' experiments/samga_reproduction/README_ZH.md)"
 ```
@@ -348,7 +355,17 @@ git check-ignore -q logs/probe.err
 git check-ignore -q results/probe.csv
 test "$(git check-ignore experiments/samga_reproduction/README.md 2>/dev/null || true)" = ""
 test "$(git check-ignore experiments/samga_reproduction/README_ZH.md 2>/dev/null || true)" = ""
-test -z "$(find experiments -type f -size +10M -not -path '*/__pycache__/*' -print -quit)"
+oversized=()
+while IFS= read -r -d '' file; do
+  if test -f "$file" && test "$(stat -c %s -- "$file")" -gt 10485760; then
+    oversized+=("$file")
+  fi
+done < <(git ls-files --cached --others --exclude-standard -z -- experiments)
+if test "${#oversized[@]}" -ne 0; then
+  printf 'Unignored experiment file exceeds 10 MiB:\n' >&2
+  printf '  %s\n' "${oversized[@]}" >&2
+  exit 1
+fi
 ```
 
 Expected: all generated paths are ignored, both guides remain visible to Git,
