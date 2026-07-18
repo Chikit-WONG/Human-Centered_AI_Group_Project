@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 import torch.nn as nn
 
-from samga_brain_rw.hashing import sha256_json
+from samga_brain_rw.hashing import canonical_json_bytes, sha256_json
 from samga_brain_rw.internvit import (
     LoraTarget,
     build_lora_target_manifest,
     resolve_internvit_components,
     resolve_lora_targets,
 )
+from scripts import resolve_lora_targets as resolver_cli
 
 
 class FakeAttention(nn.Module):
@@ -292,3 +294,85 @@ def test_manifest_serializes_semantics_without_live_modules_and_binds_hash() -> 
         for target in targets
         for value in target.values()
     )
+
+
+def test_cli_publisher_is_canonical_exclusive_and_never_serializes_weights(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "lora_targets_v1.json"
+
+    manifest = resolver_cli.publish_lora_target_manifest(
+        FakeInternViT(),
+        output_path,
+    )
+
+    original = output_path.read_bytes()
+    assert original == canonical_json_bytes(manifest) + b"\n"
+    assert b"weight_shape" in original
+    assert b"weight" not in original.replace(b"weight_shape", b"")
+    with pytest.raises(FileExistsError):
+        resolver_cli.publish_lora_target_manifest(
+            FakeInternViT(),
+            output_path,
+        )
+    assert output_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "unsafe_component",
+    [
+        "test_images",
+        "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84feae7ba64636f1a",
+        "sub-01_test.json",
+    ],
+)
+def test_cli_rejects_forbidden_paths_before_model_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_component: str,
+) -> None:
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        resolver_cli,
+        "load_pinned_model_offline",
+        lambda path: calls.append(path),
+    )
+
+    with pytest.raises(ValueError, match="forbidden"):
+        resolver_cli.main(
+            [
+                "--model-path",
+                str(tmp_path / unsafe_component),
+                "--output",
+                str(tmp_path / "targets.json"),
+            ]
+        )
+
+    assert calls == []
+
+
+def test_cli_rejects_existing_output_before_model_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "lora_targets_v1.json"
+    output_path.write_bytes(b"existing")
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        resolver_cli,
+        "load_pinned_model_offline",
+        lambda path: calls.append(path),
+    )
+
+    with pytest.raises(FileExistsError):
+        resolver_cli.main(
+            [
+                "--model-path",
+                str(tmp_path / "model"),
+                "--output",
+                str(output_path),
+            ]
+        )
+
+    assert calls == []
+    assert output_path.read_bytes() == b"existing"
