@@ -1,5 +1,7 @@
 # SAMGA + brain-rw Prioritized Experiment Design
 
+[中文](./2026-07-19-samga-brain-rw-combination-design-zh.md)
+
 **Date:** 2026-07-19  
 **Status:** Proposed for implementation  
 **Repository:** `Human-Centered_AI_Group_Project`  
