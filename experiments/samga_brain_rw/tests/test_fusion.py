@@ -206,6 +206,18 @@ def test_stage1_grid_has_exact_deterministic_47_configs() -> None:
     )
 
 
+def test_enumerated_grid_exactly_matches_tracked_stage1_candidates(
+    configs_dir: Path,
+) -> None:
+    tracked = json.loads(
+        (configs_dir / "stage1_fusion_v1.json").read_text("utf-8")
+    )
+
+    assert [config.to_dict() for config in enumerate_stage1_configs()] == (
+        tracked["candidates"]
+    )
+
+
 def test_querywise_zscore_is_float64_population_and_zeroes_constant_rows() -> None:
     scores = np.array([[1.0, 2.0, 3.0], [7.0, 7.0, 7.0]], dtype=np.float32)
 
@@ -611,6 +623,7 @@ def test_fusion_selector_requires_exact_complete_47_config_grid() -> None:
 def test_score_fusion_cli_consumes_typed_val_dev_and_binds_inputs(
     tmp_path: Path,
     experiment_root: Path,
+    configs_dir: Path,
 ) -> None:
     left, right = _save_pair(tmp_path / "inputs")
     output = tmp_path / "fusion-grid.json"
@@ -627,6 +640,17 @@ def test_score_fusion_cli_consumes_typed_val_dev_and_binds_inputs(
     assert document["schema_version"] == 1
     assert document["artifact_type"] == "samga_brain_rw.stage1_fusion_grid"
     assert document["scope"] == "val-dev"
+    tracked = json.loads(
+        (configs_dir / "stage1_fusion_v1.json").read_text("utf-8")
+    )
+    assert document["grid"]["config_id"] == "stage1_fusion_v1"
+    assert document["grid"]["candidates"] == tracked["candidates"]
+    assert document["grid"]["candidates_sha256"] == sha256_json(
+        document["grid"]["candidates"]
+    )
+    assert document["grid"]["candidates_sha256"] == sha256_json(
+        [config.to_dict() for config in enumerate_stage1_configs()]
+    )
     assert len(document["results"]) == 47
     assert [item["config_id"] for item in document["results"]] == [
         config.config_id for config in enumerate_stage1_configs()
@@ -669,6 +693,70 @@ def test_score_fusion_cli_exclusively_preserves_existing_output(
 
     assert result.returncode != 0
     assert output.read_bytes() == b"owned"
+
+
+@pytest.mark.parametrize(
+    "relative_output",
+    [
+        ("test_images", "fusion.json"),
+        ("VAL-CONFIRM", "fusion.json"),
+        ("formal-test", "fusion.json"),
+        ("SUB-07_TEST.JSON",),
+        (
+            "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84feae7ba64636f1a",
+            "fusion.json",
+        ),
+    ],
+    ids=[
+        "test-images",
+        "val-confirm",
+        "formal-test",
+        "subject-test-manifest",
+        "canonical-formal-digest",
+    ],
+)
+def test_score_fusion_cli_rejects_sensitive_output_paths_without_creation(
+    tmp_path: Path,
+    experiment_root: Path,
+    relative_output: tuple[str, ...],
+) -> None:
+    left, right = _save_pair(tmp_path / "inputs")
+    forbidden_root = tmp_path / "forbidden-output"
+    output = forbidden_root.joinpath(*relative_output)
+
+    result = _run_fusion_cli(
+        experiment_root,
+        left.directory,
+        right.directory,
+        output,
+    )
+
+    assert result.returncode != 0
+    assert not output.exists()
+    assert not forbidden_root.exists()
+
+
+def test_score_fusion_cli_rejects_symlink_parent_without_writing_target(
+    tmp_path: Path,
+    experiment_root: Path,
+) -> None:
+    left, right = _save_pair(tmp_path / "inputs")
+    real_parent = tmp_path / "real-output"
+    real_parent.mkdir()
+    symlink_parent = tmp_path / "linked-output"
+    symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    output = symlink_parent / "fusion.json"
+
+    result = _run_fusion_cli(
+        experiment_root,
+        left.directory,
+        right.directory,
+        output,
+    )
+
+    assert result.returncode != 0
+    assert list(real_parent.iterdir()) == []
+    assert symlink_parent.is_symlink()
 
 
 def test_score_fusion_cli_never_writes_inside_an_input_bundle(

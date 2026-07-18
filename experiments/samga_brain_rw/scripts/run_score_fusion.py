@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -20,7 +21,16 @@ from samga_brain_rw.scores import (
 
 
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_FORMAL_TEST_RECORD_SHA256 = (
+    "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84feae7ba64636f1a"
+)
+_SUBJECT_TEST_RE = re.compile(r"^sub-\d{2}_test\.json$", re.IGNORECASE)
+_FORBIDDEN_OUTPUT_COMPONENTS = frozenset(
+    {"test_images", "val-confirm", "formal-test"}
+)
+_GRID_CONFIG_ID = "stage1_fusion_v1"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -68,12 +78,29 @@ def _branch_id(value: str, name: str) -> str:
     return value
 
 
-def _reject_existing_output(path: Path) -> None:
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return
-    raise FileExistsError(f"fusion output already exists: {path}")
+def _validated_output_path(path: Path) -> Path:
+    raw = os.fspath(path)
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise ValueError("fusion output path is forbidden")
+    destination = Path(os.path.abspath(os.path.normpath(raw)))
+    lowered = raw.lower()
+    if _FORMAL_TEST_RECORD_SHA256 in lowered:
+        raise ValueError("fusion output path contains the formal-test digest")
+    components: list[str] = []
+    for component in (*Path(raw).parts, *destination.parts):
+        components.extend(
+            part for part in re.split(r"[\\/]+", component) if part
+        )
+    if any(_SUBJECT_TEST_RE.fullmatch(component) for component in components):
+        raise ValueError("fusion output path names a formal-test subject manifest")
+    if any(
+        component.lower() in _FORBIDDEN_OUTPUT_COMPONENTS
+        for component in components
+    ):
+        raise ValueError("fusion output path contains a sealed-scope component")
+    if not destination.name or destination == destination.parent:
+        raise ValueError("fusion output must name a file")
+    return destination
 
 
 def _reject_output_inside_inputs(
@@ -93,20 +120,57 @@ def _reject_output_inside_inputs(
         )
 
 
+def _open_output_parent_nofollow(path: Path) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW
+    directory_fd = -1
+    try:
+        directory_fd = os.open(absolute.anchor, flags)
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except OSError as exc:
+                    raise ValueError(
+                        f"cannot safely create fusion output parent: {absolute}"
+                    ) from exc
+                try:
+                    next_fd = os.open(component, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise ValueError(
+                        f"cannot safely open fusion output parent: {absolute}"
+                    ) from exc
+            except OSError as exc:
+                raise ValueError(
+                    f"symlink or invalid fusion output parent: {absolute}"
+                ) from exc
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        raise
+
+
 def _write_exclusive(path: Path, payload: bytes) -> None:
-    destination = Path(os.path.abspath(os.fspath(path)))
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = _validated_output_path(path)
+    parent_fd = _open_output_parent_nofollow(destination.parent)
     descriptor = -1
     created = False
     try:
         descriptor = os.open(
-            destination,
+            destination.name,
             os.O_WRONLY
             | os.O_CREAT
             | os.O_EXCL
             | _O_NOFOLLOW
             | _O_CLOEXEC,
             0o600,
+            dir_fd=parent_fd,
         )
         created = True
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
@@ -114,23 +178,22 @@ def _write_exclusive(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        parent_fd = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _O_CLOEXEC,
-        )
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        os.fsync(parent_fd)
     except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
         if created:
             try:
-                os.unlink(destination)
-            except FileNotFoundError:
+                os.unlink(destination.name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            try:
+                os.fsync(parent_fd)
+            except OSError:
                 pass
         raise
+    finally:
+        os.close(parent_fd)
 
 
 def _metrics_payload(metrics: object) -> dict[str, object]:
@@ -172,7 +235,7 @@ def _alignment_payload(artifact: ScoreArtifact) -> dict[str, object]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    output = Path(arguments.output)
+    output = _validated_output_path(arguments.output)
     # Refuse conflicts before opening either input.
     _reject_output_inside_inputs(
         output,
@@ -181,7 +244,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.clip_score_directory,
         ),
     )
-    _reject_existing_output(output)
     internvit_branch_id = _branch_id(
         arguments.internvit_branch_id, "internvit_branch_id"
     )
@@ -199,8 +261,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     assert_aligned(internvit, clip)
 
+    configs = enumerate_stage1_configs()
+    candidate_payload = [config.to_dict() for config in configs]
     results: list[dict[str, object]] = []
-    for config in enumerate_stage1_configs():
+    for config in configs:
         fused = config.apply(
             internvit.similarity,
             clip.similarity,
@@ -219,6 +283,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": 1,
         "artifact_type": "samga_brain_rw.stage1_fusion_grid",
         "scope": "val-dev",
+        "grid": {
+            "config_id": _GRID_CONFIG_ID,
+            "candidates": candidate_payload,
+            "candidates_sha256": sha256_json(candidate_payload),
+        },
         "inputs": {
             "internvit": _input_binding(internvit, internvit_branch_id),
             "clip": _input_binding(clip, clip_branch_id),
