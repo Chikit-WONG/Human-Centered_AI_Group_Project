@@ -4,9 +4,13 @@ English | [简体中文](README_ZH.md)
 
 Course project for **AIAA3800 — Human-Centered Artificial Intelligence**.
 
-This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The formal standard protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`) at each of five seeds (`42` through `46`). A global one-to-one Hungarian decoder is retained only as a transductive seed-42 Subject-08 ablation.
+This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The original formal protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`) at each of five seeds (`42` through `46`). A controlled SAMGA experiment isolates the effect of applying the same visual LoRA/TTUR intervention to an otherwise identical frozen-CLIP SAMGA control. A third, separate track performs an audited best-effort reproduction with the released SAMGA training code and pinned inferred InternViT V2.5 features. A global one-to-one Hungarian decoder is retained only as a transductive seed-42 Subject-08 ablation.
 
-> **Scope.** Standard Top-1/Top-5 results cover a complete 10-subject × 5-seed grid: seeds `42`, `43`, `44`, `45`, and `46`, with 50 independently trained subject–seed models. The primary statistic first computes the ten-subject macro accuracy within each seed, then reports the mean and sample standard deviation (`ddof=1`) across the five seed-level accuracies. The Hungarian result covers only seed `42` / `sub-08` and is excluded from every standard aggregate.
+> **Scope.** The original headline result covers a complete 10-subject × 5-seed grid: seeds `42`, `43`, `44`, `45`, and `46`, with 50 independently trained subject–seed models. The controlled SAMGA extension adds 50 matched Frozen models and 50 matched LoRA models on the same grid. The public-code reproduction separately evaluates released-launcher seed `2025` and a project-defined fixed-60 stability grid at seeds `42`–`46`; the latter are not claimed to be the paper's undisclosed seeds. Results remain separate because the paper does not publish its exact visual checkpoint, extractor, five seed values, or checkpoint-selection rule. The Hungarian result covers only seed `42` / `sub-08` and is excluded from every standard aggregate.
+
+> **Reproduction guide.** For pinned assets, executable commands, complete
+> protocol details, and claim boundaries, see the
+> [English SAMGA public-code reproduction guide](experiments/samga_reproduction/README.md).
 
 ## Highlights
 
@@ -15,6 +19,8 @@ This repository studies whether non-invasive EEG recordings can be mapped into a
 - Uses different learning rates for the brain and vision branches (TTUR-style optimization).
 - Reports a fixed final-checkpoint result for every subject–seed run rather than selecting the best test epoch.
 - Trains and evaluates all 50 subject–seed models independently, then reports both per-seed ten-subject and five-seed standard Top-1/Top-5 aggregates.
+- Runs a pre-registered 50-pair SAMGA Frozen-versus-LoRA attribution study with matched task initialization and a sealed concept-disjoint pilot validation split.
+- Audits the released SAMGA source, pins an inferred InternViT V2.5 revision, and reports fixed/final and test-selected metrics under explicitly different labels.
 - Provides unit tests, independent checkpoint-reload checks, and per-query predictions for every standard run, plus similarity-matrix provenance for the seed-42 / `sub-08` Hungarian ablation.
 
 ## Method
@@ -85,6 +91,51 @@ For each subject, the ± term is the sample SD (`ddof=1`) across that subject's 
 
 Metadata note: the reused legacy seed-42 / `sub-08` metrics omit the Conda-environment and SciPy-version fields. Their recorded Python, PyTorch, Transformers, Datasets, PEFT, CUDA device, and dtype values match the other runs; the separate dataset-provenance limitation is documented below.
 
+### Controlled SAMGA + visual LoRA/TTUR extension
+
+To answer whether our intervention also helps on top of SAMGA, we ran a separate controlled attribution experiment. Both arms use the same CLIP ViT-B/32 visual backbone, SAMGA EEGProject encoder, subject-aware five-layer router, projectors, two-stage MMD/contrastive objective, 17 posterior channels, trial averaging, train rows, batch order, and seeds. The only intended trainable difference is frozen visual features versus rank-32 visual LoRA on q/k/v/out and MLP projections. Each Frozen/LoRA pair has an identical recorded task-initialization hash. The Frozen arm uses a shared float16 feature cache; cache/online parity passed with minimum vector cosine 0.999939, and zero-LoRA retrieval metrics were identical.
+
+The pilot used only a concept-disjoint validation split on subjects 01, 05, and 08 at seeds 42 and 43. It locked the vision/task learning-rate ratio at `0.20` and the shared stopping epoch at `25`; all ten subjects were then retrained on all training concepts, and the test gallery was evaluated once. Training follows the released SAMGA normalization convention—image features are L2-normalized in the contrastive loss, EEG features are not—while evaluation uses cosine similarity.
+
+| Controlled arm | Top-1 | Top-5 |
+|---|---:|---:|
+| SAMGA with frozen CLIP | 76.17% ± 0.30 | 95.79% ± 0.32 |
+| SAMGA + visual LoRA/TTUR | **82.68% ± 0.36** | **97.67% ± 0.17** |
+| Paired change | **+6.51 points**, 95% CI **[+5.22, +7.69]** | **+1.88 points**, 95% CI **[+1.30, +2.50]** |
+
+The ± term is again the sample SD across the five seed-level ten-subject macro scores. The confidence intervals use the pre-registered two-way subject/seed cluster bootstrap with 10,000 resamples. Top-1 improved in 48/50 paired cells, Top-5 improved in 47/50, and the mean Top-1 change was positive for every subject. The pre-registered criterion—at least +0.5 Top-1 points, a Top-1 interval lower bound above zero, and no mean Top-5 loss worse than 0.2 points—**passed**. No Hungarian decoding was used.
+
+This is evidence that the visual LoRA/TTUR intervention transfers to a SAMGA-style training stack under a controlled CLIP backbone. It is **not** an exact reproduction of SAMGA's paper-reported 91.3%/98.8%: that result uses undisclosed precomputed InternViT features, whereas this comparison deliberately holds CLIP ViT-B/32 fixed to identify the intervention effect. The 82.68% controlled-extension Top-1 also does not replace this repository's original 86.66% headline result.
+
+### Audited SAMGA public-code reproduction attempt
+
+We kept the official SAMGA source tree clean at commit `1a63745b7ff6f98dad34b0f0b8246a9b5260d9c1` and pinned the inferred `OpenGVLab/InternViT-6B-448px-V2_5` revision `9d1a4344077479c93d42584b6941c64d795d508d`. The explicitly assumed visual representation uses actual block outputs 20/24/28/32/36, patch-token mean excluding CLS, and no additional per-vector normalization. Selection followed a limited Subject-08 then Subject-01/05 screen, so this is an audited approximate reproduction rather than a prospectively locked or paper-exact one.
+
+| Seed-2025 public-code diagnostic | Top-1 | Top-5 | Top-1 gap | Top-5 gap |
+|---|---:|---:|---:|---:|
+| No early stopping, fixed epoch 60 | **89.55%** | **98.65%** | -1.75 points | -0.15 points |
+| Per-epoch test-set-selected value | **91.95%** | **98.95%** | +0.65 points | +0.15 points |
+
+The released-launcher-compatible seed-2025 confirmation uses batch 512 and the public code's default patience 10:
+
+| Seed-2025 patience-10 diagnostic | Top-1 | Top-5 | Top-1 gap | Top-5 gap |
+|---|---:|---:|---:|---:|
+| Actual stopping/final epoch | **88.95%** | **98.90%** | -2.35 points | +0.10 points |
+| Per-epoch test-set-selected value | **91.50%** | **98.75%** | +0.20 points | -0.05 points |
+
+Actual stopping epochs range from 30 to 60, with mean 37.4 ± 9.55 across subjects. Because the stopping rule itself monitors formal-test Top-1, even the stopping/final row is test-conditioned.
+
+The project-defined seeds `42`–`46` provide a separate fixed-60 stability check:
+
+| Project-defined five-seed protocol | Top-1 | Top-5 | Top-1 gap | Top-5 gap |
+|---|---:|---:|---:|---:|
+| Epoch 60, no early stopping | **89.02% ± 0.36** | **98.87% ± 0.06** | -2.28 points | +0.07 points |
+| Per-epoch test-set-selected diagnostic | **91.82% ± 0.20** | **98.87% ± 0.16** | +0.52 points | +0.07 points |
+
+For the five-seed rows, each seed is first macro-averaged over ten subjects, and ± is the sample SD across the five seed-level means. The selected rows directly inspect the formal test set every epoch; Top-5 is the companion value at the Top-1-selected epoch. The public code's patience-10 early stopping also monitors formal-test Top-1. These are test-leaking diagnostics, not leakage-free project estimates. Every row uses standard independent 200-way cosine retrieval, never Hungarian assignment.
+
+The [SAMGA public-code reproduction guide](experiments/samga_reproduction/README.md) records the source/model/data hashes, public-material conflicts, extraction assumptions, commands, and limitations. Detailed CSV/JSON reports remain local under `results/samga_reproduction`, which is intentionally ignored by Git.
+
 ### Comparison with prior EEG-to-image retrieval work
 
 The table below uses the closest identifiable protocol in the literature: **intra-subject, 200-way, zero-shot retrieval on THINGS-EEG2**, averaged over all ten subjects. Each EEG query is ranked independently against the 200 held-out stimulus images; the Hungarian result is therefore excluded. Values are the headline results from each paper's main comparison table. The largest value in each metric column is bold, and our results are additionally highlighted in blue.
@@ -102,6 +153,8 @@ The table below uses the closest identifiable protocol in the literature: **intr
 | Our project (standard retrieval) | Course project, fixed protocol | $\color{blue}{\mathbf{86.66\%}}$ | $\color{blue}{\mathbf{98.38\%}}$ | Five-seed mean; 17 channels; fixed epoch-25 checkpoint |
 
 Although our project does not take first place in this selected comparison, **ranking second on both metrics is still a strong result**: Top-1 $\color{blue}{\mathbf{86.66\%}}$ and Top-5 $\color{blue}{\mathbf{98.38\%}}$. Our project exceeds every peer-reviewed literature row in the table; the only higher row is SAMGA, which is currently a non-peer-reviewed preprint. This is **not** an unqualified state-of-the-art claim: our five-seed mean is now closer in seed count to the reporting of Shallow Alignment and SAMGA, but the papers still differ in visual targets, pretrained encoders, training schedules, and checkpoint-selection rules. HCF and Shallow Alignment are also preprints. The hierarchical-visual-embedding paper reports 94.60% in its main table, although the ten displayed per-subject Top-5 values average to approximately 94.91%.
+
+The reproduction above is not added as a separate ranking row because it is another evaluation of SAMGA itself, not a new method.
 
 Two further reporting decisions prevent protocol mixing:
 
@@ -137,7 +190,7 @@ The recommended reporting convention is therefore:
 
 Hungarian assignment is not used in any ten-subject, per-seed, or five-seed score.
 
-## Experiment Configuration
+## Original-project Experiment Configuration
 
 | Component | Setting |
 |---|---|
@@ -187,6 +240,18 @@ Hungarian assignment is not used in any ten-subject, per-seed, or five-seed scor
 │   ├── test_multiseed_aggregation.py
 │   ├── test_subject_metric_validation.py
 │   └── test_submit_multiseed_array.py
+├── experiments/samga_lora/        # Controlled SAMGA Frozen/LoRA study
+│   ├── samga_lora/                 # Data, model, loss, and metric utilities
+│   ├── scripts/                    # Preflight, pilot, formal, and aggregation gates
+│   ├── exploratory_internvit/      # Clearly labelled inferred-model extension
+│   └── tests/                      # Independent extension tests
+├── experiments/samga_reproduction/ # Audited released-code reproduction
+│   ├── README.md                   # Protocol, results, and claim boundaries
+│   ├── V2_5_FEATURE_PIPELINE.md    # Pinned extraction and verification
+│   ├── run_official_cell.sh        # Fail-closed single-subject runner
+│   ├── aggregate_official_results.py
+│   └── tests/                      # Download, feature, runner, and aggregation tests
+├── previous_work/clip_lora_baseline/ # Snapshot of the pre-SAMGA README
 ├── docs/                            # Internal technical notes
 ├── train_clip_lora.py               # Main training entry point
 ├── vanilla.py                       # Experimental reconstruction path
@@ -194,7 +259,7 @@ Hungarian assignment is not used in any ten-subject, per-seed, or five-seed scor
 └── graph.py                         # Experimental graph-based refinement
 ```
 
-Generated checkpoints, caches, logs, plans, and result artifacts are intentionally excluded by `.gitignore`.
+Generated checkpoints, caches, logs, plans, and result artifacts are intentionally excluded by `.gitignore`. Experiment implementations, protocol documentation, tests, and launchers remain versionable.
 
 ## Environment Setup
 
@@ -231,13 +296,30 @@ python --version
 which python
 ```
 
-No additional installation is needed for standard or Hungarian retrieval. The existing `test` environment is **not** recommended for the formal run: its package versions differ from the table above and it currently has a `libstdc++`/`GLIBCXX` import conflict on the cluster.
+No additional installation is needed for standard or Hungarian retrieval. Reproduce the original 86.66%/98.38% result with `eeg_recon`; the separately validated `test` environment below supports the controlled SAMGA extension and the audited public-code reproduction, and must not be presented as the original run's software stack.
 
 To preserve `eeg_recon` unchanged while creating a separate working copy:
 
 ```bash
 conda create --name eeg-retrieval --clone eeg_recon -y
 conda activate eeg-retrieval
+```
+
+### Environment for the SAMGA extensions
+
+The Frozen/LoRA comparison and released-code reproduction were run in the existing `test` environment: Python 3.10.18, PyTorch 2.10.0+cu126, TorchVision 0.25.0+cu126, Transformers 4.57.6, PEFT 0.18.1, Accelerate 1.13.0, NumPy 1.26.4, SciPy 1.15.3, scikit-learn 1.7.2, and Timm 1.0.26. Activate it separately:
+
+```bash
+source /hpc2hdd/home/ckwong627/miniconda3/etc/profile.d/conda.sh
+conda activate test
+python -c "import torch, transformers, peft, scipy, timm"
+```
+
+The controlled extension's portable dependency list is in `experiments/samga_lora/requirements.txt`; the released-code workflow and exact pinned assets are documented separately in `experiments/samga_reproduction/README.md`. PyTorch must still be installed with a build compatible with the target CUDA driver. The cluster's `test` environment does not include the optional `pytest` package; run the repository tests from any compatible environment that provides it (the existing `eeg_recon` environment is one such choice):
+
+```bash
+conda activate eeg_recon
+PYTHONPATH=experiments/samga_lora python -m pytest -q experiments/samga_lora/tests
 ```
 
 ### Option B: create the tested environment from scratch
@@ -431,6 +513,26 @@ bash scripts/run_subject_reproduction.sh formal --subject-id 1 --seed "$SEED"
 
 Run a smoke test before the formal job if using new hardware or a newly prepared dataset.
 
+### Controlled SAMGA extension
+
+The separate [SAMGA + visual LoRA guide](experiments/samga_lora/README.md) documents the manifest, frozen-feature cache, parity/smoke, concept-disjoint pilot, locked selection, and formal stages. Formal jobs refuse to evaluate the test set unless the pilot gate passed and the locked source hashes still match. On this cluster, the 100 cells were submitted in non-overlapping scheduler-safe ranges; the reusable ten-cell launcher is:
+
+```bash
+bash experiments/samga_lora/scripts/submit_formal_chunk.sh 0
+# After completion, repeat with 10, 20, ..., 90.
+
+python experiments/samga_lora/scripts/aggregate_formal.py \
+  --formal-root artifacts/samga_lora/formal \
+  --locked-config artifacts/samga_lora/pilot_selection.json \
+  --output-dir results/samga_lora
+```
+
+The confirmatory protocol is standard independent retrieval only. Do not add Hungarian assignment to the SAMGA aggregate.
+
+### Audited SAMGA public-code reproduction
+
+The separate [public-code reproduction guide](experiments/samga_reproduction/README.md) documents the pinned model revision and hashes, safe download, V2.5 feature extraction, fixed-60 and released-launcher patience-10 protocols, project-defined five-seed stability grid, strict aggregation, and test-selection leakage. The official SAMGA source tree remains unmodified.
+
 ## Evaluation
 
 Define the common evaluation arguments in Bash:
@@ -490,6 +592,13 @@ python -m unittest discover -s tests -v
 
 The tests cover Hungarian solver optimality, collision resolution, invalid matrices, non-diagonal ID mappings, and row/column permutation invariance for a unique optimum. They also verify seed-list parsing, `ddof=1` sample-standard-deviation behavior, seed-level aggregation order, per-subject cross-seed summaries, prediction-field semantics, and SLURM array range/task mapping for default and custom seed lists.
 
+The SAMGA reproduction utilities have a separate suite:
+
+```bash
+/hpc2hdd/home/ckwong627/miniconda3/envs/eeg_recon/bin/python \
+  -m pytest -q experiments/samga_reproduction/tests
+```
+
 ## SLURM Wrappers
 
 The repository includes launchers used on the HKUST(GZ) cluster:
@@ -548,7 +657,7 @@ These shell and SLURM files currently contain site-specific absolute paths. Befo
 
 The direct training and evaluation commands above are the portable reference commands.
 
-## Reproducibility Policy
+## Original-project Reproducibility Policy
 
 - The official metric is evaluated from the fixed final checkpoint after epoch 25.
 - Test-set peak epochs are diagnostic only and are not used for checkpoint selection.
@@ -568,7 +677,7 @@ The direct training and evaluation commands above are the portable reference com
 - Each subject uses an independent model; this experiment does not evaluate cross-subject generalization.
 - Seeded training does not enforce PyTorch deterministic algorithms for every GPU operation, so retraining the same subject and seed is not guaranteed to be bitwise identical. The independent checkpoint-reload evaluation verifies saved artifacts, not bitwise reproducibility of a new training run.
 - The 10,000 query evaluations reuse each subject's same 200 held-out stimuli across five seeds and therefore must not be treated as 10,000 statistically independent examples.
-- The reproduced training loop invokes gradient clipping before `backward()`, so the configured maximum gradient norm does not affect these runs. All 50 subject–seed runs use this same behavior; correcting the order would define a different protocol and require a full rerun.
+- The original-project training loop invokes gradient clipping before `backward()`, so the configured maximum gradient norm does not affect those 50 subject–seed runs. Correcting the order would define a different protocol and require a full rerun.
 - Trial averaging uses repeated presentations and is not equivalent to single-trial decoding.
 - The Hungarian ablation was verified only for seed `42` / `sub-08`; it must not be extrapolated to other subjects or seeds. It also requires the complete query batch and a known one-to-one gallery prior, so it is not an online single-query retrieval protocol.
 - The reused legacy seed-42 / `sub-08` metrics record an earlier dataset root that is no longer available. Its historical byte identity with the current `EEG_Recon-RL` dataset root cannot be verified retrospectively; the saved model/result artifacts, protocol, and repeat-reload checks remain validated, but the data-source claim for that one run is limited.
