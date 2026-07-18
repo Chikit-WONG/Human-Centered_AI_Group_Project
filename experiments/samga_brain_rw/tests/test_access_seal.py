@@ -171,6 +171,33 @@ def test_access_authorization_cannot_be_publicly_forged() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "payload_type",
+    [
+        "samga_brain_rw.protocol_config",
+        "samga_brain_rw.semantic_config",
+        "samga_brain_rw.source_manifest",
+        "samga_brain_rw.source_train_pt",
+        "samga_brain_rw.model_config",
+        "samga_brain_rw.model_preprocessor",
+        "samga_brain_rw.model_source",
+        "samga_brain_rw.model_weights",
+        "samga_brain_rw.train_cache",
+        "samga_brain_rw.train_cache_metadata",
+    ],
+)
+def test_task4_train_provenance_types_are_explicitly_allowed(
+    tmp_path: Path,
+    payload_type: str,
+) -> None:
+    artifact, _ = _generic_artifact(
+        tmp_path / payload_type.rsplit(".", 1)[-1],
+        payload_type=payload_type,
+    )
+
+    assert len(verify_typed_artifacts("train", [artifact])) == 1
+
+
 def test_scope_allowlist_rejects_val_dev_from_train(tmp_path: Path) -> None:
     artifact, envelope = _generic_artifact(tmp_path)
     envelope["scope"] = "val-dev"
