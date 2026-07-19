@@ -26,7 +26,6 @@ from .provenance import (
 
 
 CAPABILITY_MAP_FILENAME = "capability_map.json"
-_GENERATOR = "samga_brain_rw.capability_map.v1"
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -211,7 +210,7 @@ def _build_generic_envelope(
     }
     provenance = {
         "experiment_revision": inputs.experiment_revision,
-        "generator": _GENERATOR,
+        "generator": _provenance.CAPABILITY_ENVELOPE_GENERATOR,
         "protocol_config_sha256": inputs.oracles.protocol_config_sha256,
     }
     return {

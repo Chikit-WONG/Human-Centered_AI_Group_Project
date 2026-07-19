@@ -20,6 +20,7 @@ from samga_brain_rw.hashing import (
 from samga_brain_rw.provenance import (
     CAPABILITY_PAYLOAD_TYPES,
     ProvenanceInputs,
+    build_provenance_manifest,
     expected_capability_paths,
 )
 from scripts.build_stage0_capability_map import parse_args
@@ -140,6 +141,11 @@ def test_builder_writes_exact_canonical_map_and_39_verifiable_sidecars(
         assert metadata["source_records"] == []
         assert envelope["metadata_sha256"] == sha256_json(metadata)
         assert envelope["provenance_sha256"] == sha256_json(provenance)
+        assert provenance == {
+            "experiment_revision": synthetic_inputs.experiment_revision,
+            "generator": "samga_brain_rw.capability_map.v1",
+            "protocol_config_sha256": synthetic_inputs.oracles.protocol_config_sha256,
+        }
         assert envelope["ordered_ids_sha256"] == ordered_ids_sha256(
             metadata["ordered_ids"]
         )
@@ -153,6 +159,15 @@ def test_builder_writes_exact_canonical_map_and_39_verifiable_sidecars(
     )
     assert len(verified) == 49
     assert tuple(verified) == tuple(CAPABILITY_PAYLOAD_TYPES)
+
+    manifest = build_provenance_manifest(
+        replace(synthetic_inputs, verified_artifacts=verified)
+    )
+    inventory = manifest["capability_inventory"]
+    assert inventory["artifact_count"] == 49
+    assert inventory["inventory_sha256"] == sha256_json(
+        inventory["artifacts"]
+    )
 
 
 def test_builder_never_globs_and_creates_output_only_after_all_validation(

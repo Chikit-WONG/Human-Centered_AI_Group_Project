@@ -14,6 +14,7 @@ from samga_brain_rw.access import (
     VerifiedArtifact,
     verify_typed_artifacts,
 )
+from samga_brain_rw.capability_map import build_stage0_capability_map
 from samga_brain_rw.hashing import canonical_json_bytes, ordered_ids_sha256, sha256_json
 from samga_brain_rw.provenance import (
     CAPABILITY_PAYLOAD_TYPES,
@@ -30,6 +31,7 @@ from samga_brain_rw.provenance import (
 from scripts.preflight import (
     capture_environment,
     load_and_verify_capability_map,
+    main as preflight_main,
     parse_args,
     publish_canonical_exclusive,
 )
@@ -112,6 +114,21 @@ def _capability(
         role=role,
     )
     return verify_typed_artifacts("train", [descriptor])[0]
+
+
+def _refresh_generic_capability(
+    capability: VerifiedArtifact,
+) -> VerifiedArtifact:
+    """Refresh one strict fixture sidecar after an intentional payload edit."""
+
+    path = capability.artifact.payload_path
+    envelope_path = capability.artifact.envelope_path
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    envelope["payload_sha256"] = _digest(path)
+    envelope["metadata"]["byte_count"] = path.stat().st_size
+    envelope["metadata_sha256"] = sha256_json(envelope["metadata"])
+    _write_json(envelope_path, envelope)
+    return verify_typed_artifacts("train", [capability.artifact])[0]
 
 
 def _semantic_payloads(
@@ -675,6 +692,15 @@ def synthetic_inputs(
         oracles=oracles,
     )
 
+    map_path = build_stage0_capability_map(
+        replace(inputs, verified_artifacts={}),
+        tmp_path / "fixture-capabilities",
+    )
+    capabilities = load_and_verify_capability_map(
+        map_path,
+        expected_capability_paths(inputs),
+    )
+    inputs = replace(inputs, verified_artifacts=capabilities)
     return inputs, capabilities
 
 
@@ -772,7 +798,7 @@ def test_all_ten_train_pt_hashes_and_sizes_are_pinned() -> None:
 def test_build_manifest_uses_only_verified_explicit_inputs_and_exact_semantics(
     synthetic_inputs: tuple[ProvenanceInputs, dict[str, VerifiedArtifact]],
 ) -> None:
-    inputs, _ = synthetic_inputs
+    inputs, capabilities = synthetic_inputs
     manifest = build_provenance_manifest(inputs)
 
     assert set(manifest) == {
@@ -788,6 +814,7 @@ def test_build_manifest_uses_only_verified_explicit_inputs_and_exact_semantics(
         "extraction_semantics",
         "environment",
         "checks",
+        "capability_inventory",
     }
     assert manifest["schema_version"] == 1
     assert manifest["payload_type"] == "samga_brain_rw.provenance_manifest"
@@ -818,8 +845,130 @@ def test_build_manifest_uses_only_verified_explicit_inputs_and_exact_semantics(
     assert "_test.json" not in rendered
     assert "val-confirm" not in json.dumps(manifest).lower()
 
+    inventory = manifest["capability_inventory"]
+    assert set(inventory) == {
+        "artifact_count",
+        "artifacts",
+        "inventory_sha256",
+    }
+    assert inventory["artifact_count"] == 49
+    artifacts = inventory["artifacts"]
+    assert [entry["key"] for entry in artifacts] == list(
+        CAPABILITY_PAYLOAD_TYPES
+    )
+    assert inventory["inventory_sha256"] == sha256_json(artifacts)
+    assert all(
+        set(entry)
+        == {
+            "envelope_path",
+            "envelope_sha256",
+            "key",
+            "payload_path",
+            "payload_sha256",
+            "payload_type",
+            "role",
+        }
+        for entry in artifacts
+    )
+    assert all(Path(entry["payload_path"]).is_absolute() for entry in artifacts)
+    assert all(Path(entry["envelope_path"]).is_absolute() for entry in artifacts)
+    for key, entry in zip(
+        CAPABILITY_PAYLOAD_TYPES,
+        artifacts,
+        strict=True,
+    ):
+        capability = capabilities[key]
+        assert entry == {
+            "envelope_path": str(
+                capability.artifact.envelope_path.absolute()
+            ),
+            "envelope_sha256": capability.envelope_sha256,
+            "key": key,
+            "payload_path": str(capability.artifact.payload_path.absolute()),
+            "payload_sha256": capability.payload_sha256,
+            "payload_type": capability.artifact.payload_type,
+            "role": capability.artifact.role,
+        }
+
     reordered = dict(reversed(list(manifest.items())))
     assert sha256_json(reordered) == sha256_json(manifest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "old_experiment_revision",
+        "wrong_generator",
+        "wrong_protocol_digest",
+        "swapped_capability_key",
+        "swapped_payload_path",
+        "wrong_byte_count",
+        "wrong_ordered_ids",
+        "nonempty_source_records",
+    ],
+)
+def test_generic_envelope_binding_rejects_self_consistent_mutation_before_load(
+    synthetic_inputs: tuple[ProvenanceInputs, dict[str, VerifiedArtifact]],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    inputs, capabilities = synthetic_inputs
+    key = "internvit.modeling"
+    capability = capabilities[key]
+    envelope_path = capability.artifact.envelope_path
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    metadata = envelope["metadata"]
+    provenance = envelope["provenance"]
+
+    if mutation == "old_experiment_revision":
+        provenance["experiment_revision"] = "0" * 40
+    elif mutation == "wrong_generator":
+        provenance["generator"] = "samga_brain_rw.capability_map.v0"
+    elif mutation == "wrong_protocol_digest":
+        provenance["protocol_config_sha256"] = "0" * 64
+    elif mutation == "swapped_capability_key":
+        metadata["capability_key"] = "internvit.preprocessor"
+    elif mutation == "swapped_payload_path":
+        metadata["absolute_payload_path"] = str(
+            (capability.artifact.payload_path.parent / "swapped.py").absolute()
+        )
+    elif mutation == "wrong_byte_count":
+        metadata["byte_count"] = capability.size + 1
+    elif mutation == "wrong_ordered_ids":
+        metadata["ordered_ids"] = ["internvit.preprocessor"]
+    else:
+        metadata["source_records"] = [{"source": "swapped"}]
+
+    envelope["metadata_sha256"] = sha256_json(metadata)
+    envelope["provenance_sha256"] = sha256_json(provenance)
+    envelope["ordered_ids_sha256"] = ordered_ids_sha256(
+        metadata["ordered_ids"]
+    )
+    envelope["source_records_sha256"] = sha256_json(
+        metadata["source_records"]
+    )
+    _write_json(envelope_path, envelope)
+    capabilities[key] = verify_typed_artifacts(
+        "train",
+        [capability.artifact],
+    )[0]
+
+    semantic_payload_loaded = False
+
+    def fail_semantic_load(*_: object, **__: object) -> dict[str, object]:
+        nonlocal semantic_payload_loaded
+        semantic_payload_loaded = True
+        raise AssertionError("semantic payload load must not run")
+
+    monkeypatch.setattr(
+        "samga_brain_rw.provenance._read_json",
+        fail_semantic_load,
+    )
+    with pytest.raises(ValueError, match="generic capability envelope binding"):
+        build_provenance_manifest(
+            replace(inputs, verified_artifacts=dict(capabilities))
+        )
+    assert semantic_payload_loaded is False
 
 
 def test_expected_paths_are_exact_and_do_not_scan_directories(
@@ -947,10 +1096,7 @@ def test_cache_header_or_metadata_mutation_is_rejected(
     payload = json.loads(metadata_path.read_text())
     payload["normalization"] = "l2"
     _write_json(metadata_path, payload)
-    replacement = _capability(
-        metadata_path,
-        CAPABILITY_PAYLOAD_TYPES["cache.internvit_selected_metadata"],
-    )
+    replacement = _refresh_generic_capability(metadata_capability)
     capabilities["cache.internvit_selected_metadata"] = replacement
 
     with pytest.raises(ValueError, match="normalization"):
@@ -1046,6 +1192,123 @@ def _capability_map_payload(
         "schema_version": 1,
         "scope": "train",
     }
+
+
+def _preflight_argv(
+    inputs: ProvenanceInputs,
+    capability_map: Path,
+    output: Path,
+) -> list[str]:
+    values = (
+        ("--repository-root", inputs.repository_root),
+        ("--protocol", inputs.protocol_path),
+        ("--internvit-config", inputs.internvit_config_path),
+        ("--brainrw-config", inputs.brainrw_config_path),
+        ("--source-manifest-dir", inputs.source_manifest_dir),
+        ("--manifest-dir", inputs.protocol_manifest_dir),
+        ("--feature-directory", inputs.feature_directory),
+        ("--variant-directory", inputs.variant_directory),
+        ("--canonical-cache", inputs.canonical_cache),
+        ("--clip-train-cache", inputs.clip_train_cache),
+        ("--data-root", inputs.data_root),
+        ("--model-path", inputs.model_path),
+        ("--clip-model-path", inputs.clip_model_path),
+        ("--upstream-root", inputs.upstream_root),
+        ("--experiment-revision", inputs.experiment_revision),
+        ("--upstream-revision", inputs.upstream_revision),
+        ("--cache-generator-revision", inputs.cache_generator_revision),
+        ("--capability-map", capability_map),
+        ("--output", output),
+    )
+    return [str(value) for pair in values for value in pair]
+
+
+def test_preflight_binds_raw_capability_map_and_exact_inventory_projection(
+    synthetic_inputs: tuple[ProvenanceInputs, dict[str, VerifiedArtifact]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, capabilities = synthetic_inputs
+    capability_map = tmp_path / "cli-capability-map.json"
+    output = tmp_path / "preflight-output.json"
+    map_payload = _capability_map_payload(capabilities)
+    _write_json(capability_map, map_payload)
+    raw_map = capability_map.read_bytes()
+    monkeypatch.setattr("scripts.preflight.DEFAULT_ORACLES", inputs.oracles)
+
+    assert preflight_main(
+        _preflight_argv(inputs, capability_map, output)
+    ) == 0
+
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    inventory = manifest["capability_inventory"]
+    assert manifest["capability_map"] == {
+        "artifact_count": 49,
+        "inventory_sha256": inventory["inventory_sha256"],
+        "path": str(capability_map.absolute()),
+        "raw_sha256": hashlib.sha256(raw_map).hexdigest(),
+        "schema_version": 1,
+    }
+    projection = [
+        {
+            "envelope_path": item["envelope_path"],
+            "key": item["key"],
+            "payload_path": item["payload_path"],
+            "payload_type": item["payload_type"],
+            "role": item["role"],
+        }
+        for item in inventory["artifacts"]
+    ]
+    assert map_payload["artifacts"] == projection
+    assert inventory["inventory_sha256"] == sha256_json(
+        inventory["artifacts"]
+    )
+
+
+def test_preflight_rejects_raw_map_byte_mutation_without_publication(
+    synthetic_inputs: tuple[ProvenanceInputs, dict[str, VerifiedArtifact]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, capabilities = synthetic_inputs
+    capability_map = tmp_path / "mutated-capability-map.json"
+    output = tmp_path / "must-not-exist.json"
+    _write_json(capability_map, _capability_map_payload(capabilities))
+    capability_map.write_bytes(capability_map.read_bytes() + b" ")
+    monkeypatch.setattr("scripts.preflight.DEFAULT_ORACLES", inputs.oracles)
+
+    with pytest.raises(ValueError, match="canonical JSON"):
+        preflight_main(_preflight_argv(inputs, capability_map, output))
+
+    assert not output.exists()
+
+
+def test_preflight_rejects_old_sidecar_revision_without_publication(
+    synthetic_inputs: tuple[ProvenanceInputs, dict[str, VerifiedArtifact]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, capabilities = synthetic_inputs
+    key = "internvit.modeling"
+    capability = capabilities[key]
+    envelope_path = capability.artifact.envelope_path
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    envelope["provenance"]["experiment_revision"] = "0" * 40
+    envelope["provenance_sha256"] = sha256_json(envelope["provenance"])
+    _write_json(envelope_path, envelope)
+
+    capability_map = tmp_path / "old-revision-capability-map.json"
+    output = tmp_path / "must-not-exist.json"
+    _write_json(capability_map, _capability_map_payload(capabilities))
+    monkeypatch.setattr("scripts.preflight.DEFAULT_ORACLES", inputs.oracles)
+
+    with pytest.raises(
+        ValueError,
+        match="generic capability envelope binding",
+    ):
+        preflight_main(_preflight_argv(inputs, capability_map, output))
+
+    assert not output.exists()
 
 
 def test_capability_map_strictly_verifies_all_49_explicit_descriptors(
@@ -1209,10 +1472,7 @@ def test_partial_modern_cache_metadata_is_rejected(
     metadata = json.loads(metadata_path.read_text())
     del metadata["normalization"]
     _write_json(metadata_path, metadata)
-    capabilities[key] = _capability(
-        metadata_path,
-        CAPABILITY_PAYLOAD_TYPES[key],
-    )
+    capabilities[key] = _refresh_generic_capability(capabilities[key])
     with pytest.raises(ValueError, match="missing modern metadata fields"):
         build_provenance_manifest(
             replace(inputs, verified_artifacts=dict(capabilities))

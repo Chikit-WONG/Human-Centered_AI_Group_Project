@@ -37,6 +37,9 @@ _MAX_JSON_BYTES = 64 * 1024 * 1024
 _SUBJECTS = tuple(range(1, 11))
 
 
+CAPABILITY_ENVELOPE_GENERATOR = "samga_brain_rw.capability_map.v1"
+
+
 def _require_sha256(value: object, context: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f"{context} must be a lowercase SHA-256 digest")
@@ -643,6 +646,11 @@ def build_provenance_manifest(
     paths = preflight_provenance_inputs(inputs)
     oracles = inputs.oracles
     capabilities = _bind_and_reverify_capabilities(inputs, paths)
+    _validate_generic_capability_envelopes(
+        inputs,
+        capabilities,
+    )
+    capability_inventory = _build_capability_inventory(capabilities)
 
     protocol = _read_json(capabilities["protocol"], "protocol config")
     internvit = _read_json(
@@ -685,6 +693,7 @@ def build_provenance_manifest(
         "payload_type": "samga_brain_rw.provenance_manifest",
         "scope": "train",
         "passed": True,
+        "capability_inventory": capability_inventory,
         "protocol": {
             "brainrw_config": {
                 "path": str(_normalized(inputs.brainrw_config_path)),
@@ -775,6 +784,8 @@ def build_provenance_manifest(
         "checks": {
             "cache_headers": True,
             "cache_metadata": True,
+            "capability_inventory": True,
+            "generic_envelope_bindings": True,
             "capabilities_reverified": True,
             "config_hashes": True,
             "environment_allowlist": True,
@@ -925,9 +936,102 @@ def _bind_and_reverify_capabilities(
     return result
 
 
+def _validate_generic_capability_envelopes(
+    inputs: ProvenanceInputs,
+    capabilities: Mapping[str, VerifiedArtifact],
+) -> None:
+    """Bind every generic sidecar to this exact run before payload loading."""
+
+    expected_provenance = {
+        "experiment_revision": inputs.experiment_revision,
+        "generator": CAPABILITY_ENVELOPE_GENERATOR,
+        "protocol_config_sha256": inputs.oracles.protocol_config_sha256,
+    }
+    generic_count = 0
+    for key in CAPABILITY_PAYLOAD_TYPES:
+        if key.startswith("protocol_manifest."):
+            continue
+        generic_count += 1
+        capability = capabilities[key]
+        envelope = _read_verified_envelope_json(
+            capability,
+            f"{key} capability envelope",
+        )
+        expected_metadata = {
+            "absolute_payload_path": str(
+                _normalized(capability.artifact.payload_path)
+            ),
+            "byte_count": capability.size,
+            "capability_key": key,
+            "ordered_ids": [key],
+            "source_records": [],
+        }
+        if (
+            envelope.get("provenance") != expected_provenance
+            or envelope.get("metadata") != expected_metadata
+        ):
+            raise ValueError(
+                f"{key} generic capability envelope binding mismatch"
+            )
+    if generic_count != 39:
+        raise AssertionError("exactly 39 generic capability envelopes are required")
+
+
+def _build_capability_inventory(
+    capabilities: Mapping[str, VerifiedArtifact],
+) -> dict[str, object]:
+    artifacts: list[dict[str, object]] = []
+    for key in CAPABILITY_PAYLOAD_TYPES:
+        capability = capabilities[key]
+        descriptor = capability.artifact
+        artifacts.append(
+            {
+                "key": key,
+                "payload_type": descriptor.payload_type,
+                "role": descriptor.role,
+                "payload_path": str(_normalized(descriptor.payload_path)),
+                "payload_sha256": capability.payload_sha256,
+                "envelope_path": str(_normalized(descriptor.envelope_path)),
+                "envelope_sha256": capability.envelope_sha256,
+            }
+        )
+    if len(artifacts) != 49:
+        raise AssertionError("capability inventory must contain 49 artifacts")
+    return {
+        "artifact_count": len(artifacts),
+        "artifacts": artifacts,
+        "inventory_sha256": sha256_json(artifacts),
+    }
+
+
+def _read_verified_envelope_json(
+    capability: VerifiedArtifact,
+    context: str,
+) -> dict[str, object]:
+    with capability.open_envelope_verified() as file_object:
+        raw = file_object.read(_MAX_JSON_BYTES + 1)
+    if len(raw) > _MAX_JSON_BYTES:
+        raise ValueError(f"{context} exceeds the JSON size limit")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{context} is not valid UTF-8") from exc
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{context} is malformed JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be a JSON object")
+    return value
+
+
 def _capability_identity(
     value: VerifiedArtifact,
-) -> tuple[int, int, int, int, int, str, str]:
+) -> tuple[object, ...]:
     return (
         value.device,
         value.inode,
@@ -936,6 +1040,12 @@ def _capability_identity(
         value.ctime_ns,
         value.payload_sha256,
         value.scope,
+        value.envelope_device,
+        value.envelope_inode,
+        value.envelope_size,
+        value.envelope_mtime_ns,
+        value.envelope_ctime_ns,
+        value.envelope_sha256,
     )
 
 

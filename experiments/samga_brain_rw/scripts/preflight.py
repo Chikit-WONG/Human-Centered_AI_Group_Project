@@ -9,6 +9,7 @@ verifier before any experiment payload is semantically loaded.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -19,7 +20,7 @@ import socket
 import stat
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from samga_brain_rw.access import (
@@ -59,6 +60,19 @@ _FORMAL_TEST_RECORD_SHA256 = (
     "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84feae7ba64636f1a"
 )
 _MAX_MAP_BYTES = 8 * 1024 * 1024
+
+
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_READ_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _CapabilityMapDocument:
+    path: Path
+    payload: dict[str, object]
+    raw_sha256: str
 
 
 def capture_environment(
@@ -102,7 +116,15 @@ def load_and_verify_capability_map(
 
     capability_map_path = Path(path)
     _reject_path(capability_map_path, "capability-map path")
-    payload = _read_canonical_map(capability_map_path)
+    document = _read_canonical_map(capability_map_path)
+    return _verify_capability_map_document(document, expected_paths)
+
+
+def _verify_capability_map_document(
+    document: _CapabilityMapDocument,
+    expected_paths: Mapping[str, Path],
+) -> dict[str, VerifiedArtifact]:
+    payload = document.payload
     if set(payload) != _MAP_TOP_KEYS:
         raise ValueError("capability map top-level keys do not match schema")
     if payload["schema_version"] != 1 or type(payload["schema_version"]) is not int:
@@ -279,32 +301,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         oracles=DEFAULT_ORACLES,
     )
     expected_paths = preflight_provenance_inputs(inputs)
-    capabilities = load_and_verify_capability_map(
-        args.capability_map,
+    capability_map_path = Path(args.capability_map)
+    _reject_path(capability_map_path, "capability-map path")
+    capability_map_document = _read_canonical_map(capability_map_path)
+    capabilities = _verify_capability_map_document(
+        capability_map_document,
         expected_paths,
     )
     manifest = build_provenance_manifest(
         replace(inputs, verified_artifacts=capabilities)
     )
+    manifest = _bind_capability_map(
+        manifest,
+        capability_map_document,
+    )
     publish_canonical_exclusive(args.output, manifest)
     return 0
 
 
-def _read_canonical_map(path: Path) -> dict[str, object]:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+def _read_canonical_map(path: Path) -> _CapabilityMapDocument:
+    normalized = _normalized(path)
+    descriptor = _open_readonly_nofollow(
+        normalized,
+        "capability map",
     )
     try:
-        raw = os.read(descriptor, _MAX_MAP_BYTES + 1)
-        if len(raw) > _MAX_MAP_BYTES:
-            raise ValueError("capability map exceeds the size limit")
-        if os.read(descriptor, 1):
-            raise ValueError("capability map exceeds the size limit")
+        before = os.fstat(descriptor)
+        _require_regular_file(before, "capability map")
+        chunks: list[bytes] = []
+        byte_count = 0
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > _MAX_MAP_BYTES:
+                raise ValueError("capability map exceeds the size limit")
+            chunks.append(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        _require_stable_identity(before, after, "capability map")
     finally:
         os.close(descriptor)
+    raw = b"".join(chunks)
     try:
         value = json.loads(
             raw.decode("utf-8"),
@@ -317,7 +357,123 @@ def _read_canonical_map(path: Path) -> dict[str, object]:
         raise ValueError("capability map must be a JSON object")
     if raw != canonical_json_bytes(value):
         raise ValueError("capability map must use exact canonical JSON bytes")
-    return value
+    return _CapabilityMapDocument(
+        path=normalized,
+        payload=value,
+        raw_sha256=digest.hexdigest(),
+    )
+
+
+def _bind_capability_map(
+    manifest: Mapping[str, object],
+    document: _CapabilityMapDocument,
+) -> dict[str, object]:
+    inventory = manifest.get("capability_inventory")
+    if not isinstance(inventory, dict) or set(inventory) != {
+        "artifact_count",
+        "artifacts",
+        "inventory_sha256",
+    }:
+        raise ValueError("provenance capability inventory schema mismatch")
+    artifacts = inventory["artifacts"]
+    if not isinstance(artifacts, list) or len(artifacts) != 49:
+        raise ValueError("provenance capability inventory cardinality mismatch")
+    if inventory["artifact_count"] != len(artifacts):
+        raise ValueError("provenance capability inventory count mismatch")
+    if inventory["inventory_sha256"] != hashlib.sha256(
+        canonical_json_bytes(artifacts)
+    ).hexdigest():
+        raise ValueError("provenance capability inventory digest mismatch")
+
+    projection: list[dict[str, object]] = []
+    for index, item in enumerate(artifacts):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"provenance capability inventory artifacts[{index}] invalid"
+            )
+        try:
+            projection.append(
+                {
+                    "envelope_path": item["envelope_path"],
+                    "key": item["key"],
+                    "payload_path": item["payload_path"],
+                    "payload_type": item["payload_type"],
+                    "role": item["role"],
+                }
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"provenance capability inventory artifacts[{index}] invalid"
+            ) from exc
+    if projection != document.payload["artifacts"]:
+        raise ValueError(
+            "capability map artifacts do not match provenance inventory"
+        )
+
+    bound = dict(manifest)
+    bound["capability_map"] = {
+        "artifact_count": len(artifacts),
+        "inventory_sha256": inventory["inventory_sha256"],
+        "path": str(document.path),
+        "raw_sha256": document.raw_sha256,
+        "schema_version": document.payload["schema_version"],
+    }
+    return bound
+
+
+def _open_readonly_nofollow(path: Path, context: str) -> int:
+    normalized = _normalized(path)
+    components = normalized.parts
+    if len(components) <= 1:
+        raise ValueError(f"{context} must name a regular file")
+    directory_fd = os.open(
+        normalized.anchor,
+        _READ_FLAGS | _O_DIRECTORY,
+    )
+    try:
+        for component in components[1:-1]:
+            next_fd = os.open(
+                component,
+                _READ_FLAGS | _O_DIRECTORY | _O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return os.open(
+            components[-1],
+            _READ_FLAGS | _O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def _require_regular_file(value: os.stat_result, context: str) -> None:
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError(f"{context} must be a regular file")
+
+
+def _require_stable_identity(
+    before: os.stat_result,
+    after: os.stat_result,
+    context: str,
+) -> None:
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise ValueError(f"{context} changed while it was read")
 
 
 def _reject_duplicate_keys(
