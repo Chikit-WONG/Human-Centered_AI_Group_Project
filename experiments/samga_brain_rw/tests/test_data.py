@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import pickle
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 
+from samga_brain_rw import data as data_module
 from samga_brain_rw.data import POSTERIOR_CHANNELS, ProtocolSubjectDataset
 from samga_brain_rw.hashing import (
     canonical_json_bytes,
@@ -148,10 +153,171 @@ def _install_torch_load(
         assert callable(getattr(handle, "read", None))
         assert callable(getattr(handle, "fileno", None))
         assert map_location == "cpu"
-        assert weights_only is False
+        assert weights_only is True
         return {"ch_names": list(fixture.channels), "eeg": value}
 
     monkeypatch.setattr(torch, "load", fake_load)
+
+
+def test_source_payload_digest_is_verified_before_weights_only_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "sub-01" / "train.pt"
+    payload.parent.mkdir()
+    payload.write_bytes(b"not deserialized when the digest is wrong")
+    touched = False
+
+    def forbidden_load(*_args: object, **_kwargs: object) -> object:
+        nonlocal touched
+        touched = True
+        raise AssertionError("torch.load must follow digest verification")
+
+    monkeypatch.setattr(torch, "load", forbidden_load)
+    with pytest.raises(ValueError, match="SHA-256"):
+        data_module._load_torch_payload(
+            payload,
+            expected_sha256="0" * 64,
+        )
+    assert touched is False
+
+
+def test_restricted_protocol5_unpickler_allows_only_pinned_numpy_globals(
+    tmp_path: Path,
+) -> None:
+    unpickler = data_module._RestrictedNumpyUnpickler(
+        io.BytesIO()
+    )
+    frombuffer = unpickler.find_class(
+        "numpy.core.numeric",
+        "_frombuffer",
+    )
+    assert callable(frombuffer)
+    assert np.array_equal(
+        frombuffer(
+            b"\x01\x02",
+            np.dtype("uint8"),
+            (2,),
+            "C",
+        ),
+        np.asarray([1, 2], dtype=np.uint8),
+    )
+    assert unpickler.find_class(
+        "numpy",
+        "dtype",
+    ) is np.dtype
+    with pytest.raises(
+        pickle.UnpicklingError,
+        match="global",
+    ):
+        unpickler.find_class(
+            "numpy._core.numeric",
+            "_frombuffer",
+        )
+
+    sentinel = tmp_path / "arbitrary-code-ran"
+
+    class Exploit:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (
+                os.system,
+                (f"touch {sentinel}",),
+            )
+
+    with pytest.raises(
+        pickle.UnpicklingError,
+        match="global",
+    ):
+        data_module._restricted_numpy_unpickle(
+            io.BytesIO(
+                pickle.dumps(Exploit(), protocol=5)
+            )
+        )
+    assert not sentinel.exists()
+
+
+def test_pinned_protocol5_archive_never_falls_back_to_unsafe_torch_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "sub-01" / "train.pt"
+    payload.parent.mkdir()
+    sentinel = tmp_path / "archive-code-ran"
+
+    class Exploit:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (
+                os.system,
+                (f"touch {sentinel}",),
+            )
+
+    with zipfile.ZipFile(
+        payload,
+        mode="w",
+        compression=zipfile.ZIP_STORED,
+        allowZip64=True,
+    ) as archive:
+        archive.writestr(
+            "train/data.pkl",
+            pickle.dumps(Exploit(), protocol=5),
+        )
+        archive.writestr("train/version", b"3\n")
+    touched = False
+
+    def forbidden_torch_load(
+        *_args: object,
+        **_kwargs: object,
+    ) -> object:
+        nonlocal touched
+        touched = True
+        raise AssertionError("pinned NumPy archive must use restricted pickle")
+
+    monkeypatch.setattr(torch, "load", forbidden_torch_load)
+    with pytest.raises(ValueError, match="safely"):
+        data_module._load_torch_payload(
+            payload,
+            expected_sha256=_file_sha256(payload),
+        )
+    assert touched is False
+    assert not sentinel.exists()
+
+
+def test_source_manifest_identity_binds_actual_train_payload_bytes(
+    sealed_subject: SimpleNamespace,
+) -> None:
+    identity = data_module.inspect_source_payload_identity(
+        sealed_subject.source,
+        expected_manifest_sha256=_file_sha256(
+            sealed_subject.source
+        ),
+        subject=1,
+    )
+    assert identity.path == sealed_subject.source_pt
+    assert identity.byte_count == sealed_subject.source_pt.stat().st_size
+    assert identity.sha256 == _file_sha256(
+        sealed_subject.source_pt
+    )
+    with pytest.raises(ValueError, match="manifest SHA-256"):
+        data_module.inspect_source_payload_identity(
+            sealed_subject.source,
+            expected_manifest_sha256="0" * 64,
+            subject=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "component",
+    ("test", "formal", "formal-test", "formal_test", "val-confirm", "val_confirm"),
+)
+def test_source_payload_rejects_every_sealed_path_component(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    with pytest.raises(PermissionError, match="sealed"):
+        data_module._preflight_development_path(
+            tmp_path / component / "train.pt",
+            "source train EEG",
+        )
 
 
 def test_protocol_roles_expose_exact_rows_ids_and_shared_cache_mapping(

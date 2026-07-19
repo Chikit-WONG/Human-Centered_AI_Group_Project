@@ -5,7 +5,9 @@ import hashlib
 import io
 import importlib.util
 import json
+import math
 import random
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,7 +59,11 @@ class _FakeProcessor:
 
 
 def _model(
-    *, channels: int = 2, samples: int = 4
+    *,
+    channels: int = 2,
+    samples: int = 4,
+    lora_rank: int = 2,
+    lora_alpha: int = 2,
 ) -> br.BrainRWCLIPLoRAModel:
     torch.manual_seed(5)
     return br.BrainRWCLIPLoRAModel(
@@ -66,8 +72,8 @@ def _model(
         samples=samples,
         projection_dim=8,
         dropout=0.1,
-        lora_rank=2,
-        lora_alpha=2,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
         lora_dropout=0.0,
     )
 
@@ -165,6 +171,68 @@ def test_model_forward_gradient_isolation_and_state_roundtrip() -> None:
         )
 
 
+def test_brain_mlp_uses_legacy_pretrained_model_initialization() -> None:
+    model = _model(channels=17, samples=250)
+    linears = [
+        module
+        for module in model.brain_mlp.modules()
+        if isinstance(module, nn.Linear)
+    ]
+    weights = torch.cat(
+        [module.weight.detach().reshape(-1) for module in linears]
+    )
+    assert abs(float(weights.mean())) < 0.002
+    assert float(weights.std(unbiased=False)) == pytest.approx(
+        0.02,
+        abs=0.002,
+    )
+    assert all(
+        module.bias is None
+        or torch.count_nonzero(module.bias.detach()).item() == 0
+        for module in linears
+    )
+    norms = [
+        module
+        for module in model.brain_mlp.modules()
+        if isinstance(module, nn.LayerNorm)
+    ]
+    assert norms
+    assert all(
+        torch.equal(module.weight, torch.ones_like(module.weight))
+        for module in norms
+    )
+    assert all(
+        torch.equal(module.bias, torch.zeros_like(module.bias))
+        for module in norms
+    )
+
+
+def test_brainrw_loss_is_unclamped_one_way_brain_to_image_ce() -> None:
+    model = _model()
+    model.eval()
+    with torch.no_grad():
+        model.logit_scale.fill_(math.log(101.0))
+    output = model(
+        brain_signals=torch.randn(3, 2, 4),
+        pixel_values=torch.randn(3, 8),
+    )
+    labels = torch.arange(3)
+    logits_per_brain = model.logit_scale.exp() * output.similarity
+    expected = torch.nn.functional.cross_entropy(
+        logits_per_brain,
+        labels,
+    )
+    symmetric = 0.5 * (
+        expected
+        + torch.nn.functional.cross_entropy(
+            logits_per_brain.T,
+            labels,
+        )
+    )
+    assert torch.allclose(output.loss, expected)
+    assert not torch.allclose(output.loss, symmetric)
+
+
 def test_model_rejects_incomplete_or_unbalanced_target_sets() -> None:
     with pytest.raises(ValueError, match="visual_projection"):
         br.BrainRWCLIPLoRAModel(
@@ -190,6 +258,8 @@ class _BaseDataset:
         selected_channels: tuple[str, ...],
         feature_cache: None,
         smooth_probability: float,
+        *,
+        expected_source_payload_sha256: str | None = None,
     ) -> None:
         self.calls.append(
             (
@@ -199,6 +269,7 @@ class _BaseDataset:
                 selected_channels,
                 feature_cache,
                 smooth_probability,
+                expected_source_payload_sha256,
             )
         )
         self.scope = scope
@@ -234,6 +305,7 @@ def test_development_dataset_and_collator_never_expose_test_roles(
         "train",
         42,
         image_loader=lambda path: loaded.append(path) or torch.arange(8).float(),
+        expected_source_payload_sha256="a" * 64,
     )
     item = dataset[0]
     assert loaded == [Path("/safe/training_images/concept-a/image-a.jpg")]
@@ -246,6 +318,7 @@ def test_development_dataset_and_collator_never_expose_test_roles(
             POSTERIOR_CHANNELS,
             None,
             0.3,
+            "a" * 64,
         )
     ]
     collator = br.BrainRWCollator(_FakeProcessor())
@@ -396,6 +469,10 @@ def _write_config(configs_dir: Path, root: Path) -> Path:
     clip.mkdir()
     (clip / "config.json").write_text("{}\n", encoding="utf-8")
     (clip / "model.safetensors").write_bytes(b"fake-weights")
+    (clip / "preprocessor_config.json").write_text(
+        '{"image_processor_type":"CLIPImageProcessor"}\n',
+        encoding="utf-8",
+    )
     payload = json.loads(
         (configs_dir / "brainrw_clip_lora_v1.json").read_text(encoding="utf-8")
     )
@@ -421,19 +498,410 @@ def _identity() -> br.ManifestIdentity:
         protocol_sha256="2" * 64,
         records_sha256="3" * 64,
         source_manifest_sha256="4" * 64,
+        source_payload_path=Path("/safe/sub-01/train.pt"),
+        source_payload_sha256="a" * 64,
+        source_payload_byte_count=123,
         train_role_sha256="5" * 64,
         val_dev_role_sha256="6" * 64,
         train_ordered_ids=train_ids,
         val_dev_ordered_ids=val_ids,
         train_ordered_ids_sha256=ordered_ids_sha256(train_ids),
         val_dev_ordered_ids_sha256=ordered_ids_sha256(val_ids),
+        train_row_count=2,
+        val_dev_row_count=2,
     )
 
 
+def test_config_and_run_identity_bind_preprocessor_and_source_payload(
+    configs_dir: Path,
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(configs_dir, tmp_path)
+    config = br.verify_brainrw_config(
+        config_path,
+        tmp_path / "clip",
+    )
+    preprocessor = tmp_path / "clip" / "preprocessor_config.json"
+    assert config.clip_preprocessor_sha256 == hashlib.sha256(
+        preprocessor.read_bytes()
+    ).hexdigest()
+    hashes = br.input_hashes(config, _identity())
+    assert hashes["clip_preprocessor"] == (
+        config.clip_preprocessor_sha256
+    )
+    assert hashes["source_payload"] == "a" * 64
+
+
+def test_model_build_uses_verified_preprocessor_digest(
+    configs_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = br.verify_brainrw_config(
+        _write_config(configs_dir, tmp_path),
+        tmp_path / "clip",
+    )
+    observed: list[str] = []
+
+    def fake_load(
+        _clip_path: Path,
+        *,
+        expected_config_sha256: str,
+        expected_weights_sha256: str,
+        expected_preprocessor_sha256: str,
+    ) -> tuple[nn.Module, object]:
+        assert expected_config_sha256 == config.clip_config_sha256
+        assert expected_weights_sha256 == config.clip_weights_sha256
+        observed.append(expected_preprocessor_sha256)
+        return _FakeVision(), _FakeProcessor()
+
+    monkeypatch.setattr(br, "load_clip_components", fake_load)
+    br.build_brainrw_model(
+        config.payload,
+        config.clip_path,
+        expected_preprocessor_sha256=(
+            config.clip_preprocessor_sha256
+        ),
+    )
+    assert observed == [config.clip_preprocessor_sha256]
+
+
+def test_clip_loader_pins_components_and_forces_safetensors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip = tmp_path / "clip"
+    clip.mkdir()
+    files = {
+        "config": clip / "config.json",
+        "weights": clip / "model.safetensors",
+        "preprocessor": clip / "preprocessor_config.json",
+    }
+    for name, path in files.items():
+        path.write_bytes(name.encode("ascii"))
+    digests = {
+        name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for name, path in files.items()
+    }
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class Vision:
+        @classmethod
+        def from_pretrained(
+            cls,
+            path: str,
+            **kwargs: object,
+        ) -> str:
+            calls.append(("vision", path, kwargs))
+            return "vision"
+
+    class Processor:
+        @classmethod
+        def from_pretrained(
+            cls,
+            path: str,
+            **kwargs: object,
+        ) -> str:
+            calls.append(("processor", path, kwargs))
+            return "processor"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            CLIPImageProcessor=Processor,
+            CLIPVisionModelWithProjection=Vision,
+        ),
+    )
+    assert br.load_clip_components(
+        clip,
+        expected_config_sha256=digests["config"],
+        expected_weights_sha256=digests["weights"],
+        expected_preprocessor_sha256=digests["preprocessor"],
+    ) == ("vision", "processor")
+    assert calls == [
+        (
+            "vision",
+            str(clip),
+            {
+                "local_files_only": True,
+                "use_safetensors": True,
+            },
+        ),
+        (
+            "processor",
+            str(clip),
+            {"local_files_only": True},
+        ),
+    ]
+
+
+def _complete_checkpoint_payload(
+    config: br.BrainRWConfigIdentity,
+    manifest: br.ManifestIdentity,
+) -> dict[str, object]:
+    model = _model(
+        channels=17,
+        samples=250,
+        lora_rank=32,
+        lora_alpha=32,
+    )
+    run_key, input_bundle, hashes = br.brainrw_run_key(
+        config,
+        manifest,
+        1,
+        42,
+    )
+    sampler = br.StatefulIndexSampler(2, 42)
+    tuple(iter(sampler))
+    return {
+        "schema_version": 1,
+        "payload_type": br.BRAINRW_CHECKPOINT_TYPE,
+        "complete": True,
+        "training_complete": False,
+        "scope": "train",
+        "validation_scope": "val-dev",
+        "observed_scopes": ["train", "val-dev"],
+        "subject": 1,
+        "seed": 42,
+        "config_path": str(config.path),
+        "config_payload": json.loads(
+            canonical_json_bytes(dict(config.payload))
+        ),
+        "config_sha256": config.sha256,
+        "manifest_path": str(manifest.path),
+        "manifest_sha256": manifest.manifest_sha256,
+        "protocol_sha256": manifest.protocol_sha256,
+        "input_hashes": hashes,
+        "input_bundle_sha256": input_bundle,
+        "run_key": run_key,
+        "clip_path": str(config.clip_path),
+        "clip_config_sha256": config.clip_config_sha256,
+        "clip_preprocessor_sha256": (
+            config.clip_preprocessor_sha256
+        ),
+        "clip_weights_sha256": config.clip_weights_sha256,
+        "model_manifest": json.loads(
+            canonical_json_bytes(dict(model.model_manifest))
+        ),
+        "model_manifest_sha256": model.model_manifest_sha256,
+        "target_manifest_sha256": model.target_manifest_sha256,
+        "task_state": model.task_state_dict(),
+        "candidate_state": model.candidate_state_dict(),
+        "task_initialization_sha256": br.state_dict_sha256(
+            model.task_state_dict()
+        ),
+        "candidate_initialization_sha256": br.state_dict_sha256(
+            model.candidate_state_dict()
+        ),
+        "optimizer_state": {},
+        "scheduler_state": {},
+        "epoch": 0,
+        "global_step": 1,
+        "planned_steps": 25,
+        "rng_state": br.capture_rng_state(),
+        "sampler_state": sampler.state_dict(),
+        "dataloader_generator_state": (
+            torch.Generator().manual_seed(1).get_state()
+        ),
+        "data_order_sha256": "b" * 64,
+        "effective_batch_size": 512,
+        "steps": 1,
+        "runtime_dtype": "float32",
+        "environment": {"packages": {}},
+        "git_sha": "c" * 40,
+        "git_provenance": {
+            "clean": True,
+            "git_sha": "c" * 40,
+            "repository_root": "/safe/repository",
+        },
+        "validation_metrics": {
+            "gallery_count": 2,
+            "query_count": 2,
+            "top1_count": 1,
+            "top1_rate": 0.5,
+            "top5_count": 2,
+            "top5_rate": 1.0,
+        },
+        "resumed_from_sha256": None,
+    }
+
+
+def test_checkpoint_distinguishes_resumable_partial_and_terminal_training(
+    configs_dir: Path,
+    tmp_path: Path,
+) -> None:
+    config = br.verify_brainrw_config(
+        _write_config(configs_dir, tmp_path),
+        tmp_path / "clip",
+    )
+    manifest = _identity()
+    partial = _complete_checkpoint_payload(config, manifest)
+    validated_partial = br.validate_brainrw_checkpoint_identity(
+        partial,
+        config=config,
+        manifest=manifest,
+        subject=1,
+        seed=42,
+    )
+    assert validated_partial["training_complete"] is False
+
+    terminal = copy.deepcopy(partial)
+    sampler = br.StatefulIndexSampler(2, 42)
+    for _ in range(24):
+        tuple(iter(sampler))
+        sampler.advance_epoch()
+    tuple(iter(sampler))
+    terminal.update(
+        {
+            "epoch": 24,
+            "global_step": 25,
+            "steps": 25,
+            "sampler_state": sampler.state_dict(),
+            "training_complete": True,
+        }
+    )
+    validated_terminal = br.validate_brainrw_checkpoint_identity(
+        terminal,
+        config=config,
+        manifest=manifest,
+        subject=1,
+        seed=42,
+    )
+    assert validated_terminal["training_complete"] is True
+
+    terminal["training_complete"] = False
+    with pytest.raises(ValueError, match="training_complete"):
+        br.validate_brainrw_checkpoint_identity(
+            terminal,
+            config=config,
+            manifest=manifest,
+            subject=1,
+            seed=42,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-optimizer",
+        "config-payload",
+        "input-bundle",
+        "input-hashes",
+        "run-key",
+    ),
+)
+def test_complete_checkpoint_identity_rejects_every_semantic_mismatch(
+    configs_dir: Path,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = br.verify_brainrw_config(
+        _write_config(configs_dir, tmp_path),
+        tmp_path / "clip",
+    )
+    manifest = _identity()
+    payload = _complete_checkpoint_payload(config, manifest)
+    validated = br.validate_brainrw_checkpoint_identity(
+        payload,
+        config=config,
+        manifest=manifest,
+        subject=1,
+        seed=42,
+    )
+    assert validated["run_key"] == payload["run_key"]
+    payload = copy.deepcopy(payload)
+    if mutation == "missing-optimizer":
+        del payload["optimizer_state"]
+    elif mutation == "config-payload":
+        payload["config_payload"]["config_id"] = "tampered"
+    elif mutation == "input-bundle":
+        payload["input_bundle_sha256"] = "0" * 64
+    elif mutation == "input-hashes":
+        payload["input_hashes"]["source_payload"] = "0" * 64
+    else:
+        payload["run_key"] = "tampered"
+    with pytest.raises(ValueError, match="checkpoint"):
+        br.validate_brainrw_checkpoint_identity(
+            payload,
+            config=config,
+            manifest=manifest,
+            subject=1,
+            seed=42,
+        )
+
+
+def test_checkpoint_save_validates_complete_payload_before_writing(
+    configs_dir: Path,
+    tmp_path: Path,
+) -> None:
+    config = br.verify_brainrw_config(
+        _write_config(configs_dir, tmp_path),
+        tmp_path / "clip",
+    )
+    manifest = _identity()
+    payload = _complete_checkpoint_payload(config, manifest)
+    del payload["optimizer_state"]
+    checkpoint = tmp_path / "checkpoint.pt"
+    with pytest.raises(ValueError, match="checkpoint"):
+        br.save_brainrw_checkpoint(
+            checkpoint,
+            payload,
+            manifest,
+        )
+    assert not checkpoint.exists()
+    assert not br.checkpoint_sidecar(checkpoint).exists()
+
+
+def test_checkpoint_reconstruction_binds_clip_preprocessor_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip = tmp_path / "clip"
+    clip.mkdir()
+    config_file = clip / "config.json"
+    weights_file = clip / "model.safetensors"
+    preprocessor_file = clip / "preprocessor_config.json"
+    config_file.write_bytes(b"config")
+    weights_file.write_bytes(b"weights")
+    preprocessor_file.write_bytes(b"preprocessor")
+    model = _model()
+    payload = {
+        "clip_path": str(clip),
+        "clip_config_sha256": hashlib.sha256(
+            config_file.read_bytes()
+        ).hexdigest(),
+        "clip_preprocessor_sha256": "0" * 64,
+        "clip_weights_sha256": hashlib.sha256(
+            weights_file.read_bytes()
+        ).hexdigest(),
+        "config_payload": {},
+        "model_manifest_sha256": model.model_manifest_sha256,
+        "task_state": model.task_state_dict(),
+        "candidate_state": model.candidate_state_dict(),
+    }
+    monkeypatch.setattr(
+        br,
+        "build_brainrw_model",
+        lambda *_a, **_k: (model, _FakeProcessor()),
+    )
+    with pytest.raises(ValueError, match="preprocessor"):
+        br.build_model_from_checkpoint(payload)
+
+
 class _TinyDataset:
-    def __init__(self, _: Path, scope: str, seed: int) -> None:
+    def __init__(
+        self,
+        _: Path,
+        scope: str,
+        seed: int,
+        *,
+        expected_source_payload_sha256: str | None = None,
+    ) -> None:
         assert scope in {"train", "val-dev"}
         assert seed in {42, 43}
+        if expected_source_payload_sha256 is not None:
+            assert expected_source_payload_sha256 == "a" * 64
         self.scope = scope
         self.subject_id = 1
         self.row_indices = (10, 11)
@@ -460,6 +928,46 @@ class _TinyDataset:
             "scope": self.scope,
             "subject_id": 1,
         }
+
+
+def test_reload_evaluation_uses_explicit_checkpoint_numerical_dtype() -> None:
+    model = _model(channels=17, samples=250)
+    similarity, identifiers = br.evaluate_brainrw_similarity(
+        model,
+        _TinyDataset(Path("ignored"), "val-dev", 42),
+        _FakeProcessor(),
+        batch_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert similarity.shape == (2, 2)
+    assert identifiers == ("image-a", "image-b")
+    assert {
+        parameter.dtype
+        for parameter in model.parameters()
+        if parameter.is_floating_point()
+    } == {torch.bfloat16}
+
+
+def test_checkpoint_runtime_dtype_fails_closed_on_incompatible_device() -> None:
+    assert br.checkpoint_runtime_dtype(
+        {"runtime_dtype": "float32"},
+        torch.device("cpu"),
+    ) is torch.float32
+    assert br.checkpoint_runtime_dtype(
+        {"runtime_dtype": "bfloat16"},
+        torch.device("cuda"),
+    ) is torch.bfloat16
+    with pytest.raises(ValueError, match="bfloat16.*CUDA"):
+        br.checkpoint_runtime_dtype(
+            {"runtime_dtype": "bfloat16"},
+            torch.device("cpu"),
+        )
+    with pytest.raises(ValueError, match="runtime_dtype"):
+        br.checkpoint_runtime_dtype(
+            {"runtime_dtype": "float16"},
+            torch.device("cuda"),
+        )
 
 
 def _load_train_script(experiment_root: Path):
@@ -493,6 +1001,199 @@ def test_git_sha_lookup_fails_closed(
         train._git_sha()
 
 
+def test_git_provenance_is_repo_anchored_and_requires_clean_tree(
+    experiment_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train = _load_train_script(experiment_root)
+    repository_root = experiment_root.parents[1]
+    revision = "a" * 40
+    calls: list[tuple[str, ...]] = []
+
+    def clean_output(
+        args: list[str],
+        **_kwargs: object,
+    ) -> str:
+        command = tuple(args)
+        calls.append(command)
+        prefix = ("git", "-C", str(repository_root))
+        assert command[:3] == prefix
+        suffix = command[3:]
+        if suffix == ("rev-parse", "--show-toplevel"):
+            return str(repository_root) + "\n"
+        if suffix == ("rev-parse", "HEAD"):
+            return revision + "\n"
+        if suffix == (
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ):
+            return ""
+        raise AssertionError(f"unexpected git command: {command}")
+
+    monkeypatch.setattr(
+        train.subprocess,
+        "check_output",
+        clean_output,
+    )
+    assert train._git_provenance() == {
+        "clean": True,
+        "git_sha": revision,
+        "repository_root": str(repository_root),
+    }
+    assert len(calls) == 3
+
+    def dirty_output(
+        args: list[str],
+        **kwargs: object,
+    ) -> str:
+        if args[3] == "status":
+            return " M tracked.py\n"
+        return clean_output(args, **kwargs)
+
+    monkeypatch.setattr(
+        train.subprocess,
+        "check_output",
+        dirty_output,
+    )
+    with pytest.raises(RuntimeError, match="clean"):
+        train._git_provenance()
+
+
+def test_resume_runtime_state_fails_before_eeg_dataset_construction(
+    configs_dir: Path,
+    experiment_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_config(configs_dir, tmp_path)
+    config = br.verify_brainrw_config(
+        config_path,
+        tmp_path / "clip",
+    )
+    manifest = _identity()
+    payload = _complete_checkpoint_payload(config, manifest)
+    payload["task_state"] = {
+        "wrong.task.key": torch.zeros(1),
+    }
+    loaded = br.LoadedBrainRWCheckpoint(
+        payload=payload,
+        sha256="d" * 64,
+    )
+    monkeypatch.setattr(
+        br,
+        "load_development_manifest_identity",
+        lambda *_a, **_k: manifest,
+    )
+    monkeypatch.setattr(
+        br,
+        "load_brainrw_checkpoint",
+        lambda *_a, **_k: loaded,
+    )
+    monkeypatch.setattr(
+        br,
+        "build_brainrw_model",
+        lambda *_a, **_k: (
+            _model(
+                channels=17,
+                samples=250,
+                lora_rank=32,
+                lora_alpha=32,
+            ),
+            _FakeProcessor(),
+        ),
+    )
+    touched = False
+
+    class ForbiddenDataset:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            nonlocal touched
+            touched = True
+            raise AssertionError(
+                "malformed resume state must fail before EEG loading"
+            )
+
+    monkeypatch.setattr(
+        br,
+        "BrainRWDevelopmentDataset",
+        ForbiddenDataset,
+    )
+    train = _load_train_script(experiment_root)
+    monkeypatch.setattr(
+        train,
+        "_git_provenance",
+        lambda: dict(payload["git_provenance"]),
+    )
+    args = train.parse_args(
+        [
+            "--scope", "train",
+            "--validation-scope", "val-dev",
+            "--subject", "1",
+            "--seed", "42",
+            "--resume", str(tmp_path / "resume.pt"),
+            "--config", str(config_path),
+            "--manifest", str(tmp_path / "sub-01_protocol.json"),
+            "--clip-path", str(tmp_path / "clip"),
+            "--output-dir", str(tmp_path / "never-created"),
+            "--max-train-steps", "2",
+        ]
+    )
+    with pytest.raises(ValueError, match="task-state"):
+        train.run(args)
+    assert touched is False
+
+
+def test_resume_rejects_empty_adamw_state_for_positive_step(
+    experiment_root: Path,
+) -> None:
+    train = _load_train_script(experiment_root)
+    model = _model(
+        channels=17,
+        samples=250,
+        lora_rank=32,
+        lora_alpha=32,
+    )
+    optimizer = train._build_optimizer(
+        model,
+        {
+            "brain_learning_rate": 0.0005,
+            "visual_learning_rate": 0.00005,
+            "weight_decay": 0.05,
+        },
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=25,
+    )
+    sampler = br.StatefulIndexSampler(2, 42)
+    payload = {
+        "task_state": model.task_state_dict(),
+        "candidate_state": model.candidate_state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "sampler_state": sampler.state_dict(),
+        "dataloader_generator_state": (
+            torch.Generator().manual_seed(1).get_state()
+        ),
+        "rng_state": br.capture_rng_state(),
+    }
+    with pytest.raises(
+        ValueError,
+        match="optimizer.*state",
+    ):
+        train._load_resume_runtime_before_data(
+            payload,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=sampler,
+            loader_generator=torch.Generator(),
+            device=torch.device("cpu"),
+            planned_steps=25,
+            global_step=1,
+        )
+
+
 def test_cpu_one_step_smoke_persists_complete_resume_state_and_hashes(
     configs_dir: Path,
     experiment_root: Path,
@@ -520,11 +1221,30 @@ def test_cpu_one_step_smoke_persists_complete_resume_state_and_hashes(
         br,
         "build_brainrw_model",
         lambda *_a, **_k: (
-            _model(channels=17, samples=250),
+            _model(
+                channels=17,
+                samples=250,
+                lora_rank=32,
+                lora_alpha=32,
+            ),
             _FakeProcessor(),
         ),
     )
     train = _load_train_script(experiment_root)
+    provenance = {
+        "clean": True,
+        "git_sha": "c" * 40,
+        "repository_root": str(
+            experiment_root.parents[1]
+        ),
+    }
+    git_checks: list[dict[str, object]] = []
+
+    def stable_git() -> dict[str, object]:
+        git_checks.append(provenance)
+        return provenance.copy()
+
+    monkeypatch.setattr(train, "_git_provenance", stable_git)
     first = tmp_path / "run-first"
     arguments = [
         "--scope", "train",
@@ -541,10 +1261,25 @@ def test_cpu_one_step_smoke_persists_complete_resume_state_and_hashes(
     assert train.main(arguments) == 0
     checkpoint_path = first / "checkpoint.pt"
     assert checkpoint_path.is_file()
-    assert checkpoint_path.with_suffix(".pt.meta.json").is_file()
+    checkpoint_sidecar = checkpoint_path.with_suffix(".pt.meta.json")
+    assert checkpoint_sidecar.is_file()
     loaded = br.load_brainrw_checkpoint(checkpoint_path, requested_scope="train")
+    envelope = json.loads(
+        checkpoint_sidecar.read_text(encoding="utf-8")
+    )
+    assert envelope["metadata"]["training_complete"] is False
+    assert envelope["metadata"]["global_step"] == 1
+    assert envelope["metadata"]["planned_steps"] == 25
+    source_record = envelope["metadata"]["source_records"][0]
+    assert source_record["source_manifest_sha256"] == "4" * 64
+    assert source_record["source_payload_sha256"] == "a" * 64
+    assert source_record["source_payload_path"] == (
+        "/safe/sub-01/train.pt"
+    )
+    assert source_record["source_payload_byte_count"] == 123
     payload = loaded.payload
     assert payload["global_step"] == 1
+    assert payload["training_complete"] is False
     assert payload["subject"] == 1 and payload["seed"] == 42
     assert payload["scope"] == "train"
     assert payload["validation_scope"] == "val-dev"
@@ -559,16 +1294,23 @@ def test_cpu_one_step_smoke_persists_complete_resume_state_and_hashes(
         "data_order_sha256",
         "effective_batch_size",
         "environment",
+        "git_provenance",
         "git_sha",
         "input_hashes",
         "model_manifest",
+        "runtime_dtype",
         "validation_metrics",
         "run_key",
+        "clip_preprocessor_sha256",
     ):
         assert key in payload
+    assert payload["runtime_dtype"] == "float32"
+    assert payload["git_provenance"] == provenance
+    assert payload["input_hashes"]["source_payload"] == "a" * 64
     assert set(payload["observed_scopes"]) == {"train", "val-dev"}
     run_manifest = json.loads((first / "run_manifest.json").read_text(encoding="utf-8"))
     assert run_manifest["run_key"] == payload["run_key"]
+    assert run_manifest["training_complete"] is False
     assert run_manifest["subject"] == 1 and run_manifest["seed"] == 42
 
     resumed = tmp_path / "run-resumed"
@@ -581,5 +1323,7 @@ def test_cpu_one_step_smoke_persists_complete_resume_state_and_hashes(
         resumed / "checkpoint.pt", requested_scope="train"
     ).payload
     assert resumed_payload["global_step"] == 2
+    assert resumed_payload["training_complete"] is False
+    assert len(git_checks) == 4
     assert weights_only_modes
     assert all(mode is True for mode in weights_only_modes)

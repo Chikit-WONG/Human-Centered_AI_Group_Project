@@ -6,9 +6,13 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import re
 import stat
+import sys
+import zipfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
@@ -71,6 +75,40 @@ _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _VERIFIED_CACHE_DIGESTS: dict[tuple[object, ...], str] = {}
+_VERIFIED_SOURCE_DIGESTS: dict[
+    tuple[int, int, int, int, int],
+    str,
+] = {}
+_LOCKED_NUMPY_PAYLOAD_KEYS = frozenset(
+    {
+        "ch_names",
+        "eeg",
+        "img",
+        "label",
+        "session",
+        "text",
+        "times",
+    }
+)
+_LOCKED_ARCHIVE_BASE_MEMBERS = frozenset(
+    {"train/data.pkl", "train/version"}
+)
+_LOCKED_ARCHIVE_EXTENDED_MEMBERS = frozenset(
+    {
+        *_LOCKED_ARCHIVE_BASE_MEMBERS,
+        "train/byteorder",
+        "train/.data/serialization_id",
+    }
+)
+_MAX_SOURCE_ARCHIVE_BYTES = 2_200_000_000
+_MAX_SOURCE_PICKLE_BYTES = 2_150_000_000
+
+
+@dataclass(frozen=True)
+class SourcePayloadIdentity:
+    path: Path
+    byte_count: int
+    sha256: str
 
 
 class ProtocolSubjectDataset(Dataset[dict[str, object]]):
@@ -84,6 +122,8 @@ class ProtocolSubjectDataset(Dataset[dict[str, object]]):
         selected_channels: Sequence[str],
         feature_cache: Path | None,
         smooth_probability: float,
+        *,
+        expected_source_payload_sha256: str | None = None,
     ) -> None:
         if scope not in _ALLOWED_SCOPES:
             raise PermissionError(
@@ -174,7 +214,11 @@ class ProtocolSubjectDataset(Dataset[dict[str, object]]):
             )
             self.feature_cache_metadata = _deep_freeze(metadata)
 
-        loaded = _load_torch_payload(source_pt)
+        loaded = _load_torch_payload(
+            source_pt,
+            expected_sha256=expected_source_payload_sha256,
+            expected_channels=all_channels,
+        )
         eeg = _validate_eeg_payload(
             loaded,
             declared_channels=all_channels,
@@ -428,19 +472,377 @@ def _bind_source_rows(
     return selected
 
 
-def _load_torch_payload(path: Path) -> object:
+def inspect_source_payload_identity(
+    source_manifest_path: Path,
+    *,
+    expected_manifest_sha256: str,
+    subject: int,
+) -> SourcePayloadIdentity:
+    if type(subject) is not int or not 1 <= subject <= 10:
+        raise ValueError("source subject must be between 1 and 10")
+    manifest_path = _absolute_path(Path(source_manifest_path))
+    _preflight_development_path(
+        manifest_path,
+        "source train manifest",
+    )
+    if manifest_path.name != f"sub-{subject:02d}_train.json":
+        raise ValueError(
+            "source manifest filename differs from subject"
+        )
+    raw = _read_regular_bytes(
+        manifest_path,
+        "source train manifest",
+    )
+    expected_manifest = _sha256(
+        expected_manifest_sha256,
+        "source manifest SHA-256",
+    )
+    if hashlib.sha256(raw).hexdigest() != expected_manifest:
+        raise ValueError("source manifest SHA-256 mismatch")
+    source = _parse_json_object(raw, "source train manifest")
+    if frozenset(source) != _SOURCE_KEYS:
+        raise ValueError(
+            "source train manifest has an unexpected schema"
+        )
+    if source.get("schema_version") != 1 or source.get("split") != "train":
+        raise ValueError(
+            "source manifest must be schema 1 train data"
+        )
+    if source.get("subject_id") not in {
+        subject,
+        f"sub-{subject:02d}",
+    }:
+        raise ValueError(
+            "source manifest subject differs from requested subject"
+        )
+    source_path = _absolute_path(
+        Path(_string(source.get("source_pt"), "source_pt"))
+    )
+    _preflight_development_path(
+        source_path,
+        "source train EEG",
+    )
+    if (
+        source_path.name != "train.pt"
+        or source_path.parent.name != f"sub-{subject:02d}"
+    ):
+        raise ValueError(
+            "source EEG must be the selected subject train.pt"
+        )
+    descriptor = _open_component_file(
+        source_path,
+        "source train EEG",
+    )
+    try:
+        before = os.fstat(descriptor)
+        key = _identity(before)
+        digest = _VERIFIED_SOURCE_DIGESTS.get(key)
+        if digest is None:
+            digest = _sha256_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        if _identity(before) != _identity(after):
+            raise ValueError(
+                "source train.pt changed while it was hashed"
+            )
+        _VERIFIED_SOURCE_DIGESTS[key] = digest
+    finally:
+        os.close(descriptor)
+    return SourcePayloadIdentity(
+        path=source_path,
+        byte_count=before.st_size,
+        sha256=digest,
+    )
+
+
+class _RestrictedNumpyUnpickler(pickle.Unpickler):
+    """Protocol-5 reader with exactly two NumPy constructors."""
+
+    def find_class(
+        self,
+        module: str,
+        name: str,
+    ) -> object:
+        if (
+            module,
+            name,
+        ) == (
+            "numpy.core.numeric",
+            "_frombuffer",
+        ):
+            try:
+                from numpy._core.numeric import _frombuffer
+            except ImportError:
+                from numpy.core.numeric import _frombuffer
+
+            return _frombuffer
+        if (module, name) == ("numpy", "dtype"):
+            return np.dtype
+        raise pickle.UnpicklingError(
+            f"forbidden pickle global: {module}.{name}"
+        )
+
+    def persistent_load(self, pid: object) -> object:
+        raise pickle.UnpicklingError(
+            f"persistent pickle IDs are forbidden: {pid!r}"
+        )
+
+
+def _restricted_numpy_unpickle(stream: object) -> object:
+    if not callable(getattr(stream, "read", None)):
+        raise TypeError(
+            "restricted pickle stream must be readable"
+        )
+    loaded = _RestrictedNumpyUnpickler(stream).load()
+    if stream.read(1) != b"":
+        raise pickle.UnpicklingError(
+            "restricted pickle has trailing bytes"
+        )
+    return loaded
+
+
+def _locked_numpy_array(
+    payload: Mapping[str, object],
+    name: str,
+    shape: tuple[int, ...],
+    dtype: np.dtype[object],
+) -> np.ndarray:
+    value = payload[name]
+    if (
+        type(value) is not np.ndarray
+        or value.shape != shape
+        or value.dtype != dtype
+    ):
+        raise ValueError(
+            f"source train.pt {name} schema mismatch"
+        )
+    return value
+
+
+def _validate_locked_numpy_payload(
+    loaded: object,
+    *,
+    expected_channels: tuple[str, ...] | None,
+) -> dict[str, object]:
+    if (
+        type(loaded) is not dict
+        or frozenset(loaded) != _LOCKED_NUMPY_PAYLOAD_KEYS
+    ):
+        raise ValueError(
+            "source train.pt has an unexpected payload schema"
+        )
+    payload = dict(loaded)
+    channels = payload["ch_names"]
+    if (
+        not isinstance(channels, list)
+        or len(channels) != 63
+        or any(
+            not isinstance(channel, str)
+            or not channel
+            for channel in channels
+        )
+        or len(set(channels)) != len(channels)
+        or (
+            expected_channels is not None
+            and tuple(channels) != expected_channels
+        )
+    ):
+        raise ValueError(
+            "source train.pt channel schema mismatch"
+        )
+    _locked_numpy_array(
+        payload,
+        "eeg",
+        (16_540, 4, 63, 250),
+        np.dtype("float16"),
+    )
+    _locked_numpy_array(
+        payload,
+        "img",
+        (16_540, 4),
+        np.dtype("<U64"),
+    )
+    _locked_numpy_array(
+        payload,
+        "label",
+        (16_540, 4),
+        np.dtype("int64"),
+    )
+    _locked_numpy_array(
+        payload,
+        "session",
+        (16_540, 4),
+        np.dtype("float64"),
+    )
+    _locked_numpy_array(
+        payload,
+        "text",
+        (16_540, 4),
+        np.dtype("<U18"),
+    )
+    _locked_numpy_array(
+        payload,
+        "times",
+        (300,),
+        np.dtype("float64"),
+    )
+    return payload
+
+
+def _load_locked_numpy_archive(
+    handle: object,
+    *,
+    expected_channels: tuple[str, ...] | None,
+) -> dict[str, object]:
+    with zipfile.ZipFile(
+        handle,
+        mode="r",
+        allowZip64=True,
+    ) as archive:
+        infos = archive.infolist()
+        names = [info.filename for info in infos]
+        members = frozenset(names)
+        if (
+            len(names) != len(members)
+            or members
+            not in {
+                _LOCKED_ARCHIVE_BASE_MEMBERS,
+                _LOCKED_ARCHIVE_EXTENDED_MEMBERS,
+            }
+            or archive.comment != b""
+        ):
+            raise ValueError(
+                "source train.pt ZIP members differ from the locked schema"
+            )
+        total_size = 0
+        for info in infos:
+            total_size += info.file_size
+            if (
+                info.is_dir()
+                or info.compress_type != zipfile.ZIP_STORED
+                or info.compress_size != info.file_size
+                or info.flag_bits & 0x1
+                or info.extra
+                or info.comment
+            ):
+                raise ValueError(
+                    "source train.pt ZIP member is unsafe"
+                )
+        data_info = archive.getinfo("train/data.pkl")
+        if (
+            total_size > _MAX_SOURCE_ARCHIVE_BYTES
+            or data_info.file_size
+            > _MAX_SOURCE_PICKLE_BYTES
+        ):
+            raise ValueError(
+                "source train.pt ZIP exceeds locked size limits"
+            )
+        if archive.read("train/version") != b"3\n":
+            raise ValueError(
+                "source train.pt serialization version mismatch"
+            )
+        if members == _LOCKED_ARCHIVE_EXTENDED_MEMBERS:
+            serialization_id = archive.read(
+                "train/.data/serialization_id"
+            )
+            if (
+                archive.read("train/byteorder")
+                != sys.byteorder.encode("ascii")
+                or re.fullmatch(
+                    rb"[0-9]{40}",
+                    serialization_id,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "source train.pt ZIP metadata mismatch"
+                )
+        with archive.open(
+            data_info,
+            mode="r",
+        ) as stream:
+            loaded = _restricted_numpy_unpickle(stream)
+    return _validate_locked_numpy_payload(
+        loaded,
+        expected_channels=expected_channels,
+    )
+
+
+def _load_torch_payload(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_channels: tuple[str, ...] | None = None,
+) -> object:
+    expected = (
+        None
+        if expected_sha256 is None
+        else _sha256(expected_sha256, "source train.pt SHA-256")
+    )
     descriptor = _open_component_file(path, "source train EEG")
     try:
         before = os.fstat(descriptor)
+        if before.st_size > _MAX_SOURCE_ARCHIVE_BYTES:
+            raise ValueError(
+                "source train.pt exceeds locked size limits"
+            )
+        if expected is not None:
+            key = _identity(before)
+            digest = _VERIFIED_SOURCE_DIGESTS.get(key)
+            if digest is None:
+                digest = _sha256_descriptor(descriptor)
+            after_hash = os.fstat(descriptor)
+            if _identity(before) != _identity(after_hash):
+                raise ValueError(
+                    "source train.pt changed while it was hashed"
+                )
+            _VERIFIED_SOURCE_DIGESTS[key] = digest
+            if digest != expected:
+                raise ValueError(
+                    "source train.pt SHA-256 mismatch"
+                )
+        os.lseek(descriptor, 0, os.SEEK_SET)
         with os.fdopen(descriptor, "rb", closefd=True) as handle:
             descriptor = -1
             try:
-                loaded = torch.load(
-                    handle,
-                    map_location="cpu",
-                    weights_only=False,
+                is_pinned_zip = (
+                    expected is not None
+                    and os.pread(
+                        handle.fileno(),
+                        4,
+                        0,
+                    )
+                    == b"PK\x03\x04"
                 )
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                if is_pinned_zip:
+                    loaded = _load_locked_numpy_archive(
+                        handle,
+                        expected_channels=expected_channels,
+                    )
+                else:
+                    from numpy.core.multiarray import _reconstruct
+
+                    safe_globals = (
+                        _reconstruct,
+                        np.ndarray,
+                        np.dtype,
+                        type(np.dtype(np.float32)),
+                    )
+                    with torch.serialization.safe_globals(safe_globals):
+                        loaded = torch.load(
+                            handle,
+                            map_location="cpu",
+                            weights_only=True,
+                        )
+            except (
+                EOFError,
+                KeyError,
+                OSError,
+                pickle.UnpicklingError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                zipfile.BadZipFile,
+            ) as exc:
                 raise ValueError("source train.pt could not be loaded safely") from exc
             after = os.fstat(handle.fileno())
             if _identity(before) != _identity(after):
@@ -705,9 +1107,11 @@ def _preflight_development_path(path: Path, context: str) -> None:
     for component in Path(raw).parts:
         normalized = re.sub(r"[^a-z0-9]+", "_", component.lower()).strip("_")
         if normalized in {
+            "formal",
             "formal_input",
             "formal_refit",
             "formal_test",
+            "test",
             "test_images",
             "val_confirm",
         } or _SUBJECT_TEST_RE.fullmatch(component):
@@ -718,9 +1122,11 @@ def _reject_record_path(value: str) -> None:
     for component in re.split(r"[\\/]", value):
         normalized = re.sub(r"[^a-z0-9]+", "_", component.lower()).strip("_")
         if normalized in {
+            "formal",
             "formal_input",
             "formal_refit",
             "formal_test",
+            "test",
             "test_images",
             "val_confirm",
         } or _SUBJECT_TEST_RE.fullmatch(component):

@@ -22,6 +22,7 @@ from samga_brain_rw.scores import independent_retrieval_metrics
 
 
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -64,6 +65,58 @@ def _git_sha() -> str:
     if _GIT_SHA_RE.fullmatch(value) is None:
         raise ValueError("Git SHA is invalid")
     return value
+
+
+def _git_provenance() -> dict[str, object]:
+    root = _REPOSITORY_ROOT
+
+    def output(*arguments: str) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", "-C", str(root), *arguments],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+        ) as exc:
+            raise RuntimeError(
+                "Git provenance cannot be resolved"
+            ) from exc
+
+    actual_root = output(
+        "rev-parse",
+        "--show-toplevel",
+    )
+    try:
+        resolved_actual = Path(actual_root).resolve(strict=True)
+        resolved_expected = root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Git repository root cannot be resolved"
+        ) from exc
+    if resolved_actual != resolved_expected:
+        raise RuntimeError(
+            "Git repository root differs from the anchored project"
+        )
+    revision = output("rev-parse", "HEAD")
+    if _GIT_SHA_RE.fullmatch(revision) is None:
+        raise ValueError("Git SHA is invalid")
+    status = output(
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    )
+    if status:
+        raise RuntimeError(
+            "Git worktree must be clean before BrainRW execution"
+        )
+    return {
+        "clean": True,
+        "git_sha": revision,
+        "repository_root": str(resolved_expected),
+    }
 
 
 def _json_clone(value: object) -> object:
@@ -144,18 +197,16 @@ def _validate_resume_before_data(
         raise ValueError("resume checkpoint input-hash bundle mismatch")
 
 
-def _validate_resume_after_model(
+def _validate_resume_model_before_data(
     payload: Mapping[str, object],
     *,
     model: br.BrainRWCLIPLoRAModel,
-    data_order_hash: str,
     effective_batch_size: int,
     task_initialization_sha256: str,
     candidate_initialization_sha256: str,
 ) -> None:
     expected = {
         "model_manifest_sha256": model.model_manifest_sha256,
-        "data_order_sha256": data_order_hash,
         "effective_batch_size": effective_batch_size,
         "task_initialization_sha256": task_initialization_sha256,
         "candidate_initialization_sha256": (
@@ -167,6 +218,175 @@ def _validate_resume_after_model(
             raise ValueError(f"resume checkpoint {name} mismatch")
 
 
+def _load_resume_runtime_before_data(
+    payload: Mapping[str, object],
+    *,
+    model: br.BrainRWCLIPLoRAModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    sampler: br.StatefulIndexSampler,
+    loader_generator: torch.Generator,
+    device: torch.device,
+    planned_steps: int,
+    global_step: int,
+) -> None:
+    try:
+        model.load_checkpoint_states(
+            payload["task_state"],
+            payload["candidate_state"],
+        )
+        optimizer_state = payload["optimizer_state"]
+        if not isinstance(optimizer_state, Mapping):
+            raise ValueError(
+                "optimizer state must be a mapping"
+            )
+        expected_optimizer = optimizer.state_dict()
+        if set(optimizer_state) != set(expected_optimizer):
+            raise ValueError(
+                "optimizer state has an unexpected schema"
+            )
+        actual_groups = optimizer_state.get("param_groups")
+        expected_groups = expected_optimizer["param_groups"]
+        if (
+            not isinstance(actual_groups, list)
+            or len(actual_groups) != len(expected_groups)
+        ):
+            raise ValueError(
+                "optimizer parameter groups differ from recipe"
+            )
+        parameter_by_id: dict[int, torch.nn.Parameter] = {}
+        for actual, expected, runtime_group in zip(
+            actual_groups,
+            expected_groups,
+            optimizer.param_groups,
+            strict=True,
+        ):
+            if (
+                not isinstance(actual, Mapping)
+                or set(actual) != set(expected)
+                or not isinstance(actual.get("params"), list)
+                or len(actual["params"]) != len(expected["params"])
+            ):
+                raise ValueError(
+                    "optimizer parameter-group schema differs from recipe"
+                )
+            parameter_ids = actual["params"]
+            runtime_parameters = runtime_group["params"]
+            if len(parameter_ids) != len(runtime_parameters):
+                raise ValueError(
+                    "optimizer parameter count differs from recipe"
+                )
+            for parameter_id, parameter in zip(
+                parameter_ids,
+                runtime_parameters,
+                strict=True,
+            ):
+                if (
+                    type(parameter_id) is not int
+                    or parameter_id < 0
+                    or parameter_id in parameter_by_id
+                    or not isinstance(
+                        parameter,
+                        torch.nn.Parameter,
+                    )
+                ):
+                    raise ValueError(
+                        "optimizer parameter identity is invalid"
+                    )
+                parameter_by_id[parameter_id] = parameter
+        optimizer_values = optimizer_state.get("state")
+        if (
+            not isinstance(optimizer_values, Mapping)
+            or set(optimizer_values) != set(parameter_by_id)
+        ):
+            raise ValueError(
+                "optimizer state does not cover every trainable parameter"
+            )
+        for parameter_id, parameter in parameter_by_id.items():
+            state = optimizer_values[parameter_id]
+            if (
+                not isinstance(state, Mapping)
+                or set(state)
+                != {"step", "exp_avg", "exp_avg_sq"}
+            ):
+                raise ValueError(
+                    "optimizer parameter state has an unexpected schema"
+                )
+            step = state["step"]
+            if (
+                not isinstance(step, torch.Tensor)
+                or step.numel() != 1
+                or not step.is_floating_point()
+                or not bool(torch.isfinite(step).all())
+                or float(step.item()) != float(global_step)
+            ):
+                raise ValueError(
+                    "optimizer parameter step differs from global step"
+                )
+            for name in ("exp_avg", "exp_avg_sq"):
+                moment = state[name]
+                if (
+                    not isinstance(moment, torch.Tensor)
+                    or moment.shape != parameter.shape
+                    or not moment.is_floating_point()
+                    or moment.dtype
+                    not in {parameter.dtype, torch.float32}
+                    or not bool(torch.isfinite(moment).all())
+                    or (
+                        name == "exp_avg_sq"
+                        and bool((moment < 0).any())
+                    )
+                ):
+                    raise ValueError(
+                        f"optimizer {name} tensor is invalid"
+                    )
+        optimizer.load_state_dict(optimizer_state)
+        if [
+            group.get("group_name")
+            for group in optimizer.param_groups
+        ] != ["brain_task", "clip_lora"]:
+            raise ValueError(
+                "optimizer parameter-group identity mismatch"
+            )
+        _move_optimizer_state(optimizer, device)
+
+        scheduler_state = payload["scheduler_state"]
+        if (
+            not isinstance(scheduler_state, Mapping)
+            or set(scheduler_state)
+            != set(scheduler.state_dict())
+        ):
+            raise ValueError(
+                "scheduler state has an unexpected schema"
+            )
+        if scheduler_state.get("last_epoch") != global_step:
+            raise ValueError(
+                "scheduler step differs from global step"
+            )
+        scheduler.load_state_dict(scheduler_state)
+        if (
+            scheduler.state_dict().get("T_max") != planned_steps
+            or scheduler.last_epoch != global_step
+        ):
+            raise ValueError(
+                "scheduler progress differs from planned steps"
+            )
+        sampler.load_state_dict(payload["sampler_state"])
+        loader_generator.set_state(
+            payload["dataloader_generator_state"]
+        )
+        br.restore_rng_state(payload["rng_state"])
+    except (
+        KeyError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(
+            f"resume checkpoint runtime state is invalid: {exc}"
+        ) from exc
+
+
 def _validation_metrics(
     model: br.BrainRWCLIPLoRAModel,
     dataset: object,
@@ -174,6 +394,7 @@ def _validation_metrics(
     *,
     batch_size: int,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> dict[str, object]:
     similarity, identifiers = br.evaluate_brainrw_similarity(
         model,
@@ -181,6 +402,7 @@ def _validation_metrics(
         processor,
         batch_size=batch_size,
         device=device,
+        dtype=dtype,
     )
     metrics = independent_retrieval_metrics(
         similarity,
@@ -199,6 +421,7 @@ def _validation_metrics(
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     _validate_cli(args)
+    initial_git_provenance = _git_provenance()
     config = br.verify_brainrw_config(args.config, args.clip_path)
     manifest = br.load_development_manifest_identity(
         args.manifest,
@@ -216,15 +439,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             Path(args.resume),
             requested_scope="train",
         )
-        _validate_resume_before_data(
+        br.validate_brainrw_checkpoint_identity(
             resume.payload,
-            subject=args.subject,
-            seed=args.seed,
             config=config,
             manifest=manifest,
-            run_key=run_key,
-            input_hashes=hashes,
+            subject=args.subject,
+            seed=args.seed,
         )
+        if resume.payload["git_sha"] != initial_git_provenance[
+            "git_sha"
+        ]:
+            raise ValueError(
+                "resume checkpoint Git revision mismatch"
+            )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -232,25 +459,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    train_dataset = br.BrainRWDevelopmentDataset(
-        manifest.path,
-        "train",
-        args.seed,
-    )
-    val_dataset = br.BrainRWDevelopmentDataset(
-        manifest.path,
-        "val-dev",
-        args.seed,
-    )
-    if (
-        train_dataset.subject_id != args.subject
-        or val_dataset.subject_id != args.subject
-    ):
-        raise ValueError("dataset subject differs from CLI subject")
-
     model, processor = br.build_brainrw_model(
         config.payload,
         config.clip_path,
+        expected_preprocessor_sha256=(
+            config.clip_preprocessor_sha256
+        ),
     )
     training = config.payload["training"]
     optimizer_config = config.payload["optimizer"]
@@ -259,17 +473,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     batch_size = int(training["batch_size"])
     epochs = int(training["epochs"])
     effective_batch_size = batch_size
-    sampler = br.StatefulIndexSampler(
-        len(train_dataset),
-        args.seed,
-    )
-    base_data_order_sha256 = br.data_order_sha256(
-        train_dataset,
-        sampler,
-    )
-    loader_generator = torch.Generator().manual_seed(
-        args.seed + 1_000_003
-    )
     task_initialization_sha256 = br.state_dict_sha256(
         model.task_state_dict()
     )
@@ -277,10 +480,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         model.candidate_state_dict()
     )
     if resume is not None:
-        _validate_resume_after_model(
+        _validate_resume_model_before_data(
             resume.payload,
             model=model,
-            data_order_hash=base_data_order_sha256,
             effective_batch_size=effective_batch_size,
             task_initialization_sha256=task_initialization_sha256,
             candidate_initialization_sha256=(
@@ -297,35 +499,88 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         and training["precision"] == "bf16"
         else torch.float32
     )
+    runtime_dtype_name = (
+        "bfloat16"
+        if runtime_dtype is torch.bfloat16
+        else "float32"
+    )
+    if resume is not None and br.checkpoint_runtime_dtype(
+        resume.payload,
+        device,
+    ) is not runtime_dtype:
+        raise ValueError("resume checkpoint runtime_dtype mismatch")
     model.to(device=device, dtype=runtime_dtype)
     optimizer = _build_optimizer(model, optimizer_config)
+    sampler = br.StatefulIndexSampler(
+        manifest.train_row_count,
+        args.seed,
+    )
     planned_steps = epochs * max(
-        1, math.ceil(len(train_dataset) / batch_size)
+        1, math.ceil(sampler.size / batch_size)
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=planned_steps,
     )
+    loader_generator = torch.Generator().manual_seed(
+        args.seed + 1_000_003
+    )
     global_step = 0
     resumed_from_sha256 = None
     if resume is not None:
         payload = resume.payload
-        model.load_checkpoint_states(
-            payload["task_state"],
-            payload["candidate_state"],
-        )
-        optimizer.load_state_dict(payload["optimizer_state"])
-        _move_optimizer_state(optimizer, device)
-        scheduler.load_state_dict(payload["scheduler_state"])
-        sampler.load_state_dict(payload["sampler_state"])
-        loader_generator.set_state(
-            payload["dataloader_generator_state"]
-        )
-        global_step = int(payload["global_step"])
         if int(payload["planned_steps"]) != planned_steps:
             raise ValueError("resume planned optimization steps mismatch")
-        br.restore_rng_state(payload["rng_state"])
+        _load_resume_runtime_before_data(
+            payload,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=sampler,
+            loader_generator=loader_generator,
+            device=device,
+            planned_steps=planned_steps,
+            global_step=int(payload["global_step"]),
+        )
+        global_step = int(payload["global_step"])
         resumed_from_sha256 = resume.sha256
+
+    train_dataset = br.BrainRWDevelopmentDataset(
+        manifest.path,
+        "train",
+        args.seed,
+        expected_source_payload_sha256=manifest.source_payload_sha256,
+    )
+    val_dataset = br.BrainRWDevelopmentDataset(
+        manifest.path,
+        "val-dev",
+        args.seed,
+        expected_source_payload_sha256=manifest.source_payload_sha256,
+    )
+    if (
+        train_dataset.subject_id != args.subject
+        or val_dataset.subject_id != args.subject
+    ):
+        raise ValueError("dataset subject differs from CLI subject")
+    if (
+        len(train_dataset) != sampler.size
+        or len(val_dataset) != manifest.val_dev_row_count
+    ):
+        raise ValueError(
+            "dataset row count differs from manifest identity"
+        )
+    base_data_order_sha256 = br.data_order_sha256(
+        train_dataset,
+        sampler,
+    )
+    if (
+        resume is not None
+        and resume.payload["data_order_sha256"]
+        != base_data_order_sha256
+    ):
+        raise ValueError(
+            "resume checkpoint data_order_sha256 mismatch"
+        )
 
     stop_step = (
         planned_steps
@@ -381,12 +636,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         processor,
         batch_size=batch_size,
         device=device,
+        dtype=runtime_dtype,
     )
-    git_sha = _git_sha()
+    final_git_provenance = _git_provenance()
+    if final_git_provenance != initial_git_provenance:
+        raise RuntimeError(
+            "Git provenance changed during BrainRW execution"
+        )
+    git_sha = str(initial_git_provenance["git_sha"])
+    training_complete = global_step == planned_steps
     payload = {
         "schema_version": 1,
         "payload_type": br.BRAINRW_CHECKPOINT_TYPE,
         "complete": True,
+        "training_complete": training_complete,
         "scope": "train",
         "validation_scope": "val-dev",
         "observed_scopes": ["train", "val-dev"],
@@ -403,6 +666,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "run_key": run_key,
         "clip_path": str(config.clip_path),
         "clip_config_sha256": config.clip_config_sha256,
+        "clip_preprocessor_sha256": config.clip_preprocessor_sha256,
         "clip_weights_sha256": config.clip_weights_sha256,
         "model_manifest": _json_clone(dict(model.model_manifest)),
         "model_manifest_sha256": model.model_manifest_sha256,
@@ -426,11 +690,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "data_order_sha256": base_data_order_sha256,
         "effective_batch_size": effective_batch_size,
         "steps": global_step,
+        "runtime_dtype": runtime_dtype_name,
         "environment": br.capture_environment(),
         "git_sha": git_sha,
+        "git_provenance": _json_clone(
+            initial_git_provenance
+        ),
         "validation_metrics": metrics,
         "resumed_from_sha256": resumed_from_sha256,
     }
+    br.validate_brainrw_checkpoint_identity(
+        payload,
+        config=config,
+        manifest=manifest,
+        subject=args.subject,
+        seed=args.seed,
+    )
     output = br.reject_development_path(
         args.output_dir, "output directory"
     )
@@ -447,6 +722,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "schema_version": 1,
         "payload_type": "samga_brain_rw.brainrw_run_manifest",
         "complete": True,
+        "training_complete": training_complete,
         "scope": "train",
         "validation_scope": "val-dev",
         "observed_scopes": ["train", "val-dev"],
@@ -469,6 +745,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "effective_batch_size": effective_batch_size,
         "planned_steps": planned_steps,
         "completed_steps": global_step,
+        "runtime_dtype": runtime_dtype_name,
+        "git_sha": git_sha,
+        "git_provenance": initial_git_provenance,
         "validation_metrics": metrics,
         "resumed_from_sha256": resumed_from_sha256,
     }
@@ -491,6 +770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         FileExistsError,
         OSError,
         PermissionError,
+        RuntimeError,
         TypeError,
         ValueError,
     ) as exc:

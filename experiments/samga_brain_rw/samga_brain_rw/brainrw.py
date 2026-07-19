@@ -33,7 +33,11 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .access import TypedArtifact, verify_typed_artifacts
 from .config import SemanticConfig, make_run_key
-from .data import POSTERIOR_CHANNELS, ProtocolSubjectDataset
+from .data import (
+    POSTERIOR_CHANNELS,
+    ProtocolSubjectDataset,
+    inspect_source_payload_identity,
+)
 from .hashing import canonical_json_bytes, ordered_ids_sha256, sha256_json
 
 
@@ -70,6 +74,72 @@ _SEALED_COMPONENTS = frozenset(
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+_BRAINRW_CHECKPOINT_KEYS = frozenset(
+    {
+        "candidate_initialization_sha256",
+        "candidate_state",
+        "clip_config_sha256",
+        "clip_path",
+        "clip_preprocessor_sha256",
+        "clip_weights_sha256",
+        "complete",
+        "config_path",
+        "config_payload",
+        "config_sha256",
+        "data_order_sha256",
+        "dataloader_generator_state",
+        "effective_batch_size",
+        "environment",
+        "epoch",
+        "git_provenance",
+        "git_sha",
+        "global_step",
+        "input_bundle_sha256",
+        "input_hashes",
+        "manifest_path",
+        "manifest_sha256",
+        "model_manifest",
+        "model_manifest_sha256",
+        "observed_scopes",
+        "optimizer_state",
+        "payload_type",
+        "planned_steps",
+        "protocol_sha256",
+        "resumed_from_sha256",
+        "rng_state",
+        "run_key",
+        "runtime_dtype",
+        "sampler_state",
+        "scheduler_state",
+        "schema_version",
+        "scope",
+        "seed",
+        "steps",
+        "subject",
+        "target_manifest_sha256",
+        "training_complete",
+        "task_initialization_sha256",
+        "task_state",
+        "validation_metrics",
+        "validation_scope",
+    }
+)
+_BRAINRW_INPUT_HASH_KEYS = frozenset(
+    {
+        "clip_config",
+        "clip_preprocessor",
+        "clip_weights",
+        "config",
+        "manifest",
+        "protocol",
+        "records",
+        "source_manifest",
+        "source_payload",
+        "train_role",
+        "val_dev_role",
+    }
+)
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -224,6 +294,18 @@ class BrainMLP(nn.Module):
         for layer in self.layers:
             values = layer(values)
         return values
+
+
+def _initialize_legacy_brain_module(module: nn.Module) -> None:
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LayerNorm):
+        if module.weight is not None:
+            nn.init.ones_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 class LoRALinear(nn.Module):
@@ -385,6 +467,9 @@ class BrainRWCLIPLoRAModel(nn.Module):
             hidden_size=self.projection_dim,
             dropout=dropout,
         )
+        self.brain_mlp.apply(
+            _initialize_legacy_brain_module
+        )
         self.logit_scale = nn.Parameter(
             torch.tensor(2.0, dtype=torch.float32)
         )
@@ -474,16 +559,11 @@ class BrainRWCLIPLoRAModel(nn.Module):
         similarity = brain @ image.T
         loss = None
         if return_loss:
-            logits = (
-                self.logit_scale.exp().clamp(max=100.0) * similarity
-            )
+            logits = self.logit_scale.exp() * similarity
             labels = torch.arange(
                 logits.shape[0], device=logits.device
             )
-            loss = 0.5 * (
-                F.cross_entropy(logits, labels)
-                + F.cross_entropy(logits.T, labels)
-            )
+            loss = F.cross_entropy(logits, labels)
         return BrainRWOutput(loss, similarity, brain, image)
 
     def task_state_dict(self) -> dict[str, Tensor]:
@@ -574,6 +654,7 @@ class BrainRWDevelopmentDataset(Dataset[dict[str, object]]):
         seed: int,
         *,
         image_loader: Callable[[Path], object] | None = None,
+        expected_source_payload_sha256: str | None = None,
     ) -> None:
         if scope not in _DEVELOPMENT_SCOPES:
             raise PermissionError(
@@ -586,6 +667,9 @@ class BrainRWDevelopmentDataset(Dataset[dict[str, object]]):
             POSTERIOR_CHANNELS,
             None,
             0.3 if scope == "train" else 0.0,
+            expected_source_payload_sha256=(
+                expected_source_payload_sha256
+            ),
         )
         self._image_loader = (
             _load_rgb_image if image_loader is None else image_loader
@@ -694,12 +778,17 @@ class ManifestIdentity:
     protocol_sha256: str
     records_sha256: str
     source_manifest_sha256: str
+    source_payload_path: Path
+    source_payload_sha256: str
+    source_payload_byte_count: int
     train_role_sha256: str
     val_dev_role_sha256: str
     train_ordered_ids: tuple[str, ...]
     val_dev_ordered_ids: tuple[str, ...]
     train_ordered_ids_sha256: str
     val_dev_ordered_ids_sha256: str
+    train_row_count: int = 12_540
+    val_dev_row_count: int = 200
 
 
 def load_development_manifest_identity(
@@ -804,6 +893,53 @@ def load_development_manifest_identity(
         raise ValueError(
             "protocol role descriptors are missing"
         )
+    source_manifest_sha256 = _sha256(
+        document.get("source_manifest_sha256"),
+        "source manifest hash",
+    )
+    declared_source = document.get("source_manifest_path")
+    if not isinstance(declared_source, str) or not declared_source:
+        raise ValueError(
+            "protocol source_manifest_path must be a non-empty string"
+        )
+    declared_path = Path(declared_source)
+    candidates = (
+        reject_development_path(
+            declared_path,
+            "source train manifest",
+        ),
+        reject_development_path(
+            path.parent / declared_path,
+            "source train manifest",
+        ),
+    )
+    existing_sources = tuple(
+        dict.fromkeys(
+            candidate
+            for candidate in candidates
+            if candidate.is_file()
+        )
+    )
+    if len(existing_sources) != 1:
+        raise ValueError(
+            "protocol source manifest path is missing or ambiguous"
+        )
+    source_payload = inspect_source_payload_identity(
+        existing_sources[0],
+        expected_manifest_sha256=source_manifest_sha256,
+        subject=subject,
+    )
+    from .provenance import DEFAULT_ORACLES
+
+    source_oracle = DEFAULT_ORACLES.source_files[subject - 1]
+    if (
+        source_oracle.manifest_sha256 != source_manifest_sha256
+        or source_oracle.byte_count != source_payload.byte_count
+        or source_oracle.sha256 != source_payload.sha256
+    ):
+        raise ValueError(
+            "source manifest/train.pt identity differs from pinned provenance"
+        )
     return ManifestIdentity(
         path=path,
         subject=subject,
@@ -815,10 +951,10 @@ def load_development_manifest_identity(
         records_sha256=_sha256(
             document.get("records_sha256"), "records hash"
         ),
-        source_manifest_sha256=_sha256(
-            document.get("source_manifest_sha256"),
-            "source manifest hash",
-        ),
+        source_manifest_sha256=source_manifest_sha256,
+        source_payload_path=source_payload.path,
+        source_payload_sha256=source_payload.sha256,
+        source_payload_byte_count=source_payload.byte_count,
         train_role_sha256=_sha256(
             train_descriptor.get("role_payload_sha256"),
             "train role hash",
@@ -831,6 +967,8 @@ def load_development_manifest_identity(
         val_dev_ordered_ids=val_ids,
         train_ordered_ids_sha256=ordered_ids_sha256(train_ids),
         val_dev_ordered_ids_sha256=ordered_ids_sha256(val_ids),
+        train_row_count=int(train["row_count"]),
+        val_dev_row_count=int(val_dev["row_count"]),
     )
 
 
@@ -841,6 +979,7 @@ class BrainRWConfigIdentity:
     sha256: str
     clip_path: Path
     clip_config_sha256: str
+    clip_preprocessor_sha256: str
     clip_weights_sha256: str
 
 
@@ -911,12 +1050,18 @@ def verify_brainrw_config(
         )
     config_file = resolved_clip / "config.json"
     weights_file = resolved_clip / "model.safetensors"
-    if not config_file.is_file() or not weights_file.is_file():
+    preprocessor_file = resolved_clip / "preprocessor_config.json"
+    if (
+        not config_file.is_file()
+        or not weights_file.is_file()
+        or not preprocessor_file.is_file()
+    ):
         raise ValueError(
             "CLIP path lacks required local model files"
         )
     config_hash = file_sha256(config_file)
     weights_hash = file_sha256(weights_file)
+    preprocessor_hash = file_sha256(preprocessor_file)
     if config_hash != _sha256(
         clip["config_sha256"], "CLIP config hash"
     ):
@@ -931,6 +1076,7 @@ def verify_brainrw_config(
         sha256=semantic.sha256,
         clip_path=resolved_clip,
         clip_config_sha256=config_hash,
+        clip_preprocessor_sha256=preprocessor_hash,
         clip_weights_sha256=weights_hash,
     )
 
@@ -941,12 +1087,14 @@ def input_hashes(
 ) -> dict[str, str]:
     return {
         "clip_config": config.clip_config_sha256,
+        "clip_preprocessor": config.clip_preprocessor_sha256,
         "clip_weights": config.clip_weights_sha256,
         "config": config.sha256,
         "manifest": manifest.manifest_sha256,
         "protocol": manifest.protocol_sha256,
         "records": manifest.records_sha256,
         "source_manifest": manifest.source_manifest_sha256,
+        "source_payload": manifest.source_payload_sha256,
         "train_role": manifest.train_role_sha256,
         "val_dev_role": manifest.val_dev_role_sha256,
     }
@@ -973,28 +1121,81 @@ def brainrw_run_key(
 
 def load_clip_components(
     clip_path: Path,
+    *,
+    expected_config_sha256: str,
+    expected_weights_sha256: str,
+    expected_preprocessor_sha256: str,
 ) -> tuple[nn.Module, object]:
+    path = reject_development_path(clip_path, "CLIP path")
+    expected = {
+        "config": _sha256(
+            expected_config_sha256,
+            "CLIP config hash",
+        ),
+        "weights": _sha256(
+            expected_weights_sha256,
+            "CLIP weights hash",
+        ),
+        "preprocessor": _sha256(
+            expected_preprocessor_sha256,
+            "CLIP preprocessor hash",
+        ),
+    }
+    components = {
+        "config": path / "config.json",
+        "weights": path / "model.safetensors",
+        "preprocessor": path / "preprocessor_config.json",
+    }
+    for name, component in components.items():
+        if file_sha256(component) != expected[name]:
+            raise ValueError(
+                f"CLIP {name} SHA-256 mismatch before load"
+            )
     from transformers import (
         CLIPImageProcessor,
         CLIPVisionModelWithProjection,
     )
 
     model = CLIPVisionModelWithProjection.from_pretrained(
-        str(clip_path),
+        str(path),
         local_files_only=True,
+        use_safetensors=True,
     )
     processor = CLIPImageProcessor.from_pretrained(
-        str(clip_path),
+        str(path),
         local_files_only=True,
     )
+    for name, component in components.items():
+        if file_sha256(component) != expected[name]:
+            raise ValueError(
+                f"CLIP {name} SHA-256 mismatch after load"
+            )
     return model, processor
 
 
 def build_brainrw_model(
     config_payload: Mapping[str, object],
     clip_path: Path,
+    *,
+    expected_preprocessor_sha256: str,
 ) -> tuple[BrainRWCLIPLoRAModel, object]:
-    vision, processor = load_clip_components(clip_path)
+    clip = config_payload["clip"]
+    if not isinstance(clip, Mapping):
+        raise ValueError("CLIP config must be a mapping")
+    preprocessor_sha256 = _sha256(
+        expected_preprocessor_sha256,
+        "CLIP preprocessor hash",
+    )
+    vision, processor = load_clip_components(
+        clip_path,
+        expected_config_sha256=_sha256(
+            clip.get("config_sha256"), "CLIP config hash"
+        ),
+        expected_weights_sha256=_sha256(
+            clip.get("weights_sha256"), "CLIP weights hash"
+        ),
+        expected_preprocessor_sha256=preprocessor_sha256,
+    )
     lora = config_payload["lora"]
     brain = config_payload["brain_mlp"]
     assert isinstance(lora, Mapping) and isinstance(brain, Mapping)
@@ -1638,6 +1839,7 @@ def save_brainrw_checkpoint(
     payload: Mapping[str, object],
     manifest: ManifestIdentity,
 ) -> str:
+    payload = _validate_loaded_checkpoint(payload)
     checkpoint_path = reject_development_path(
         path, "checkpoint output"
     )
@@ -1677,6 +1879,12 @@ def save_brainrw_checkpoint(
             "records_sha256": manifest.records_sha256,
             "role": "train",
             "role_payload_sha256": manifest.train_role_sha256,
+            "source_manifest_sha256": (
+                manifest.source_manifest_sha256
+            ),
+            "source_payload_byte_count": manifest.source_payload_byte_count,
+            "source_payload_path": str(manifest.source_payload_path),
+            "source_payload_sha256": manifest.source_payload_sha256,
         }
     ]
     provenance = {
@@ -1690,6 +1898,9 @@ def save_brainrw_checkpoint(
     }
     metadata = {
         "complete": True,
+        "global_step": payload["global_step"],
+        "planned_steps": payload["planned_steps"],
+        "training_complete": payload["training_complete"],
         "observed_scopes": ["train", "val-dev"],
         "ordered_ids": list(manifest.train_ordered_ids),
         "run_key": payload["run_key"],
@@ -1759,6 +1970,383 @@ def save_brainrw_checkpoint(
     return payload_hash
 
 
+def _checkpoint_json_sha256(value: object, name: str) -> str:
+    try:
+        return sha256_json(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"checkpoint {name} is not canonical JSON"
+        ) from exc
+
+
+def _checkpoint_mapping(
+    value: object,
+    name: str,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"checkpoint {name} must be a mapping"
+        )
+    result = dict(value)
+    if any(not isinstance(key, str) for key in result):
+        raise ValueError(
+            f"checkpoint {name} keys must be strings"
+        )
+    return result
+
+
+def _validate_checkpoint_model_manifest(
+    value: object,
+    declared_sha256: object,
+    target_sha256: object,
+) -> dict[str, object]:
+    manifest = _checkpoint_mapping(value, "model_manifest")
+    if set(manifest) != {
+        "schema_version",
+        "brain_mlp",
+        "lora",
+    }:
+        raise ValueError(
+            "checkpoint model_manifest has an unexpected schema"
+        )
+    if manifest["schema_version"] != 1:
+        raise ValueError(
+            "checkpoint model_manifest schema mismatch"
+        )
+    if (
+        _checkpoint_json_sha256(
+            manifest,
+            "model_manifest",
+        )
+        != _sha256(
+            declared_sha256,
+            "checkpoint model_manifest_sha256",
+        )
+    ):
+        raise ValueError(
+            "checkpoint model_manifest hash mismatch"
+        )
+    brain = _checkpoint_mapping(
+        manifest["brain_mlp"],
+        "model_manifest.brain_mlp",
+    )
+    lora = _checkpoint_mapping(
+        manifest["lora"],
+        "model_manifest.lora",
+    )
+    if set(brain) != {
+        "channels",
+        "samples",
+        "projection_dim",
+        "layers",
+        "dropout",
+        "layer_norm_eps",
+    } or set(lora) != {
+        "semantic_targets",
+        "resolved_targets",
+        "target_manifest_sha256",
+        "rank",
+        "alpha",
+        "dropout",
+    }:
+        raise ValueError(
+            "checkpoint model_manifest has an unexpected nested schema"
+        )
+    target = _sha256(
+        target_sha256,
+        "checkpoint target_manifest_sha256",
+    )
+    if (
+        _sha256(
+            lora["target_manifest_sha256"],
+            "checkpoint model manifest target hash",
+        )
+        != target
+    ):
+        raise ValueError(
+            "checkpoint target manifest hash mismatch"
+        )
+    _positive_int(
+        brain["channels"],
+        "checkpoint model channels",
+    )
+    _positive_int(
+        brain["samples"],
+        "checkpoint model samples",
+    )
+    _positive_int(
+        brain["projection_dim"],
+        "checkpoint model projection dimension",
+    )
+    _positive_int(
+        brain["layers"],
+        "checkpoint model layer count",
+    )
+    _probability(
+        brain["dropout"],
+        "checkpoint model dropout",
+    )
+    if (
+        isinstance(brain["layer_norm_eps"], bool)
+        or not isinstance(
+            brain["layer_norm_eps"],
+            (int, float),
+        )
+        or not math.isfinite(float(brain["layer_norm_eps"]))
+        or float(brain["layer_norm_eps"]) <= 0.0
+    ):
+        raise ValueError(
+            "checkpoint model layer_norm_eps is invalid"
+        )
+    if not isinstance(lora["semantic_targets"], list) or not isinstance(
+        lora["resolved_targets"],
+        list,
+    ) or any(
+        not isinstance(item, str)
+        for item in (
+            list(lora["semantic_targets"])
+            + list(lora["resolved_targets"])
+        )
+    ):
+        raise ValueError(
+            "checkpoint model LoRA targets are invalid"
+        )
+    _positive_int(lora["rank"], "checkpoint LoRA rank")
+    _positive_int(lora["alpha"], "checkpoint LoRA alpha")
+    _probability(lora["dropout"], "checkpoint LoRA dropout")
+    return manifest
+
+
+def _validate_checkpoint_resume_state(
+    value: dict[str, object],
+) -> None:
+    for name in ("task_state", "candidate_state"):
+        state = _checkpoint_mapping(value[name], name)
+        if not state:
+            raise ValueError(
+                f"checkpoint {name} must not be empty"
+            )
+        try:
+            state_dict_sha256(state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"checkpoint {name} is invalid"
+            ) from exc
+    _checkpoint_mapping(
+        value["optimizer_state"],
+        "optimizer_state",
+    )
+    _checkpoint_mapping(
+        value["scheduler_state"],
+        "scheduler_state",
+    )
+    epoch = _nonnegative_int(
+        value["epoch"],
+        "checkpoint epoch",
+    )
+    global_step = _positive_int(
+        value["global_step"],
+        "checkpoint global_step",
+    )
+    planned_steps = _positive_int(
+        value["planned_steps"],
+        "checkpoint planned_steps",
+    )
+    if (
+        value["steps"] != global_step
+        or global_step > planned_steps
+    ):
+        raise ValueError(
+            "checkpoint optimization step identity mismatch"
+        )
+    effective_batch_size = _positive_int(
+        value["effective_batch_size"],
+        "checkpoint effective_batch_size",
+    )
+    rng_state = _checkpoint_mapping(
+        value["rng_state"],
+        "rng_state",
+    )
+    if set(rng_state) != {
+        "python",
+        "numpy",
+        "torch",
+        "cuda",
+    }:
+        raise ValueError(
+            "checkpoint RNG state has an unexpected schema"
+        )
+    sampler = _checkpoint_mapping(
+        value["sampler_state"],
+        "sampler_state",
+    )
+    if set(sampler) != {
+        "size",
+        "seed",
+        "epoch",
+        "position",
+        "order",
+    }:
+        raise ValueError(
+            "checkpoint sampler state has an unexpected schema"
+        )
+    sampler_size = _positive_int(
+        sampler["size"],
+        "checkpoint sampler size",
+    )
+    sampler_epoch = _nonnegative_int(
+        sampler["epoch"],
+        "checkpoint sampler epoch",
+    )
+    sampler_position = _nonnegative_int(
+        sampler["position"],
+        "checkpoint sampler position",
+    )
+    if (
+        sampler["seed"] != value["seed"]
+        or sampler_epoch != epoch
+        or sampler_position > sampler_size
+        or not isinstance(sampler["order"], list)
+        or sorted(sampler["order"]) != list(range(sampler_size))
+    ):
+        raise ValueError(
+            "checkpoint sampler state identity mismatch"
+        )
+    config_payload = _checkpoint_mapping(
+        value["config_payload"],
+        "config_payload",
+    )
+    training = _checkpoint_mapping(
+        config_payload.get("training"),
+        "config_payload.training",
+    )
+    epochs = _positive_int(
+        training.get("epochs"),
+        "checkpoint configured epochs",
+    )
+    configured_batch_size = _positive_int(
+        training.get("batch_size"),
+        "checkpoint configured batch_size",
+    )
+    if effective_batch_size != configured_batch_size:
+        raise ValueError(
+            "checkpoint effective batch size differs from config"
+        )
+    batches_per_epoch = math.ceil(
+        sampler_size / effective_batch_size
+    )
+    if planned_steps != epochs * batches_per_epoch:
+        raise ValueError(
+            "checkpoint planned steps differ from config and sampler"
+        )
+    if (
+        sampler_epoch >= epochs
+        or (
+            sampler_position != sampler_size
+            and sampler_position % effective_batch_size != 0
+        )
+    ):
+        raise ValueError(
+            "checkpoint sampler progress is not on a batch boundary"
+        )
+    expected_global_step = (
+        sampler_epoch * batches_per_epoch
+        + math.ceil(
+            sampler_position / effective_batch_size
+        )
+    )
+    if global_step != expected_global_step:
+        raise ValueError(
+            "checkpoint global step differs from sampler progress"
+        )
+    training_complete = value["training_complete"]
+    expected_complete = global_step == planned_steps
+    if (
+        type(training_complete) is not bool
+        or training_complete is not expected_complete
+    ):
+        raise ValueError(
+            "checkpoint training_complete differs from step progress"
+        )
+    if training_complete and (
+        sampler_epoch != epochs - 1
+        or sampler_position != sampler_size
+    ):
+        raise ValueError(
+            "checkpoint terminal sampler state is inconsistent"
+        )
+    generator_state = value["dataloader_generator_state"]
+    if (
+        not isinstance(generator_state, Tensor)
+        or generator_state.dtype != torch.uint8
+        or generator_state.ndim != 1
+        or generator_state.numel() == 0
+    ):
+        raise ValueError(
+            "checkpoint dataloader generator state is invalid"
+        )
+
+
+def _validate_checkpoint_metrics(value: object) -> None:
+    metrics = _checkpoint_mapping(
+        value,
+        "validation_metrics",
+    )
+    if set(metrics) != {
+        "gallery_count",
+        "query_count",
+        "top1_count",
+        "top1_rate",
+        "top5_count",
+        "top5_rate",
+    }:
+        raise ValueError(
+            "checkpoint validation metrics have an unexpected schema"
+        )
+    query_count = _positive_int(
+        metrics["query_count"],
+        "checkpoint validation query_count",
+    )
+    _positive_int(
+        metrics["gallery_count"],
+        "checkpoint validation gallery_count",
+    )
+    top1_count = _nonnegative_int(
+        metrics["top1_count"],
+        "checkpoint validation top1_count",
+    )
+    top5_count = _nonnegative_int(
+        metrics["top5_count"],
+        "checkpoint validation top5_count",
+    )
+    if (
+        top1_count > top5_count
+        or top5_count > query_count
+    ):
+        raise ValueError(
+            "checkpoint validation count identity mismatch"
+        )
+    for name, count in (
+        ("top1_rate", top1_count),
+        ("top5_rate", top5_count),
+    ):
+        rate = metrics[name]
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not math.isfinite(float(rate))
+            or not math.isclose(
+                float(rate),
+                count / query_count,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"checkpoint validation {name} mismatch"
+            )
+
+
 def _validate_loaded_checkpoint(
     payload: object,
 ) -> dict[str, object]:
@@ -1767,27 +2355,19 @@ def _validate_loaded_checkpoint(
             "checkpoint payload must be a mapping"
         )
     value = dict(payload)
-    required = (
-        "schema_version",
-        "payload_type",
-        "complete",
-        "scope",
-        "validation_scope",
-        "subject",
-        "seed",
-        "config_sha256",
-        "manifest_sha256",
-        "protocol_sha256",
-        "task_state",
-        "candidate_state",
-        "git_sha",
-        "run_key",
-        "observed_scopes",
+    missing = sorted(
+        _BRAINRW_CHECKPOINT_KEYS - set(value)
     )
-    missing = [key for key in required if key not in value]
     if missing:
         raise ValueError(
             f"checkpoint is missing {missing[0]}"
+        )
+    unknown = sorted(
+        set(value) - _BRAINRW_CHECKPOINT_KEYS
+    )
+    if unknown:
+        raise ValueError(
+            f"checkpoint has unknown field {unknown[0]}"
         )
     if (
         value["schema_version"] != 1
@@ -1821,23 +2401,262 @@ def _validate_loaded_checkpoint(
         )
     _nonnegative_int(value["seed"], "checkpoint seed")
     for key in (
+        "candidate_initialization_sha256",
+        "clip_config_sha256",
+        "clip_preprocessor_sha256",
+        "clip_weights_sha256",
         "config_sha256",
+        "data_order_sha256",
+        "input_bundle_sha256",
         "manifest_sha256",
+        "model_manifest_sha256",
         "protocol_sha256",
+        "target_manifest_sha256",
+        "task_initialization_sha256",
     ):
         _sha256(value[key], f"checkpoint {key}")
+    for key in (
+        "config_path",
+        "manifest_path",
+        "clip_path",
+    ):
+        path = value[key]
+        if not isinstance(path, str) or not path:
+            raise ValueError(
+                f"checkpoint {key} must be a non-empty path"
+            )
+        reject_development_path(
+            Path(path),
+            f"checkpoint {key}",
+        )
     if (
         not isinstance(value["git_sha"], str)
         or _GIT_RE.fullmatch(value["git_sha"]) is None
     ):
         raise ValueError("checkpoint git_sha is invalid")
-    if not isinstance(value["task_state"], Mapping) or not isinstance(
-        value["candidate_state"], Mapping
+    config_payload = _checkpoint_mapping(
+        value["config_payload"],
+        "config_payload",
+    )
+    if (
+        _checkpoint_json_sha256(
+            config_payload,
+            "config_payload",
+        )
+        != value["config_sha256"]
     ):
         raise ValueError(
-            "checkpoint model states must be mappings"
+            "checkpoint config payload hash mismatch"
+        )
+    config_id = config_payload.get("config_id")
+    if not isinstance(config_id, str):
+        raise ValueError(
+            "checkpoint config payload lacks config_id"
+        )
+    hashes = _checkpoint_mapping(
+        value["input_hashes"],
+        "input_hashes",
+    )
+    if set(hashes) != _BRAINRW_INPUT_HASH_KEYS:
+        raise ValueError(
+            "checkpoint input hashes have an unexpected schema"
+        )
+    for name, digest in hashes.items():
+        _sha256(
+            digest,
+            f"checkpoint input hash {name}",
+        )
+    expected_bundle = _checkpoint_json_sha256(
+        hashes,
+        "input_hashes",
+    )
+    if value["input_bundle_sha256"] != expected_bundle:
+        raise ValueError(
+            "checkpoint input bundle hash mismatch"
+        )
+    expected_run_key = make_run_key(
+        "brainrw-clip-lora",
+        config_id,
+        subject,
+        int(value["seed"]),
+        str(value["config_sha256"]),
+        expected_bundle,
+    )
+    if value["run_key"] != expected_run_key:
+        raise ValueError(
+            "checkpoint run key identity mismatch"
+        )
+    if (
+        hashes["config"] != value["config_sha256"]
+        or hashes["manifest"] != value["manifest_sha256"]
+        or hashes["protocol"] != value["protocol_sha256"]
+        or hashes["clip_config"] != value["clip_config_sha256"]
+        or hashes["clip_preprocessor"]
+        != value["clip_preprocessor_sha256"]
+        or hashes["clip_weights"] != value["clip_weights_sha256"]
+    ):
+        raise ValueError(
+            "checkpoint duplicated input identity mismatch"
+        )
+    _validate_checkpoint_model_manifest(
+        value["model_manifest"],
+        value["model_manifest_sha256"],
+        value["target_manifest_sha256"],
+    )
+    _validate_checkpoint_resume_state(value)
+    runtime_dtype = value["runtime_dtype"]
+    if runtime_dtype not in {"float32", "bfloat16"}:
+        raise ValueError(
+            "checkpoint runtime_dtype is invalid"
+        )
+    _checkpoint_mapping(
+        value["environment"],
+        "environment",
+    )
+    provenance = _checkpoint_mapping(
+        value["git_provenance"],
+        "git_provenance",
+    )
+    if (
+        set(provenance)
+        != {
+            "clean",
+            "git_sha",
+            "repository_root",
+        }
+        or provenance["clean"] is not True
+        or provenance["git_sha"] != value["git_sha"]
+        or not isinstance(
+            provenance["repository_root"],
+            str,
+        )
+        or not Path(
+            provenance["repository_root"]
+        ).is_absolute()
+    ):
+        raise ValueError(
+            "checkpoint Git provenance is invalid"
+        )
+    _validate_checkpoint_metrics(
+        value["validation_metrics"]
+    )
+    resumed = value["resumed_from_sha256"]
+    if resumed is not None:
+        _sha256(
+            resumed,
+            "checkpoint resumed_from_sha256",
         )
     return value
+
+
+def validate_brainrw_checkpoint_identity(
+    payload: Mapping[str, object],
+    *,
+    config: BrainRWConfigIdentity,
+    manifest: ManifestIdentity,
+    subject: int,
+    seed: int,
+) -> Mapping[str, object]:
+    if not isinstance(config, BrainRWConfigIdentity):
+        raise TypeError(
+            "checkpoint config identity is invalid"
+        )
+    if not isinstance(manifest, ManifestIdentity):
+        raise TypeError(
+            "checkpoint manifest identity is invalid"
+        )
+    subject = _positive_int(
+        subject,
+        "checkpoint expected subject",
+    )
+    seed = _nonnegative_int(
+        seed,
+        "checkpoint expected seed",
+    )
+    value = _validate_loaded_checkpoint(payload)
+    expected_run_key, expected_bundle, expected_hashes = (
+        brainrw_run_key(
+            config,
+            manifest,
+            subject,
+            seed,
+        )
+    )
+    comparisons = {
+        "subject": subject,
+        "seed": seed,
+        "config_path": str(config.path),
+        "config_sha256": config.sha256,
+        "manifest_path": str(manifest.path),
+        "manifest_sha256": manifest.manifest_sha256,
+        "protocol_sha256": manifest.protocol_sha256,
+        "input_bundle_sha256": expected_bundle,
+        "run_key": expected_run_key,
+        "clip_path": str(config.clip_path),
+        "clip_config_sha256": config.clip_config_sha256,
+        "clip_preprocessor_sha256": (
+            config.clip_preprocessor_sha256
+        ),
+        "clip_weights_sha256": config.clip_weights_sha256,
+    }
+    for name, expected in comparisons.items():
+        if value[name] != expected:
+            raise ValueError(
+                f"checkpoint {name} mismatch"
+            )
+    if value["input_hashes"] != expected_hashes:
+        raise ValueError(
+            "checkpoint input hashes mismatch"
+        )
+    expected_config_payload = dict(config.payload)
+    if (
+        _checkpoint_json_sha256(
+            value["config_payload"],
+            "config_payload",
+        )
+        != _checkpoint_json_sha256(
+            expected_config_payload,
+            "expected config payload",
+        )
+    ):
+        raise ValueError(
+            "checkpoint config payload mismatch"
+        )
+    model_manifest = _checkpoint_mapping(
+        value["model_manifest"],
+        "model_manifest",
+    )
+    brain = _checkpoint_mapping(
+        model_manifest["brain_mlp"],
+        "model_manifest.brain_mlp",
+    )
+    lora = _checkpoint_mapping(
+        model_manifest["lora"],
+        "model_manifest.lora",
+    )
+    config_brain = _checkpoint_mapping(
+        config.payload["brain_mlp"],
+        "config brain_mlp",
+    )
+    config_lora = _checkpoint_mapping(
+        config.payload["lora"],
+        "config lora",
+    )
+    if (
+        brain["channels"] != 17
+        or brain["samples"] != 250
+        or brain["layers"] != 1
+        or brain["dropout"] != config_brain["dropout"]
+        or float(brain["layer_norm_eps"]) != 1e-6
+        or lora["semantic_targets"] != config_lora["targets"]
+        or lora["rank"] != config_lora["rank"]
+        or lora["alpha"] != config_lora["alpha"]
+        or lora["dropout"] != config_lora["dropout"]
+    ):
+        raise ValueError(
+            "checkpoint model manifest differs from semantic config"
+        )
+    return MappingProxyType(value)
 
 
 def load_brainrw_checkpoint(
@@ -1912,8 +2731,19 @@ def build_model_from_checkpoint(
         raise ValueError(
             "checkpoint CLIP weights hash no longer matches"
         )
+    if (
+        file_sha256(path / "preprocessor_config.json")
+        != payload.get("clip_preprocessor_sha256")
+    ):
+        raise ValueError(
+            "checkpoint CLIP preprocessor hash no longer matches"
+        )
     model, processor = build_brainrw_model(
-        config_payload, path
+        config_payload,
+        path,
+        expected_preprocessor_sha256=str(
+            payload["clip_preprocessor_sha256"]
+        ),
     )
     if (
         model.model_manifest_sha256
@@ -1929,6 +2759,31 @@ def build_model_from_checkpoint(
     return model, processor
 
 
+def checkpoint_runtime_dtype(
+    payload: Mapping[str, object],
+    device: torch.device,
+) -> torch.dtype:
+    declared = payload.get("runtime_dtype")
+    if declared == "float32":
+        return torch.float32
+    if declared == "bfloat16":
+        if device.type != "cuda":
+            raise ValueError(
+                "bfloat16 checkpoint evaluation requires CUDA"
+            )
+        return torch.bfloat16
+    raise ValueError(
+        "checkpoint runtime_dtype must be float32 or bfloat16"
+    )
+
+
+def _model_floating_dtype(model: nn.Module) -> torch.dtype:
+    for parameter in model.parameters():
+        if parameter.is_floating_point():
+            return parameter.dtype
+    raise ValueError("model has no floating parameters")
+
+
 def evaluate_brainrw_similarity(
     model: BrainRWCLIPLoRAModel,
     dataset: Dataset[dict[str, object]],
@@ -1936,7 +2791,15 @@ def evaluate_brainrw_similarity(
     *,
     batch_size: int,
     device: torch.device,
+    dtype: torch.dtype | None = None,
 ) -> tuple[np.ndarray, tuple[str, ...]]:
+    numerical_dtype = (
+        _model_floating_dtype(model)
+        if dtype is None
+        else dtype
+    )
+    if numerical_dtype not in {torch.float32, torch.bfloat16}:
+        raise ValueError("evaluation dtype must be float32 or bfloat16")
     loader = DataLoader(
         dataset,
         batch_size=_positive_int(
@@ -1946,7 +2809,7 @@ def evaluate_brainrw_similarity(
         num_workers=0,
         collate_fn=BrainRWCollator(processor),
     )
-    model.to(device)
+    model.to(device=device, dtype=numerical_dtype)
     model.eval()
     brain_values: list[Tensor] = []
     image_values: list[Tensor] = []
@@ -1955,12 +2818,18 @@ def evaluate_brainrw_similarity(
         for batch in loader:
             brain_values.append(
                 model.encode_brain(
-                    batch["brain_signals"].to(device)
+                    batch["brain_signals"].to(
+                        device=device,
+                        dtype=numerical_dtype,
+                    )
                 ).cpu()
             )
             image_values.append(
                 model.encode_image(
-                    batch["pixel_values"].to(device)
+                    batch["pixel_values"].to(
+                        device=device,
+                        dtype=numerical_dtype,
+                    )
                 ).cpu()
             )
             identifiers.extend(batch["image_ids"])
