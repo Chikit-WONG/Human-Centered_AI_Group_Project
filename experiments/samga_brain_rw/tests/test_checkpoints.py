@@ -147,6 +147,12 @@ def test_swa_is_updated_once_per_locked_epoch_and_matches_arithmetic(
     assert hash_state_dict(swa) == hash_state_dict(arithmetic)
 
 
+def test_state_hash_accepts_scalar_tensor() -> None:
+    first = hash_state_dict({"temperature": torch.tensor(0.07)})
+    second = hash_state_dict({"temperature": torch.tensor(0.07)})
+    assert first == second
+
+
 def test_swa_preserves_real_float32_averaged_model_update_semantics(
     tmp_path: Path,
 ) -> None:

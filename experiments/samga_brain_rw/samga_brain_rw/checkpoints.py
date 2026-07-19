@@ -512,7 +512,7 @@ def _tensor_semantics(tensor: torch.Tensor) -> dict[str, object]:
     value = tensor.detach().cpu().contiguous()
     if value.layout != torch.strided:
         raise ValueError("payload tensors must use strided layout")
-    raw = value.view(torch.uint8).numpy().tobytes()
+    raw = value.reshape(-1).view(torch.uint8).numpy().tobytes()
     return {
         "dtype": str(value.dtype),
         "shape": list(value.shape),
