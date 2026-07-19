@@ -102,6 +102,24 @@ def _resource_command(
     if not rows:
         raise ValueError("cannot submit a job map without rows")
     row = rows[0]
+    bounds = payload.get("array_bounds")
+    if (
+        not isinstance(bounds, list)
+        or len(bounds) != 2
+        or type(bounds[0]) is not int
+        or type(bounds[1]) is not int
+    ):
+        raise ValueError("job map has invalid immutable array bounds")
+    stdout_path = Path(str(row["stdout_path"]))
+    stderr_path = Path(str(row["stderr_path"]))
+    expected_log_dir = stdout_path.parent
+    if (
+        stderr_path.parent != expected_log_dir
+        or Path(log_dir) != expected_log_dir
+    ):
+        raise ValueError("log_dir differs from the sealed row log paths")
+    if "," in str(job_map_path) or "\n" in str(job_map_path):
+        raise ValueError("job-map path cannot be encoded in SLURM --export")
     return [
         "sbatch",
         "--parsable",
@@ -111,12 +129,14 @@ def _resource_command(
         f"--mem={row['memory']}",
         f"--time={row['time']}",
         f"--array={_compress_indices(indices)}",
-        f"--output={log_dir}/%x_%A_%a.out",
-        f"--error={log_dir}/%x_%A_%a.err",
+        f"--output={row['stdout_path']}",
+        f"--error={row['stderr_path']}",
         (
             "--export=ALL,"
             f"JOB_MAP={job_map_path},"
-            f"JOB_MAP_SHA256={job_map_sha256}"
+            f"JOB_MAP_SHA256={job_map_sha256},"
+            f"JOB_MAP_ARRAY_MIN={bounds[0]},"
+            f"JOB_MAP_ARRAY_MAX={bounds[1]}"
         ),
         str(slurm_script),
     ]

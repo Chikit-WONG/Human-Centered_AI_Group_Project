@@ -40,6 +40,7 @@ ROW_KEYS = {
     "config_id",
     "config_sha256",
     "input_bundle_sha256",
+    "run_key",
     "subject",
     "seed",
     "argv",
@@ -95,6 +96,9 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})$")
 _MEMORY_RE = re.compile(r"^[1-9]\d*[KMGTP]$")
 _GENERATION_RE = re.compile(r"^generation-(\d{6})$")
+_DEVELOPMENT_STAGE_RE = re.compile(
+    r"^stage-(?P<stage>[02])-(?P<phase>smoke|pilot|full)$"
+)
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,25 @@ def _is_forbidden_path_token(value: str) -> bool:
     return False
 
 
+def _validate_slurm_log_pattern(value: object, label: str, suffix: str) -> str:
+    text = _validate_log_path(value, label, suffix)
+    if text.count("%A") != 1 or text.count("%a") != 1:
+        raise ValueError(f"{label} must contain exactly one %A and one %a")
+    remainder = text.replace("%A", "").replace("%a", "")
+    if "%" in remainder:
+        raise ValueError(f"{label} contains an unsupported SLURM log pattern")
+    return text
+
+
+def _has_flag(argv: Sequence[str], flag: str) -> bool:
+    return flag in argv
+
+
+def _forbid_flag(argv: Sequence[str], flag: str) -> None:
+    if _has_flag(argv, flag):
+        raise ValueError(f"sealed argv forbids {flag}")
+
+
 def _validate_log_path(value: object, label: str, suffix: str) -> str:
     text = _require_nonempty_string(value, label)
     path = PurePosixPath(text)
@@ -206,6 +229,138 @@ def _flag_value(argv: Sequence[str], flag: str) -> str:
     if position + 1 >= len(argv) or argv[position + 1].startswith("--"):
         raise ValueError(f"sealed argv must bind a value to {flag}")
     return argv[position + 1]
+
+
+def _validate_training_runner_argv(
+    row: Mapping[str, object],
+    argv: Sequence[str],
+) -> None:
+    if len(argv) < 2:
+        raise ValueError("sealed training runner argv is incomplete")
+    executable = PurePosixPath(argv[1]).as_posix()
+    match = _DEVELOPMENT_STAGE_RE.fullmatch(str(row["stage"]))
+    expected_suffix = (
+        "experiments/samga_brain_rw/scripts/run_training_cell.py"
+    )
+    if not executable.endswith(expected_suffix):
+        if match is not None:
+            raise ValueError(
+                "development training stage requires the unified runner"
+            )
+        return
+    if match is None:
+        raise ValueError(
+            "unified training runner requires a development training stage"
+        )
+    flags = [value for value in argv if value.startswith("--")]
+    if len(flags) != len(set(flags)):
+        raise ValueError("sealed training runner argv contains a duplicate flag")
+    required = (
+        "--mode",
+        "--stage",
+        "--role",
+        "--subject",
+        "--seed",
+        "--resume",
+        "--config",
+        "--manifest",
+        "--feature-cache",
+        "--output-dir",
+        "--project-root",
+        "--config-id",
+        "--expected-config-sha256",
+        "--expected-input-bundle-sha256",
+        "--run-key",
+    )
+    values = {flag: _flag_value(argv, flag) for flag in required}
+    stage = match.group("stage")
+    phase = match.group("phase")
+    expected_mode = "smoke" if phase == "smoke" else "full"
+    expected = {
+        "--mode": expected_mode,
+        "--stage": stage,
+        "--role": str(row["role"]),
+        "--subject": str(row["subject"]),
+        "--seed": str(row["seed"]),
+        "--config-id": str(row["config_id"]),
+        "--expected-config-sha256": str(row["config_sha256"]),
+        "--expected-input-bundle-sha256": str(
+            row["input_bundle_sha256"]
+        ),
+        "--run-key": str(row["run_key"]),
+    }
+    for flag, expected_value in expected.items():
+        if values[flag] != expected_value:
+            label = flag.removeprefix("--").replace("-", "_")
+            raise ValueError(f"sealed argv {label} does not match the row")
+    if PurePosixPath(values["--output-dir"]).name != row["run_key"]:
+        raise ValueError("sealed argv output directory does not match run_key")
+    if values["--resume"] == "":
+        raise ValueError("sealed argv resume must be explicit")
+    for flag in ("--config", "--manifest", "--feature-cache", "--project-root"):
+        _require_nonempty_string(values[flag], f"argv {flag}")
+    project_root = PurePosixPath(values["--project-root"])
+    if not project_root.is_absolute() or ".." in project_root.parts:
+        raise ValueError("sealed argv project-root must be absolute and normalized")
+    expected_runner = (project_root / expected_suffix).as_posix()
+    if executable != expected_runner:
+        raise ValueError(
+            "unified runner path does not match the declared project-root"
+        )
+    role = str(row["role"])
+    if (stage == "0" and role != "baseline") or (
+        stage == "2" and role not in {"baseline", "candidate", "control"}
+    ):
+        raise ValueError("training row role is invalid for its stage")
+    if stage == "2":
+        for flag in ("--stage2-config", "--candidate-id"):
+            value = _flag_value(argv, flag)
+            if not value:
+                raise ValueError(f"sealed argv {flag} must be nonempty")
+        if _flag_value(argv, "--candidate-id") != row["config_id"]:
+            raise ValueError(
+                "sealed argv candidate does not match config_id"
+            )
+    else:
+        for flag in (
+            "--stage2-config",
+            "--candidate-id",
+            "--adapter-rank",
+            "--adapter-lr-ratio",
+            "--whitening-artifact",
+        ):
+            _forbid_flag(argv, flag)
+    if expected_mode == "smoke":
+        text = _flag_value(argv, "--max-train-steps")
+        if (
+            not text.isascii()
+            or not text.isdecimal()
+            or int(text) <= 0
+            or str(int(text)) != text
+        ):
+            raise ValueError(
+                "smoke training runner requires positive --max-train-steps"
+            )
+        required_hashes = [
+            "final_checkpoint_sha256",
+            "in_loop_metadata_sha256",
+            "run_manifest_sha256",
+        ]
+    else:
+        _forbid_flag(argv, "--max-train-steps")
+        required_hashes = [
+            "final_checkpoint_sha256",
+            "parity_sha256",
+            "run_manifest_sha256",
+        ]
+    schema = row["expected_completion_schema"]
+    if (
+        not isinstance(schema, Mapping)
+        or schema.get("required_output_hashes") != required_hashes
+    ):
+        raise ValueError(
+            "completion schema does not match the training runner mode"
+        )
 
 
 def _validate_completion_schema(value: object) -> dict[str, object]:
@@ -248,6 +403,7 @@ def _validate_row(
     _require_safe_id(row["config_id"], "config_id")
     _require_sha256(row["config_sha256"], "config_sha256")
     _require_sha256(row["input_bundle_sha256"], "input_bundle_sha256")
+    _require_safe_id(row["run_key"], "run_key")
     subject = _require_int(row["subject"], "subject", minimum=1)
     seed = _require_int(row["seed"], "seed", minimum=0)
 
@@ -265,6 +421,7 @@ def _validate_row(
     if _flag_value(argv, "--seed") != str(seed):
         raise ValueError("sealed argv seed does not match the job-map row")
     _require_nonempty_string(_flag_value(argv, "--config"), "argv config")
+    _validate_training_runner_argv(row, argv)
 
     partition = _require_nonempty_string(row["partition"], "partition")
     if partition not in ALLOWED_A40_PARTITIONS:
@@ -281,8 +438,12 @@ def _validate_row(
     if partition == "debug" and seconds > 30 * 60:
         raise ValueError("debug resource jobs must finish within 30 minutes")
 
-    _validate_log_path(row["stdout_path"], "stdout_path", ".out")
-    _validate_log_path(row["stderr_path"], "stderr_path", ".err")
+    _validate_slurm_log_pattern(
+        row["stdout_path"], "stdout_path", ".out"
+    )
+    _validate_slurm_log_pattern(
+        row["stderr_path"], "stderr_path", ".err"
+    )
     completion_path = _require_nonempty_string(
         row["completion_path"],
         "completion_path",
@@ -305,6 +466,7 @@ def job_row_sort_key(row: Mapping[str, object]) -> tuple[object, ...]:
         row["subject"],
         row["seed"],
         row["config_sha256"],
+        row["run_key"],
         row["input_bundle_sha256"],
         tuple(row["argv"]),  # type: ignore[arg-type]
     )
@@ -317,6 +479,8 @@ def _resource_key(row: Mapping[str, object]) -> tuple[object, ...]:
         row["cpus"],
         row["memory"],
         row["time"],
+        row["stdout_path"],
+        row["stderr_path"],
     )
 
 
@@ -327,6 +491,7 @@ def _logical_run_key(row: Mapping[str, object]) -> tuple[object, ...]:
         row["config_id"],
         row["subject"],
         row["seed"],
+        row["run_key"],
     )
 
 
@@ -352,10 +517,15 @@ def build_job_map(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     logical_keys = [_logical_run_key(row) for row in validated]
     if len(set(logical_keys)) != len(logical_keys):
         raise ValueError("duplicate logical job-map row")
-    for field in ("stdout_path", "stderr_path", "completion_path"):
-        values = [str(row[field]) for row in validated]
-        if len(set(values)) != len(values):
-            raise ValueError(f"duplicate {field} in job map")
+    for field in ("stdout_path", "stderr_path"):
+        values = {str(row[field]) for row in validated}
+        if len(values) != 1:
+            raise ValueError(
+                f"job map must use one shared sealed {field} pattern"
+            )
+    completion_paths = [str(row["completion_path"]) for row in validated]
+    if len(set(completion_paths)) != len(completion_paths):
+        raise ValueError("duplicate completion_path in job map")
 
     ordered = sorted(validated, key=job_row_sort_key)
     indexed = [
@@ -416,10 +586,15 @@ def validate_job_map(payload: Mapping[str, object]) -> dict[str, object]:
     logical_keys = [_logical_run_key(row) for row in validated]
     if len(set(logical_keys)) != len(logical_keys):
         raise ValueError("duplicate logical job-map row")
-    for field in ("stdout_path", "stderr_path", "completion_path"):
-        values = [str(row[field]) for row in validated]
-        if len(set(values)) != len(values):
-            raise ValueError(f"duplicate {field} in job map")
+    for field in ("stdout_path", "stderr_path"):
+        values = {str(row[field]) for row in validated}
+        if len(values) != 1:
+            raise ValueError(
+                f"job map must use one shared sealed {field} pattern"
+            )
+    completion_paths = [str(row["completion_path"]) for row in validated]
+    if len(set(completion_paths)) != len(completion_paths):
+        raise ValueError("duplicate completion_path in job map")
 
     claimed = _require_sha256(payload["payload_sha256"], "job-map hash")
     body = {key: value for key, value in payload.items() if key != "payload_sha256"}

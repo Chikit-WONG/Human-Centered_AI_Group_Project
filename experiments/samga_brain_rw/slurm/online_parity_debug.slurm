@@ -13,8 +13,8 @@ set -euo pipefail
 JOB_MAP=${JOB_MAP:?set JOB_MAP to the sealed online-parity job map}
 JOB_MAP_SHA256=${JOB_MAP_SHA256:?set JOB_MAP_SHA256 to its sealed hash}
 ARRAY_INDEX=${SLURM_ARRAY_TASK_ID:-0}
-ARRAY_MIN=${SLURM_ARRAY_TASK_MIN:-0}
-ARRAY_MAX=${SLURM_ARRAY_TASK_MAX:-0}
+ARRAY_MIN=${JOB_MAP_ARRAY_MIN:?set immutable full job-map minimum}
+ARRAY_MAX=${JOB_MAP_ARRAY_MAX:?set immutable full job-map maximum}
 
 export PYTHONPATH=experiments/samga_brain_rw
 export HF_DATASETS_OFFLINE=1

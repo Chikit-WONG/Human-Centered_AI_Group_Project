@@ -79,6 +79,8 @@ def _row(
     tmp_path: Path,
     *,
     stage: str = "stage-2-pilot",
+    mode: str | None = None,
+    training_runner: bool = True,
     role: str = "candidate",
     config_id: str = "s2-layernorm-on",
     subject: int = 1,
@@ -86,47 +88,121 @@ def _row(
     partition: str = "debug",
     time: str = "00:30:00",
 ) -> dict[str, object]:
-    run_key = f"{stage}_{role}_{config_id}_sub{subject:02d}_seed{seed}"
-    return {
-        "stage": stage,
-        "role": role,
-        "config_id": config_id,
-        "config_sha256": _h(f"config:{config_id}"),
-        "input_bundle_sha256": _h(f"input:{subject}:{seed}"),
-        "subject": subject,
-        "seed": seed,
-        "argv": [
+    stage_number = 2 if "stage-2" in stage else 0
+    selected_mode = mode or ("smoke" if "smoke" in stage else "full")
+    config_sha256 = _h(f"config:{config_id}")
+    input_bundle_sha256 = _h(f"input:{subject}:{seed}")
+    run_key = (
+        f"stage{stage_number}__{config_id}__sub-{subject:02d}__seed-{seed}__"
+        f"{config_sha256}__{input_bundle_sha256}"
+    )
+    project_root = Path(__file__).resolve().parents[3]
+    output_dir = tmp_path / stage / run_key
+    argv = [
+        "python",
+        str(project_root / "experiments/samga_brain_rw/scripts/run_training_cell.py"),
+        "--mode",
+        selected_mode,
+        "--stage",
+        str(stage_number),
+        "--role",
+        role,
+        "--subject",
+        str(subject),
+        "--seed",
+        str(seed),
+        "--resume",
+        "none",
+        "--config",
+        "experiments/samga_brain_rw/configs/internvit_baseline_v1.json",
+        "--manifest",
+        f"artifacts/samga_brain_rw/protocol/manifests/sub-{subject:02d}_protocol.json",
+        "--feature-cache",
+        "artifacts/samga_reproduction/features/features.npy",
+        "--output-dir",
+        str(output_dir),
+        "--project-root",
+        str(project_root),
+        "--config-id",
+        config_id,
+        "--expected-config-sha256",
+        config_sha256,
+        "--expected-input-bundle-sha256",
+        input_bundle_sha256,
+        "--run-key",
+        run_key,
+    ]
+    if stage_number == 2:
+        argv.extend(
+            [
+                "--stage2-config",
+                "experiments/samga_brain_rw/configs/stage2_candidates_v1.json",
+                "--candidate-id",
+                config_id,
+            ]
+        )
+    if selected_mode == "smoke":
+        argv.extend(["--max-train-steps", "1"])
+    if not training_runner:
+        argv = [
             "python",
-            "experiments/samga_brain_rw/train.py",
-            "--scope",
-            "train",
-            "--validation-scope",
-            "val-dev",
-            "--stage",
-            "2",
+            "legacy_development_command.py",
             "--subject",
             str(subject),
             "--seed",
             str(seed),
-            "--resume",
-            "none",
             "--config",
-            "experiments/samga_brain_rw/configs/stage2_candidates_v1.json",
-        ],
+            "legacy-development.json",
+        ]
+    required = (
+        [
+            "final_checkpoint_sha256",
+            "in_loop_metadata_sha256",
+            "run_manifest_sha256",
+        ]
+        if selected_mode == "smoke"
+        else [
+            "final_checkpoint_sha256",
+            "parity_sha256",
+            "run_manifest_sha256",
+        ]
+    )
+    required = required if training_runner else ["metrics_sha256"]
+    return {
+        "stage": stage,
+        "role": role,
+        "config_id": config_id,
+        "config_sha256": config_sha256,
+        "input_bundle_sha256": input_bundle_sha256,
+        "subject": subject,
+        "seed": seed,
+        "run_key": run_key,
+        "argv": argv,
         "partition": partition,
         "gres": "gpu:a40:1",
         "cpus": 8,
         "memory": "64G",
         "time": time,
-        "stdout_path": f"logs/samga_brain_rw/{run_key}_%A_%a.out",
-        "stderr_path": f"logs/samga_brain_rw/{run_key}_%A_%a.err",
-        "completion_path": str(tmp_path / run_key / "completion.json"),
+        "stdout_path": "logs/samga_brain_rw/sealed_%A_%a.out",
+        "stderr_path": "logs/samga_brain_rw/sealed_%A_%a.err",
+        "completion_path": str(tmp_path / stage / run_key / "completion.json"),
         "expected_completion_schema": {
             "schema_version": 1,
             "payload_type": "samga_brain_rw.job_completion",
-            "required_output_hashes": ["metrics_sha256"],
+            "required_output_hashes": required,
         },
     }
+
+
+def _output_hashes(
+    row: dict[str, object],
+    label: str,
+) -> dict[str, str]:
+    schema = row["expected_completion_schema"]
+    assert isinstance(schema, dict)
+    names = schema["required_output_hashes"]
+    assert isinstance(names, list)
+    return {str(name): _h(f"{label}:{name}") for name in names}
 
 
 def _rehash(payload: dict[str, object]) -> None:
@@ -217,8 +293,12 @@ def test_array_launchers_validate_hash_bounds_and_selected_row(
         assert "${JOB_MAP:?" in text
         assert "${JOB_MAP_SHA256:?" in text
         assert "SLURM_ARRAY_TASK_ID" in text
-        assert "SLURM_ARRAY_TASK_MIN" in text
-        assert "SLURM_ARRAY_TASK_MAX" in text
+        if name == "pilot_array.slurm":
+            assert "JOB_MAP_ARRAY_MIN" in text
+            assert "JOB_MAP_ARRAY_MAX" in text
+        else:
+            assert "SLURM_ARRAY_TASK_MIN" in text
+            assert "SLURM_ARRAY_TASK_MAX" in text
         assert "--job-map-sha256" in text
         assert "--array-index" in text
         assert "--array-min" in text
@@ -278,6 +358,7 @@ def test_job_map_sorts_rows_assigns_indices_and_seals_every_field(
         "config_id",
         "config_sha256",
         "input_bundle_sha256",
+        "run_key",
         "subject",
         "seed",
         "argv",
@@ -424,6 +505,151 @@ def test_selected_row_requires_exact_map_hash_bounds_and_index(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "flag", "replacement", "match"),
+    (
+        ("stage", "--stage", "0", "stage"),
+        ("role", "--role", "control", "role"),
+        ("config_id", "--config-id", "different", "config_id"),
+        ("config_sha256", "--expected-config-sha256", "0" * 64, "config"),
+        (
+            "input_bundle_sha256",
+            "--expected-input-bundle-sha256",
+            "0" * 64,
+            "input",
+        ),
+        ("run_key", "--run-key", "different", "run_key"),
+        ("run_key", "--output-dir", "/tmp/different", "output|run_key"),
+        ("config_id", "--candidate-id", "different", "candidate"),
+    ),
+)
+def test_job_map_binds_runner_identity_fields_to_named_argv(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+    field: str,
+    flag: str,
+    replacement: str,
+    match: str,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    position = argv.index(flag)
+    argv[position + 1] = replacement
+    with pytest.raises(ValueError, match=match):
+        jobmap_module.build_job_map([row])
+
+
+def test_job_map_requires_one_shared_sealed_slurm_log_pattern(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    first = _row(tmp_path, subject=1, seed=42)
+    second = _row(tmp_path, subject=5, seed=43)
+    second["stdout_path"] = "logs/samga_brain_rw/different_%A_%a.out"
+    with pytest.raises(ValueError, match="log|stdout|pattern|resource"):
+        jobmap_module.build_job_map([first, second])
+
+    invalid = _row(tmp_path)
+    invalid["stderr_path"] = "logs/samga_brain_rw/missing-array.err"
+    with pytest.raises(ValueError, match="%A|%a|pattern"):
+        jobmap_module.build_job_map([invalid])
+
+
+def test_training_stage_rejects_non_unified_runner_before_map_seal(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    argv[1] = "experiments/samga_brain_rw/train.py"
+    with pytest.raises(ValueError, match="unified|runner"):
+        jobmap_module.build_job_map([row])
+
+
+def test_training_stage_binds_runner_to_declared_project_root(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    position = argv.index("--project-root")
+    argv[position + 1] = str(tmp_path / "other-root")
+    with pytest.raises(ValueError, match="project.root|runner"):
+        jobmap_module.build_job_map([row])
+
+
+def test_partial_retry_exports_full_map_bounds_and_uses_sealed_logs(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    rows = [
+        _row(
+            tmp_path,
+            subject=subject,
+            seed=seed,
+            partition="i64m1tga40u",
+            time="04:00:00",
+        )
+        for subject, seed in ((1, 42), (5, 43), (8, 42))
+    ]
+    payload = jobmap_module.write_job_map(rows, tmp_path / "pilot.json")
+    for row in (payload["rows"][0], payload["rows"][2]):
+        jobmap_module.claim_job_row(payload, row)
+        jobmap_module.complete_job_row(
+            payload,
+            row,
+            {
+                "final_checkpoint_sha256": _h(f"checkpoint-{row['array_index']}"),
+                "parity_sha256": _h(f"parity-{row['array_index']}"),
+                "run_manifest_sha256": _h(f"manifest-{row['array_index']}"),
+            },
+        )
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        calls.append(list(command))
+        return SimpleNamespace(stdout="123\n", returncode=0)
+
+    submit_module._submit(
+        payload,
+        job_map_path=tmp_path / "pilot.json",
+        job_map_sha256=payload["payload_sha256"],
+        slurm_script=experiment_root / "slurm" / "pilot_array.slurm",
+        log_dir=Path("logs/samga_brain_rw"),
+        rows=[payload["rows"][1]],
+        runner=fake_runner,
+    )
+    command = calls[1]
+    assert "--array=1-1" in command
+    export = next(value for value in command if value.startswith("--export="))
+    assert "JOB_MAP_ARRAY_MIN=0" in export
+    assert "JOB_MAP_ARRAY_MAX=2" in export
+    assert "--output=logs/samga_brain_rw/sealed_%A_%a.out" in command
+    assert "--error=logs/samga_brain_rw/sealed_%A_%a.err" in command
+
+
+def test_current_development_launchers_use_immutable_full_map_bounds(
+    experiment_root: Path,
+) -> None:
+    for name in (
+        "pilot_array.slurm",
+        "preflight_debug.slurm",
+        "online_parity_debug.slurm",
+    ):
+        text = (experiment_root / "slurm" / name).read_text(encoding="utf-8")
+        assert "${JOB_MAP_ARRAY_MIN:?" in text
+        assert "${JOB_MAP_ARRAY_MAX:?" in text
+        assert 'ARRAY_MIN=${JOB_MAP_ARRAY_MIN:?' in text
+        assert 'ARRAY_MAX=${JOB_MAP_ARRAY_MAX:?' in text
+
+
 def test_run_row_exports_exact_array_context_to_child(
     jobmap_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -438,7 +664,7 @@ def test_run_row_exports_exact_array_context_to_child(
         map_path,
     )
     row = payload["rows"][1]
-    output_hashes = {"metrics_sha256": _h("run-row-metrics")}
+    output_hashes = _output_hashes(row, "run-row")
     observed: dict[str, str] = {}
 
     def fake_run(command: object, **kwargs: object) -> SimpleNamespace:
@@ -495,7 +721,7 @@ def test_complete_env_reloads_and_completes_only_selected_claim(
         tmp_path,
     )
     _install_job_environment(monkeypatch, environment)
-    output_hashes = {"metrics_sha256": _h("complete-env-metrics")}
+    output_hashes = _output_hashes(row, "complete-env")
 
     result = jobmap_module.main(
         [
@@ -558,7 +784,7 @@ def test_complete_env_rejects_recovery_before_completion_lock(
             [
                 "complete-env",
                 "--output-hashes",
-                json.dumps({"metrics_sha256": _h("race-output")}),
+                json.dumps(_output_hashes(row, "race-output")),
             ]
         )
 
@@ -589,7 +815,7 @@ def test_complete_env_rejects_each_missing_context_variable(
             [
                 "complete-env",
                 "--output-hashes",
-                json.dumps({"metrics_sha256": _h("missing-env")}),
+                json.dumps(_output_hashes(row, "missing-env")),
             ]
         )
     assert not Path(row["completion_path"]).exists()
@@ -649,7 +875,7 @@ def test_complete_env_rejects_tampered_context(
             [
                 "complete-env",
                 "--output-hashes",
-                json.dumps({"metrics_sha256": _h("tampered-env")}),
+                json.dumps(_output_hashes(row, "tampered-env")),
             ]
         )
     assert not Path(row["completion_path"]).exists()
@@ -669,7 +895,7 @@ def test_completion_is_idempotent_and_prevents_resubmission(
     completion = jobmap_module.complete_job_row(
         payload,
         row,
-        {"metrics_sha256": _h("metrics")},
+        _output_hashes(row, "metrics"),
     )
     assert completion.path == Path(row["completion_path"])
     assert jobmap_module.completion_is_valid(payload, row) is True
@@ -678,7 +904,7 @@ def test_completion_is_idempotent_and_prevents_resubmission(
     repeated = jobmap_module.complete_job_row(
         payload,
         row,
-        {"metrics_sha256": _h("metrics")},
+        _output_hashes(row, "metrics"),
     )
     assert repeated.sha256 == completion.sha256
     assert completion.path.read_bytes() == original
@@ -710,7 +936,7 @@ def test_stale_claim_recovery_is_audited_and_never_deletes_original(
     jobmap_module.complete_job_row(
         payload,
         row,
-        {"metrics_sha256": _h("recovered-metrics")},
+        _output_hashes(row, "recovered-metrics"),
     )
     assert jobmap_module.completion_is_valid(payload, row)
 
@@ -719,8 +945,10 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
     experiment_root: Path,
     jobmap_module: ModuleType,
     submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     smoke = jobmap_module.write_job_map(
         [_row(tmp_path, stage="stage-2-smoke")],
         tmp_path / "smoke-map.json",
@@ -757,7 +985,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
         pilot_job_map=tmp_path / "pilot-map.json",
         pilot_sha256=pilot["payload_sha256"],
         slurm_script=script,
-        log_dir=tmp_path / "logs" / "samga_brain_rw",
+        log_dir=Path("logs/samga_brain_rw"),
         runner=fake_runner,
     )
     assert phase == "smoke-submitted"
@@ -774,7 +1002,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
     jobmap_module.complete_job_row(
         smoke,
         smoke_row,
-        {"metrics_sha256": _h("smoke")},
+        _output_hashes(smoke_row, "smoke"),
     )
     calls.clear()
     phase = submit_module.submit_available_pilot(
@@ -783,7 +1011,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
         pilot_job_map=tmp_path / "pilot-map.json",
         pilot_sha256=pilot["payload_sha256"],
         slurm_script=script,
-        log_dir=tmp_path / "logs" / "samga_brain_rw",
+        log_dir=Path("logs/samga_brain_rw"),
         runner=fake_runner,
     )
     assert phase == "pilot-submitted"
@@ -796,7 +1024,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
         jobmap_module.complete_job_row(
             pilot,
             row,
-            {"metrics_sha256": _h(f"pilot:{row['array_index']}")},
+            _output_hashes(row, f"pilot:{row['array_index']}"),
         )
     calls.clear()
     phase = submit_module.submit_available_pilot(
@@ -805,7 +1033,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
         pilot_job_map=tmp_path / "pilot-map.json",
         pilot_sha256=pilot["payload_sha256"],
         slurm_script=script,
-        log_dir=tmp_path / "logs" / "samga_brain_rw",
+        log_dir=Path("logs/samga_brain_rw"),
         runner=fake_runner,
     )
     assert phase == "already-complete"
@@ -819,7 +1047,7 @@ def test_submitter_refuses_confirmation_stage_without_any_command(
     tmp_path: Path,
 ) -> None:
     confirmation = jobmap_module.write_job_map(
-        [_row(tmp_path, stage="confirmation")],
+        [_row(tmp_path, stage="confirmation", training_runner=False)],
         tmp_path / "confirmation-map.json",
     )
     smoke = jobmap_module.write_job_map(
