@@ -957,14 +957,51 @@ def complete_job_row(
     payload: Mapping[str, object],
     row: Mapping[str, object],
     output_hashes: Mapping[str, str],
+    *,
+    expected_claim_path: Path | str | None = None,
+    expected_claim_sha256: str | None = None,
 ) -> JobCompletion:
     """Publish one completion, returning the original for an identical retry."""
 
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    if (expected_claim_path is None) != (
+        expected_claim_sha256 is None
+    ):
+        raise ValueError(
+            "expected claim path and hash must be provided together"
+        )
+    checked_expected_claim_path = (
+        Path(expected_claim_path)
+        if expected_claim_path is not None
+        else None
+    )
+    checked_expected_claim_sha256 = (
+        _require_sha256(
+            expected_claim_sha256,
+            "expected_claim_sha256",
+        )
+        if expected_claim_sha256 is not None
+        else None
+    )
     outputs = _validate_output_hashes(checked_row, output_hashes)
     base = _state_dir(checked_row)
     completion_path = Path(str(checked_row["completion_path"]))
     with _transition_lock(base):
+        claims = _load_claim_chain(
+            checked_row,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+        )
+        if not claims:
+            raise RuntimeError("job row must be claimed before completion")
+        current = claims[-1]
+        if checked_expected_claim_path is not None and (
+            current.path != checked_expected_claim_path
+            or current.sha256 != checked_expected_claim_sha256
+        ):
+            raise ValueError(
+                "expected claim identity changed before completion"
+            )
         if completion_path.exists():
             existing = _load_completion(payload, checked_row)
             existing_payload = existing.document["payload"]
@@ -976,14 +1013,6 @@ def complete_job_row(
                     "completion already exists with different output hashes"
                 )
             return existing
-        claims = _load_claim_chain(
-            checked_row,
-            map_sha256=map_sha256,
-            row_sha256=row_sha256,
-        )
-        if not claims:
-            raise RuntimeError("job row must be claimed before completion")
-        current = claims[-1]
         schema = checked_row["expected_completion_schema"]
         if not isinstance(schema, dict):
             raise ValueError("invalid expected completion schema")
@@ -1153,7 +1182,13 @@ def complete_job_row_from_environment(
         raise ValueError(
             "SAMGA_JOB_CLAIM claim path does not match the selected row"
         )
-    return complete_job_row(job_map, checked_row, output_hashes)
+    return complete_job_row(
+        job_map,
+        checked_row,
+        output_hashes,
+        expected_claim_path=current_claim.path,
+        expected_claim_sha256=current_claim.sha256,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -509,6 +509,67 @@ def test_complete_env_reloads_and_completes_only_selected_claim(
     assert jobmap_module.completion_is_valid(payload, row)
 
 
+def test_complete_env_rejects_recovery_before_completion_lock(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload, row, _, environment = _claimed_job_environment(
+        jobmap_module,
+        tmp_path,
+    )
+    _install_job_environment(monkeypatch, environment)
+    original_complete = jobmap_module.complete_job_row
+    recovered: list[object] = []
+    first_claim_path = Path(environment["SAMGA_JOB_CLAIM"])
+    first_claim_sha256 = hashlib.sha256(
+        first_claim_path.read_bytes()
+    ).hexdigest()
+
+    def recover_before_completion_lock(
+        candidate_payload: object,
+        candidate_row: object,
+        output_hashes: object,
+        **expected_claim: object,
+    ) -> object:
+        second = jobmap_module.recover_job_row(
+            candidate_payload,
+            candidate_row,
+            recovery_audit_sha256=_h("race-recovery-audit"),
+        )
+        recovered.append(second)
+        return original_complete(
+            candidate_payload,
+            candidate_row,
+            output_hashes,
+            **expected_claim,
+        )
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "complete_job_row",
+        recover_before_completion_lock,
+    )
+    with pytest.raises(
+        ValueError,
+        match="claim identity.*changed|current claim",
+    ):
+        jobmap_module.main(
+            [
+                "complete-env",
+                "--output-hashes",
+                json.dumps({"metrics_sha256": _h("race-output")}),
+            ]
+        )
+
+    assert len(recovered) == 1
+    second = recovered[0]
+    assert second.generation == 2
+    assert second.path != first_claim_path
+    assert second.sha256 != first_claim_sha256
+    assert not Path(row["completion_path"]).exists()
+
+
 @pytest.mark.parametrize("missing_name", JOB_ENVIRONMENT_NAMES)
 def test_complete_env_rejects_each_missing_context_variable(
     jobmap_module: ModuleType,
