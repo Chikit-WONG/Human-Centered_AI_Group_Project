@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from dataclasses import replace
 from pathlib import Path
@@ -13,11 +14,13 @@ from torch import nn
 from torch.utils.data import Dataset
 
 import train as samga_train
+import samga_brain_rw.trainer as trainer_module
 from samga_brain_rw.adapters import (
     DenseBottleneckControl,
     MatchedPerLayerProjectorControl,
     ResidualFeatureAdapter,
 )
+from samga_brain_rw.feature_transforms import TrainWhitening
 from samga_brain_rw.trainer import (
     CheckpointPublication,
     SAMGARuntimeModel,
@@ -189,6 +192,20 @@ class _DatasetFactory:
         )
 
 
+def _attested_memory_sink(
+    payload: dict[str, object],
+    *,
+    retain_for_averaging: bool,
+) -> CheckpointPublication:
+    return CheckpointPublication(
+        reference=f"memory://epoch-{payload['epoch']}",
+        exclusive_create=True,
+        atomic_publish=True,
+        verified=True,
+        durable_retention=retain_for_averaging,
+    )
+
+
 def _spec(
     tmp_path: Path,
     components: UpstreamComponents,
@@ -204,11 +221,11 @@ def _spec(
         "seed": 19,
         "config_sha256": _h("config"),
         "schedule_sha256": samga_train.SCHEDULE_SHA256,
-        "trajectory_sha256": _h("trajectory"),
-        "data_order_sha256": _h("data-order"),
-        "input_hashes": {"manifest_sha256": _h("manifest")},
+        "input_hashes": {
+            "manifest_sha256": _h("manifest"),
+            "cache_sha256": _h("feature-cache"),
+        },
         "run_manifest": {"run_id": "s0-sub01-seed19"},
-        "candidate_spec": {"config_id": "baseline"},
         "checkpoint_builder": samga_train.build_epoch_checkpoint,
         "checkpoint_restorer": samga_train.restore_training_checkpoint,
         "dataset_factory": factory,
@@ -216,9 +233,87 @@ def _spec(
         "max_train_steps": 1,
         "num_workers": 0,
         "device": "cpu",
+        "checkpoint_sink": _attested_memory_sink,
     }
     values.update(overrides)
+    identities = trainer_module.derive_training_identities(
+        components=components,
+        train_row_indices=tuple(range(100, 100 + factory.train_size)),
+        stage=int(values["stage"]),
+        subject=int(values["subject"]),
+        seed=int(values["seed"]),
+        batch_size=int(values["batch_size"]),
+        layernorm_config_id=str(
+            values.get("layernorm_config_id", "s2-layernorm-off")
+        ),
+        whitening_config_id=str(
+            values.get("whitening_config_id", "s2-whitening-off")
+        ),
+        preprojector_config_id=str(
+            values.get("preprojector_config_id", "s2-preproj-shared")
+        ),
+        adapter_kind=str(values.get("adapter_kind", "identity")),
+        adapter_rank=values.get("adapter_rank"),  # type: ignore[arg-type]
+        adapter_lr_ratio=values.get(  # type: ignore[arg-type]
+            "adapter_lr_ratio"
+        ),
+        whitening=values.get("whitening"),  # type: ignore[arg-type]
+    )
+    values.setdefault("trajectory_sha256", identities.trajectory_sha256)
+    values.setdefault("data_order_sha256", identities.data_order_sha256)
+    candidate = dict(
+        values.get("candidate_spec", {"config_id": "baseline"})
+    )
+    candidate.setdefault(
+        "full_task_initialization_sha256",
+        identities.full_task_initialization_sha256,
+    )
+    candidate.setdefault(
+        "shared_parameter_intersection_name",
+        identities.shared_parameter_intersection_name,
+    )
+    candidate.setdefault(
+        "shared_parameter_intersection_sha256",
+        identities.shared_parameter_intersection_sha256,
+    )
+    candidate.setdefault(
+        "architecture_specific_initialization_sha256",
+        identities.architecture_specific_initialization_sha256,
+    )
+    values["candidate_spec"] = candidate
     return TrainingCellSpec(**values)
+
+
+def test_checkpoint_sink_is_mandatory(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    with pytest.raises(ValueError, match="checkpoint_sink.*required"):
+        _spec(
+            tmp_path,
+            components,
+            _DatasetFactory(),
+            checkpoint_sink=None,
+        )
+
+
+def test_checkpoint_publication_has_typed_durable_retention_attestation() -> None:
+    receipt = CheckpointPublication(
+        reference="memory://ordinary-snapshot",
+        exclusive_create=True,
+        atomic_publish=True,
+        verified=True,
+    )
+
+    assert receipt.durable_retention is False
+    with pytest.raises(TypeError, match="durable_retention.*boolean"):
+        CheckpointPublication(
+            reference="memory://retained-snapshot",
+            exclusive_create=True,
+            atomic_publish=True,
+            verified=True,
+            durable_retention=1,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
@@ -323,6 +418,72 @@ def test_stage0_and_stage2_reject_factor_combinations_or_unfitted_whitening(
         )
 
 
+def _provenance_only_whitening(
+    *,
+    rows: tuple[int, ...],
+    manifest_sha256: str,
+    cache_sha256: str,
+) -> TrainWhitening:
+    artifact = object.__new__(TrainWhitening)
+    nn.Module.__init__(artifact)
+    artifact.register_buffer("mean", torch.zeros(5, 3_200))
+    artifact.register_buffer("matrix", torch.empty(0))
+    artifact.canonical_train_rows = rows
+    artifact.canonical_row_count = max(rows) + 1
+    artifact.source_scope = "train"
+    artifact.eps = 1e-5
+    artifact.input_provenance_sha256 = manifest_sha256
+    artifact.cache_provenance_sha256 = cache_sha256
+    artifact._payload_sha256 = trainer_module.sha256_json(
+        artifact._payload_body()
+    )
+    return artifact
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("rows", "row-list"),
+        ("manifest", "manifest.*provenance"),
+        ("cache", "cache.*provenance"),
+    ],
+)
+def test_whitening_binds_current_train_rows_manifest_and_cache_provenance(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    tamper: str,
+    message: str,
+) -> None:
+    base = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=2, val_size=2),
+    )
+    rows = (100, 101)
+    manifest_sha256 = base.input_hashes["manifest_sha256"]
+    cache_sha256 = base.input_hashes["cache_sha256"]
+    if tamper == "rows":
+        rows = (100, 102)
+    elif tamper == "manifest":
+        manifest_sha256 = _h("other-manifest")
+    else:
+        cache_sha256 = _h("other-cache")
+    whitening = _provenance_only_whitening(
+        rows=rows,
+        manifest_sha256=manifest_sha256,
+        cache_sha256=cache_sha256,
+    )
+    spec = replace(
+        base,
+        stage=2,
+        whitening_config_id="s2-whitening-on",
+        whitening=whitening,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        run_training_cell(spec)
+
+
 def test_stateful_epoch_sampler_restores_the_exact_remaining_order() -> None:
     sampler = StatefulEpochSampler(dataset_size=9, seed=31, epoch=4)
     iterator = iter(sampler)
@@ -338,6 +499,141 @@ def test_stateful_epoch_sampler_restores_the_exact_remaining_order() -> None:
     assert tuple(restored) == expected_suffix
     with pytest.raises(ValueError, match="dataset"):
         StatefulEpochSampler(dataset_size=8, seed=31).load_state_dict(state)
+
+
+def test_data_order_derivation_binds_rows_seed_batch_and_all_60_epochs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    derive = getattr(trainer_module, "derive_data_order_sha256")
+    rows = tuple(range(100, 106))
+    baseline = derive(rows, seed=19, batch_size=2)
+
+    assert baseline != derive(tuple(reversed(rows)), seed=19, batch_size=2)
+    assert baseline != derive(rows, seed=20, batch_size=2)
+    assert baseline != derive(rows, seed=19, batch_size=3)
+
+    original = StatefulEpochSampler._order_for_epoch
+
+    def changed_epoch_60(
+        self: StatefulEpochSampler,
+        epoch: int,
+    ) -> tuple[int, ...]:
+        order = original(self, epoch)
+        if epoch != 60:
+            return order
+        values = list(order)
+        values[0], values[1] = values[1], values[0]
+        return tuple(values)
+
+    monkeypatch.setattr(
+        StatefulEpochSampler,
+        "_order_for_epoch",
+        changed_epoch_60,
+    )
+    assert derive(rows, seed=19, batch_size=2) != baseline
+
+
+def test_public_identity_helper_derives_actual_seeded_initializations(
+    components: UpstreamComponents,
+) -> None:
+    derive = getattr(trainer_module, "derive_training_identities")
+    arguments = {
+        "components": components,
+        "train_row_indices": tuple(range(100, 106)),
+        "stage": 2,
+        "subject": 1,
+        "seed": 19,
+        "batch_size": 2,
+        "adapter_kind": "adapter",
+        "adapter_rank": 8,
+        "adapter_lr_ratio": 0.05,
+    }
+
+    first = derive(**arguments)
+    repeated = derive(**arguments)
+    other_seed = derive(**{**arguments, "seed": 20})
+
+    assert first == repeated
+    assert first.data_order_sha256 == trainer_module.derive_data_order_sha256(
+        arguments["train_row_indices"],
+        seed=19,
+        batch_size=2,
+    )
+    assert first.full_task_initialization_sha256 != (
+        other_seed.full_task_initialization_sha256
+    )
+    assert first.shared_parameter_intersection_sha256 == (
+        other_seed.shared_parameter_intersection_sha256
+    )
+    assert first.architecture_specific_initialization_sha256 != (
+        other_seed.architecture_specific_initialization_sha256
+    )
+    assert first.shared_parameter_intersection_name
+    for value in (
+        first.data_order_sha256,
+        first.trajectory_sha256,
+        first.full_task_initialization_sha256,
+        first.shared_parameter_intersection_sha256,
+        first.architecture_specific_initialization_sha256,
+    ):
+        assert len(value) == 64
+        assert set(value) <= set("0123456789abcdef")
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("data_order_sha256", "data.order"),
+        ("trajectory_sha256", "trajectory"),
+        (
+            "architecture_specific_initialization_sha256",
+            "architecture.specific",
+        ),
+    ],
+)
+def test_runtime_recomputes_and_rejects_identity_declaration_tampering(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    field: str,
+    message: str,
+) -> None:
+    spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=2, val_size=2),
+    )
+    if field == "data_order_sha256":
+        tampered = replace(spec, data_order_sha256=_h("wrong-data-order"))
+    elif field == "trajectory_sha256":
+        tampered = replace(spec, trajectory_sha256=_h("wrong-trajectory"))
+    else:
+        candidate = dict(spec.candidate_spec)
+        candidate[field] = _h("wrong-initialization")
+        tampered = replace(spec, candidate_spec=candidate)
+
+    with pytest.raises(ValueError, match=message):
+        run_training_cell(tampered)
+
+
+def test_runtime_derives_data_order_from_actual_factory_rows(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    class _ReorderedFactory(_DatasetFactory):
+        def __call__(self, **kwargs: object) -> _TinyProtocolDataset:
+            dataset = super().__call__(**kwargs)
+            if kwargs["scope"] == "train":
+                dataset.row_indices = tuple(reversed(dataset.row_indices))
+            return dataset
+
+    with pytest.raises(ValueError, match="data.order"):
+        run_training_cell(
+            _spec(
+                tmp_path,
+                components,
+                _ReorderedFactory(train_size=2, val_size=2),
+            )
+        )
 
 
 def test_cpu_one_step_smoke_uses_protocol_scopes_and_global_validation(
@@ -365,6 +661,38 @@ def test_cpu_one_step_smoke_uses_protocol_scopes_and_global_validation(
     assert all(len(call["selected_channels"]) == 17 for call in factory.calls)
     assert False in result.model.base.router.calls
     assert True in result.model.base.router.calls
+
+
+@pytest.mark.parametrize(
+    ("requested_scope", "metadata_name", "metadata_value", "message"),
+    [
+        ("train", "scope", "val-dev", "scope"),
+        ("val-dev", "subject_id", 2, "subject"),
+    ],
+)
+def test_factory_result_must_match_requested_scope_and_subject(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    requested_scope: str,
+    metadata_name: str,
+    metadata_value: object,
+    message: str,
+) -> None:
+    class _LyingFactory(_DatasetFactory):
+        def __call__(self, **kwargs: object) -> _TinyProtocolDataset:
+            dataset = super().__call__(**kwargs)
+            if kwargs["scope"] == requested_scope:
+                setattr(dataset, metadata_name, metadata_value)
+            return dataset
+
+    with pytest.raises(ValueError, match=message):
+        run_training_cell(
+            _spec(
+                tmp_path,
+                components,
+                _LyingFactory(train_size=2, val_size=2),
+            )
+        )
 
 
 def test_public_development_evaluator_forces_global_cosine_scores(
@@ -461,23 +789,186 @@ def test_mid_epoch_resume_is_identical_to_uninterrupted_two_steps(
     )
 
 
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("missing_model_hash", "schema|model.*hash"),
+        ("wrong_model_hash", "model.*hash"),
+        ("missing_rng", "schema|RNG"),
+        ("scheduler_step", "scheduler.*step"),
+        ("optimizer_lr", "optimizer"),
+        ("epoch", "epoch|position"),
+    ],
+)
+def test_checkpoint_builder_result_requires_complete_semantic_schema(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    tamper: str,
+    message: str,
+) -> None:
+    def builder(**kwargs: object) -> dict[str, object]:
+        payload = samga_train.build_epoch_checkpoint(**kwargs)
+        if tamper == "missing_model_hash":
+            payload.pop("model_state_sha256")
+        elif tamper == "wrong_model_hash":
+            payload["model_state_sha256"] = _h("wrong-model")
+        elif tamper == "missing_rng":
+            payload.pop("python_rng_state")
+        elif tamper == "scheduler_step":
+            scheduler_state = copy.deepcopy(payload["scheduler_state_dict"])
+            scheduler_state["last_epoch"] = 99
+            payload["scheduler_state_dict"] = scheduler_state
+        elif tamper == "optimizer_lr":
+            optimizer_state = copy.deepcopy(payload["optimizer_state_dict"])
+            optimizer_state["param_groups"][0]["lr"] = 9.0
+            payload["optimizer_state_dict"] = optimizer_state
+        else:
+            payload["epoch"] = 2
+        return payload
+
+    with pytest.raises(ValueError, match=message):
+        run_training_cell(
+            _spec(
+                tmp_path,
+                components,
+                _DatasetFactory(train_size=2, val_size=2),
+                checkpoint_builder=builder,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("model_state", "model.*hash"),
+        ("global_step", "global.*step|position"),
+        ("sampler_epoch", "sampler.*epoch|position"),
+        ("epoch_complete", "sampler.*position|epoch.complete"),
+        ("scheduler_step", "scheduler.*step"),
+        ("snapshot_prefix", "snapshot.*prefix"),
+    ],
+)
+def test_resume_rejects_cross_field_checkpoint_tampering(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    tamper: str,
+    message: str,
+) -> None:
+    spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=6, val_size=2),
+    )
+    first = run_training_cell(spec)
+    checkpoint = copy.deepcopy(first.final_checkpoint)
+    if tamper == "model_state":
+        model_state = checkpoint["model_state_dict"]
+        assert isinstance(model_state, dict)
+        first_key = next(iter(model_state))
+        model_state[first_key] = model_state[first_key] + 1
+    elif tamper == "global_step":
+        checkpoint["global_step"] = 2
+    elif tamper == "sampler_epoch":
+        sampler_state = checkpoint["sampler_state_dict"]
+        assert isinstance(sampler_state, dict)
+        epoch_two = StatefulEpochSampler(
+            dataset_size=6,
+            seed=19,
+            epoch=2,
+        ).state_dict()
+        sampler_state["epoch"] = 2
+        sampler_state["order"] = epoch_two["order"]
+    elif tamper == "epoch_complete":
+        runtime = checkpoint["runtime_state"]
+        assert isinstance(runtime, dict)
+        runtime["epoch_complete"] = True
+        runtime["next_epoch"] = 2
+        runtime["snapshot_epochs"] = [1]
+    elif tamper == "scheduler_step":
+        scheduler = checkpoint["scheduler_state_dict"]
+        assert isinstance(scheduler, dict)
+        scheduler["last_epoch"] = 2
+    else:
+        runtime = checkpoint["runtime_state"]
+        assert isinstance(runtime, dict)
+        runtime["snapshot_epochs"] = [1]
+
+    with pytest.raises(ValueError, match=message):
+        run_training_cell(replace(spec, resume_checkpoint=checkpoint))
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("model", "post.restore.*model.*hash"),
+        ("optimizer", "post.restore.*optimizer"),
+        ("scheduler", "post.restore.*scheduler"),
+        ("generator", "post.restore.*generator"),
+        ("rng", "post.restore.*RNG"),
+    ],
+)
+def test_resume_verifies_objects_after_restorer_returns(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    corruption: str,
+    message: str,
+) -> None:
+    base = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=6, val_size=2),
+    )
+    first = run_training_cell(base)
+
+    def corrupting_restorer(
+        payload: dict[str, object],
+        **kwargs: object,
+    ) -> tuple[int, int]:
+        restored = samga_train.restore_training_checkpoint(
+            payload,
+            **kwargs,
+        )
+        if corruption == "model":
+            model = kwargs["model"]
+            assert isinstance(model, nn.Module)
+            with torch.no_grad():
+                next(model.parameters()).add_(1)
+        elif corruption == "optimizer":
+            optimizer = kwargs["optimizer"]
+            assert isinstance(optimizer, torch.optim.Optimizer)
+            optimizer.param_groups[0]["lr"] = 9.0
+        elif corruption == "scheduler":
+            scheduler = kwargs["scheduler"]
+            scheduler.last_epoch += 1
+        elif corruption == "generator":
+            generator = kwargs["generator"]
+            assert isinstance(generator, torch.Generator)
+            generator.manual_seed(999)
+        else:
+            torch.manual_seed(999)
+        return restored
+
+    with pytest.raises(ValueError, match=message):
+        run_training_cell(
+            replace(
+                base,
+                resume_checkpoint=first.final_checkpoint,
+                checkpoint_restorer=corrupting_restorer,
+            )
+        )
+
+
 def test_epoch21_freezes_shared_encoder_and_rebuilds_adamw(
     tmp_path: Path,
     components: UpstreamComponents,
 ) -> None:
     spec = _spec(tmp_path, components, _DatasetFactory(train_size=6))
-    first = run_training_cell(spec)
-    end_of_stage1 = dict(first.final_checkpoint)
-    end_of_stage1["epoch"] = 20
-    end_of_stage1["optimizer_stage"] = "stage1"
-    end_of_stage1["runtime_state"] = {
-        **dict(end_of_stage1["runtime_state"]),
-        "epoch_complete": True,
-        "next_epoch": 21,
-    }
+    stage1 = run_training_cell(replace(spec, max_train_steps=60))
+    assert stage1.final_checkpoint["epoch"] == 20
+    assert stage1.final_checkpoint["runtime_state"]["epoch_complete"] is True
 
     resumed = run_training_cell(
-        replace(spec, resume_checkpoint=end_of_stage1)
+        replace(spec, resume_checkpoint=stage1.final_checkpoint)
     )
 
     assert resumed.optimizer_rebuild_epochs == (21,)
@@ -498,26 +989,9 @@ def test_epochs_51_to_60_are_retained_and_sink_receipts_are_verified(
 ) -> None:
     factory = _DatasetFactory(train_size=2, val_size=2)
     base_spec = _spec(tmp_path, components, factory)
-    first = run_training_cell(base_spec)
-    end_of_stage1 = dict(first.final_checkpoint)
-    end_of_stage1["epoch"] = 20
-    end_of_stage1["optimizer_stage"] = "stage1"
-    end_of_stage1["runtime_state"] = {
-        **dict(end_of_stage1["runtime_state"]),
-        "epoch_complete": True,
-        "next_epoch": 21,
-    }
-    stage2 = run_training_cell(
-        replace(base_spec, resume_checkpoint=end_of_stage1)
-    )
-    end_of_epoch50 = dict(stage2.final_checkpoint)
-    end_of_epoch50["epoch"] = 50
-    end_of_epoch50["optimizer_stage"] = "stage2"
-    end_of_epoch50["runtime_state"] = {
-        **dict(end_of_epoch50["runtime_state"]),
-        "epoch_complete": True,
-        "next_epoch": 51,
-    }
+    first_50 = run_training_cell(replace(base_spec, max_train_steps=50))
+    assert first_50.final_checkpoint["epoch"] == 50
+    assert first_50.final_checkpoint["runtime_state"]["epoch_complete"] is True
 
     published: list[tuple[int, bool]] = []
 
@@ -533,12 +1007,13 @@ def test_epochs_51_to_60_are_retained_and_sink_receipts_are_verified(
             exclusive_create=True,
             atomic_publish=True,
             verified=True,
+            durable_retention=True,
         )
 
     result = run_training_cell(
         replace(
             base_spec,
-            resume_checkpoint=end_of_epoch50,
+            resume_checkpoint=first_50.final_checkpoint,
             max_train_steps=10,
             checkpoint_sink=sink,
         )
@@ -554,6 +1029,43 @@ def test_epochs_51_to_60_are_retained_and_sink_receipts_are_verified(
     assert result.final_checkpoint["retention"]["required_epochs"] == list(
         range(51, 61)
     )
+
+
+def test_retained_checkpoint_requires_durable_retention_attestation(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    base_spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=2, val_size=2),
+    )
+    first_50 = run_training_cell(replace(base_spec, max_train_steps=50))
+
+    def nondurable_sink(
+        payload: dict[str, object],
+        *,
+        retain_for_averaging: bool,
+    ) -> CheckpointPublication:
+        del payload
+        assert retain_for_averaging is True
+        return CheckpointPublication(
+            reference="memory://volatile",
+            exclusive_create=True,
+            atomic_publish=True,
+            verified=True,
+            durable_retention=False,
+        )
+
+    with pytest.raises(ValueError, match="durable.*retention"):
+        run_training_cell(
+            replace(
+                base_spec,
+                resume_checkpoint=first_50.final_checkpoint,
+                max_train_steps=1,
+                checkpoint_sink=nondurable_sink,
+            )
+        )
 
 
 def test_checkpoint_sink_must_attest_exclusive_atomic_verified_publish(

@@ -8,6 +8,8 @@ and post-publication verification.
 from __future__ import annotations
 
 import copy
+import hashlib
+import math
 import random
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -27,7 +29,7 @@ from .adapters import (
     MatchedPerLayerProjectorControl,
     ResidualFeatureAdapter,
 )
-from .checkpoints import CHECKPOINT_PAYLOAD_TYPE
+from .checkpoints import CHECKPOINT_PAYLOAD_TYPE, hash_state_dict
 from .data import POSTERIOR_CHANNELS, ProtocolSubjectDataset
 from .feature_transforms import LayerNormTransform, TrainWhitening
 from .hashing import sha256_json
@@ -59,6 +61,54 @@ _LAYERNORM_IDS = ("s2-layernorm-off", "s2-layernorm-on")
 _WHITENING_IDS = ("s2-whitening-off", "s2-whitening-on")
 _PREPROJECTOR_IDS = ("s2-preproj-shared", "s2-preproj-separate")
 _ADAPTER_KINDS = ("identity", "adapter", "global_dense", "matched_projector")
+SHARED_PARAMETER_INTERSECTION_NAME = (
+    "SAMGARuntimeModel.state_dict_without_active_factor"
+)
+_CHECKPOINT_KEYS = {
+    "schema_version",
+    "payload_type",
+    "epoch",
+    "global_step",
+    "subject",
+    "seed",
+    "config_sha256",
+    "schedule_sha256",
+    "optimizer_stage",
+    "trajectory_sha256",
+    "data_order_sha256",
+    "model_state_dict",
+    "model_state_sha256",
+    "optimizer_state_dict",
+    "scheduler_state_dict",
+    "python_rng_state",
+    "numpy_rng_state",
+    "torch_rng_state",
+    "cuda_rng_states",
+    "loader_generator_state",
+    "sampler_state_dict",
+    "validation_metrics",
+    "input_hashes",
+    "effective_batch",
+    "environment",
+    "run_manifest",
+    "candidate_spec",
+    "runtime_state",
+    "retention",
+}
+_RUNTIME_STATE_KEYS = {
+    "schema_version",
+    "epoch_complete",
+    "next_epoch",
+    "optimizer_base_lr",
+    "iterator_generator_state",
+    "snapshot_epochs",
+    "required_retained_epochs",
+}
+_RETENTION_KEYS = {
+    "policy",
+    "required_epochs",
+    "retain_for_averaging",
+}
 
 DatasetFactory = Callable[..., Dataset[dict[str, object]]]
 CheckpointBuilder = Callable[..., Mapping[str, object]]
@@ -73,14 +123,47 @@ class CheckpointPublication:
     exclusive_create: bool
     atomic_publish: bool
     verified: bool
+    durable_retention: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("exclusive_create", "atomic_publish", "verified"):
+        for name in (
+            "exclusive_create",
+            "atomic_publish",
+            "verified",
+            "durable_retention",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be boolean")
 
 
 CheckpointSink = Callable[..., CheckpointPublication]
+
+
+@dataclass(frozen=True)
+class TrainingIdentities:
+    """Runtime-derived ordering and pre-training initialization identities."""
+
+    data_order_sha256: str
+    trajectory_sha256: str
+    full_task_initialization_sha256: str
+    shared_parameter_intersection_name: str
+    shared_parameter_intersection_sha256: str
+    architecture_specific_initialization_sha256: str
+
+
+@dataclass(frozen=True)
+class _ModelBuildInputs:
+    components: UpstreamComponents
+    stage: int
+    subject: int
+    active_factor: str | None
+    layernorm_config_id: str
+    whitening_config_id: str
+    preprojector_config_id: str
+    adapter_kind: str
+    adapter_rank: int | None
+    adapter_lr_ratio: float | None
+    whitening: TrainWhitening | None
 
 
 @dataclass(frozen=True)
@@ -102,13 +185,13 @@ class TrainingCellSpec:
     candidate_spec: Mapping[str, object]
     checkpoint_builder: CheckpointBuilder
     checkpoint_restorer: CheckpointRestorer
+    checkpoint_sink: CheckpointSink
     dataset_factory: DatasetFactory = ProtocolSubjectDataset
     batch_size: int = 512
     max_train_steps: int | None = None
     num_workers: int = 0
     device: str | torch.device = "auto"
     resume_checkpoint: Mapping[str, object] | None = None
-    checkpoint_sink: CheckpointSink | None = None
     layernorm_config_id: str = "s2-layernorm-off"
     whitening_config_id: str = "s2-whitening-off"
     preprojector_config_id: str = "s2-preproj-shared"
@@ -152,10 +235,8 @@ class TrainingCellSpec:
         ):
             if not callable(value):
                 raise TypeError(f"{name} must be callable")
-        if self.checkpoint_sink is not None and not callable(
-            self.checkpoint_sink
-        ):
-            raise TypeError("checkpoint_sink must be callable")
+        if not callable(self.checkpoint_sink):
+            raise ValueError("checkpoint_sink is required and must be callable")
         if type(self.batch_size) is not int or self.batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         if self.max_train_steps is not None and (
@@ -370,14 +451,159 @@ class StatefulEpochSampler(Sampler[int]):
         self._order = normalized
 
 
+def derive_data_order_sha256(
+    train_row_indices: Sequence[int],
+    *,
+    seed: int,
+    batch_size: int,
+) -> str:
+    """Hash the complete locked 60-epoch, drop-last training order."""
+
+    if (
+        not isinstance(train_row_indices, Sequence)
+        or isinstance(train_row_indices, (str, bytes, bytearray))
+        or not train_row_indices
+        or any(type(row) is not int or row < 0 for row in train_row_indices)
+    ):
+        raise ValueError(
+            "train_row_indices must be a nonempty sequence of non-negative integers"
+        )
+    rows = tuple(train_row_indices)
+    if len(set(rows)) != len(rows):
+        raise ValueError("train_row_indices must be unique")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
+    sampler = StatefulEpochSampler(
+        dataset_size=len(rows),
+        seed=seed,
+    )
+    consumed = len(rows) - (len(rows) % batch_size)
+    epochs: list[dict[str, object]] = []
+    for epoch in range(1, TOTAL_EPOCHS + 1):
+        permutation = sampler._order_for_epoch(epoch)
+        ordered_rows = [rows[index] for index in permutation]
+        epochs.append(
+            {
+                "epoch": epoch,
+                "permutation": list(permutation),
+                "ordered_row_indices": ordered_rows,
+                "consumed_row_indices": ordered_rows[:consumed],
+            }
+        )
+    return sha256_json(
+        {
+            "schema_version": 1,
+            "payload_type": "samga_brain_rw.training_data_order",
+            "ordered_train_row_indices": list(rows),
+            "seed": seed,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "drop_last": True,
+        }
+    )
+
+
+def _validated_model_build_inputs(
+    *,
+    components: UpstreamComponents,
+    stage: int,
+    subject: int,
+    layernorm_config_id: str,
+    whitening_config_id: str,
+    preprojector_config_id: str,
+    adapter_kind: str,
+    adapter_rank: int | None,
+    adapter_lr_ratio: float | None,
+    whitening: TrainWhitening | None,
+) -> _ModelBuildInputs:
+    if not isinstance(components, UpstreamComponents):
+        raise TypeError("components must be verified UpstreamComponents")
+    if components.commit != PINNED_UPSTREAM_SHA:
+        raise ValueError(f"upstream commit is locked to {PINNED_UPSTREAM_SHA}")
+    if type(stage) is not int or stage not in (0, 2):
+        raise ValueError("stage must be 0 or 2")
+    if type(subject) is not int or not 1 <= subject <= 10:
+        raise ValueError("subject must be in 1..10")
+    if layernorm_config_id not in _LAYERNORM_IDS:
+        raise ValueError("unknown Stage 2 layernorm config_id")
+    if whitening_config_id not in _WHITENING_IDS:
+        raise ValueError("unknown Stage 2 whitening config_id")
+    if preprojector_config_id not in _PREPROJECTOR_IDS:
+        raise ValueError("unknown Stage 2 preprojector config_id")
+    if adapter_kind not in _ADAPTER_KINDS:
+        raise ValueError("unknown Stage 2 adapter kind")
+
+    factor_flags = {
+        "layernorm": layernorm_config_id == "s2-layernorm-on",
+        "whitening": whitening_config_id == "s2-whitening-on",
+        "preprojectors": preprojector_config_id == "s2-preproj-separate",
+        "feature_adapter": adapter_kind != "identity",
+    }
+    active = tuple(name for name, enabled in factor_flags.items() if enabled)
+    if stage == 0 and active:
+        raise ValueError("Stage 0 cannot enable a Stage 2 factor")
+    if len(active) > 1:
+        raise ValueError("Stage 2 permits exactly zero or one active factor")
+    if adapter_kind == "identity":
+        if adapter_rank is not None or adapter_lr_ratio is not None:
+            raise ValueError(
+                "identity adapter cannot set adapter rank or LR ratio"
+            )
+    else:
+        if adapter_rank not in ADAPTER_RANKS:
+            raise ValueError(f"adapter_rank must be one of {ADAPTER_RANKS}")
+        if adapter_lr_ratio not in LEARNING_RATE_RATIOS:
+            raise ValueError(
+                f"adapter_lr_ratio must be one of {LEARNING_RATE_RATIOS}"
+            )
+    if whitening_config_id == "s2-whitening-on":
+        if not isinstance(whitening, TrainWhitening):
+            raise ValueError(
+                "s2-whitening-on requires a fitted TrainWhitening"
+            )
+        if whitening.source_scope != "train":
+            raise ValueError("TrainWhitening must be fit from train scope")
+        if tuple(whitening.mean.shape) != (5, 3_200):
+            raise ValueError("TrainWhitening must target [5,3200] features")
+    elif whitening is not None:
+        raise ValueError("TrainWhitening is only accepted by s2-whitening-on")
+
+    return _ModelBuildInputs(
+        components=components,
+        stage=stage,
+        subject=subject,
+        active_factor=active[0] if active else None,
+        layernorm_config_id=layernorm_config_id,
+        whitening_config_id=whitening_config_id,
+        preprojector_config_id=preprojector_config_id,
+        adapter_kind=adapter_kind,
+        adapter_rank=adapter_rank,
+        adapter_lr_ratio=adapter_lr_ratio,
+        whitening=whitening,
+    )
+
+
 class SAMGARuntimeModel(nn.Module):
     """Verified SAMGA task plus exactly zero or one preregistered factor."""
 
-    def __init__(self, spec: TrainingCellSpec) -> None:
+    def __init__(
+        self,
+        spec: TrainingCellSpec | _ModelBuildInputs,
+    ) -> None:
         super().__init__()
-        if not isinstance(spec, TrainingCellSpec):
-            raise TypeError("spec must be a TrainingCellSpec")
+        if not isinstance(spec, (TrainingCellSpec, _ModelBuildInputs)):
+            raise TypeError(
+                "spec must be a TrainingCellSpec or validated model inputs"
+            )
+        self.stage = spec.stage
         self.active_factor = spec.active_factor
+        self.subject_id = spec.subject
+        self.layernorm_config_id = spec.layernorm_config_id
+        self.whitening_config_id = spec.whitening_config_id
+        self.preprojector_config_id = spec.preprojector_config_id
         self.adapter_lr_ratio = spec.adapter_lr_ratio
         self.base = SAMGATaskModel(components=spec.components)
         self.layernorm = LayerNormTransform(
@@ -588,6 +814,249 @@ class SAMGARuntimeModel(nn.Module):
         return groups
 
 
+def _derive_identities_from_model(
+    model: SAMGARuntimeModel,
+    *,
+    train_row_indices: Sequence[int],
+    seed: int,
+    batch_size: int,
+) -> TrainingIdentities:
+    data_order = derive_data_order_sha256(
+        train_row_indices,
+        seed=seed,
+        batch_size=batch_size,
+    )
+    state = {
+        key: value.detach().cpu().contiguous()
+        for key, value in model.state_dict().items()
+    }
+    if model.active_factor == "whitening":
+        candidate_prefixes = ("whitening.",)
+    elif model.active_factor == "preprojectors":
+        candidate_prefixes = ("separate_image_pre_projectors.",)
+    elif model.active_factor == "feature_adapter":
+        candidate_prefixes = ("feature_adapter.",)
+    else:
+        candidate_prefixes = ()
+    candidate_state = {
+        key: value
+        for key, value in state.items()
+        if key.startswith(candidate_prefixes)
+    }
+    shared_state = {
+        key: value
+        for key, value in state.items()
+        if key not in candidate_state
+    }
+    full_hash = hash_state_dict(state)
+    shared_hash = hash_state_dict(shared_state)
+    candidate_state_hash = (
+        hash_state_dict(candidate_state)
+        if candidate_state
+        else sha256_json({"state_dict": {}})
+    )
+    whitening_payload_sha256 = (
+        model.whitening.payload_sha256
+        if isinstance(model.whitening, TrainWhitening)
+        else None
+    )
+    specific_hash = sha256_json(
+        {
+            "schema_version": 1,
+            "payload_type": (
+                "samga_brain_rw.architecture_specific_initialization"
+            ),
+            "active_factor": model.active_factor,
+            "layernorm_config_id": model.layernorm_config_id,
+            "whitening_config_id": model.whitening_config_id,
+            "whitening_payload_sha256": whitening_payload_sha256,
+            "preprojector_config_id": model.preprojector_config_id,
+            "adapter_kind": model.adapter_kind,
+            "adapter_lr_ratio": model.adapter_lr_ratio,
+            "state_keys": sorted(candidate_state),
+            "state_sha256": candidate_state_hash,
+        }
+    )
+    trajectory = sha256_json(
+        {
+            "schema_version": 1,
+            "payload_type": "samga_brain_rw.training_trajectory",
+            "stage": model.stage,
+            "subject": model.subject_id,
+            "seed": seed,
+            "schedule_sha256": SCHEDULE_SHA256,
+            "data_order_sha256": data_order,
+            "effective_batch": batch_size,
+            "drop_last": True,
+            "full_task_initialization_sha256": full_hash,
+            "shared_parameter_intersection_name": (
+                SHARED_PARAMETER_INTERSECTION_NAME
+            ),
+            "shared_parameter_intersection_sha256": shared_hash,
+            "architecture_specific_initialization_sha256": specific_hash,
+        }
+    )
+    return TrainingIdentities(
+        data_order_sha256=data_order,
+        trajectory_sha256=trajectory,
+        full_task_initialization_sha256=full_hash,
+        shared_parameter_intersection_name=(
+            SHARED_PARAMETER_INTERSECTION_NAME
+        ),
+        shared_parameter_intersection_sha256=shared_hash,
+        architecture_specific_initialization_sha256=specific_hash,
+    )
+
+
+def derive_training_identities(
+    *,
+    components: UpstreamComponents,
+    train_row_indices: Sequence[int],
+    stage: int,
+    subject: int,
+    seed: int,
+    batch_size: int,
+    layernorm_config_id: str = "s2-layernorm-off",
+    whitening_config_id: str = "s2-whitening-off",
+    preprojector_config_id: str = "s2-preproj-shared",
+    adapter_kind: str = "identity",
+    adapter_rank: int | None = None,
+    adapter_lr_ratio: float | None = None,
+    whitening: TrainWhitening | None = None,
+) -> TrainingIdentities:
+    """Derive CLI-ready identities without trusting identity declarations."""
+
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    inputs = _validated_model_build_inputs(
+        components=components,
+        stage=stage,
+        subject=subject,
+        layernorm_config_id=layernorm_config_id,
+        whitening_config_id=whitening_config_id,
+        preprojector_config_id=preprojector_config_id,
+        adapter_kind=adapter_kind,
+        adapter_rank=adapter_rank,
+        adapter_lr_ratio=adapter_lr_ratio,
+        whitening=whitening,
+    )
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    numpy_state = (
+        numpy_state[0],
+        numpy_state[1].copy(),
+        numpy_state[2],
+        numpy_state[3],
+        numpy_state[4],
+    )
+    torch_state = torch.get_rng_state().clone()
+    cuda_states = (
+        torch.cuda.get_rng_state_all()
+        if torch.cuda.is_initialized()
+        else None
+    )
+    try:
+        _seed_fresh_process(seed, torch.device("cpu"))
+        model = SAMGARuntimeModel(inputs)
+        return _derive_identities_from_model(
+            model,
+            train_row_indices=train_row_indices,
+            seed=seed,
+            batch_size=batch_size,
+        )
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _validate_runtime_identities(
+    spec: TrainingCellSpec,
+    model: SAMGARuntimeModel,
+    train_dataset: Dataset[dict[str, object]],
+) -> TrainingIdentities:
+    rows = getattr(train_dataset, "row_indices", None)
+    if not isinstance(rows, Sequence) or isinstance(
+        rows,
+        (str, bytes, bytearray),
+    ):
+        raise ValueError("train dataset must expose ordered row_indices")
+    identities = _derive_identities_from_model(
+        model,
+        train_row_indices=rows,
+        seed=spec.seed,
+        batch_size=spec.batch_size,
+    )
+    if spec.data_order_sha256 != identities.data_order_sha256:
+        raise ValueError("runtime-derived data-order identity mismatch")
+    if spec.trajectory_sha256 != identities.trajectory_sha256:
+        raise ValueError("runtime-derived trajectory identity mismatch")
+    expected_candidate = {
+        "full_task_initialization_sha256": (
+            identities.full_task_initialization_sha256
+        ),
+        "shared_parameter_intersection_name": (
+            identities.shared_parameter_intersection_name
+        ),
+        "shared_parameter_intersection_sha256": (
+            identities.shared_parameter_intersection_sha256
+        ),
+        "architecture_specific_initialization_sha256": (
+            identities.architecture_specific_initialization_sha256
+        ),
+    }
+    for name, expected in expected_candidate.items():
+        if spec.candidate_spec.get(name) != expected:
+            label = name.removesuffix("_sha256").replace("_", "-")
+            raise ValueError(
+                f"candidate_spec {label} identity mismatch"
+            )
+    return identities
+
+
+def _validate_whitening_provenance(
+    spec: TrainingCellSpec,
+    train_dataset: Dataset[dict[str, object]],
+) -> None:
+    if spec.whitening_config_id != "s2-whitening-on":
+        return
+    whitening = spec.whitening
+    if not isinstance(whitening, TrainWhitening):
+        raise AssertionError("whitening-on spec lost its TrainWhitening")
+    whitening.to_payload()
+    rows = getattr(train_dataset, "row_indices", None)
+    if (
+        not isinstance(rows, Sequence)
+        or isinstance(rows, (str, bytes, bytearray))
+        or any(type(row) is not int for row in rows)
+    ):
+        raise ValueError("train dataset must expose an integer row-list")
+    if tuple(rows) != tuple(whitening.canonical_train_rows):
+        raise ValueError(
+            "TrainWhitening train row-list differs from the current dataset"
+        )
+    manifest_sha256 = spec.input_hashes.get("manifest_sha256")
+    cache_sha256 = spec.input_hashes.get("cache_sha256")
+    _require_sha256(
+        manifest_sha256,
+        "input_hashes.manifest_sha256",
+    )
+    _require_sha256(
+        cache_sha256,
+        "input_hashes.cache_sha256",
+    )
+    if whitening.input_provenance_sha256 != manifest_sha256:
+        raise ValueError(
+            "TrainWhitening manifest provenance differs from current input"
+        )
+    if whitening.cache_provenance_sha256 != cache_sha256:
+        raise ValueError(
+            "TrainWhitening cache provenance differs from current input"
+        )
+
+
 def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
     """Run, resume, or smoke-test one locked SAMGA cell in memory."""
 
@@ -600,7 +1069,9 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
     if len(train_dataset) <= 0 or len(validation_dataset) <= 0:
         raise ValueError("train and val-dev datasets must be non-empty")
 
+    _validate_whitening_provenance(spec, train_dataset)
     model = SAMGARuntimeModel(spec).to(device)
+    _validate_runtime_identities(spec, model, train_dataset)
     loader_generator = torch.Generator(device="cpu")
     loader_generator.manual_seed(_loader_seed(spec.seed))
     sampler = StatefulEpochSampler(
@@ -617,7 +1088,7 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
     )
 
     resume = (
-        _validated_resume_checkpoint(spec)
+        _validated_resume_checkpoint(spec, dataset_size=len(train_dataset))
         if spec.resume_checkpoint is not None
         else None
     )
@@ -658,6 +1129,13 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
             int(resume["global_step"]),
         ):
             raise ValueError("checkpoint restorer returned inconsistent position")
+        _verify_restored_checkpoint(
+            resume,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            generator=loader_generator,
+        )
         sampler.load_state_dict(
             _mapping(
                 resume["sampler_state_dict"],
@@ -894,6 +1372,12 @@ def _build_dataset(
     )
     if not isinstance(dataset, Dataset):
         raise TypeError("dataset_factory must return a torch Dataset")
+    if getattr(dataset, "scope", None) != scope:
+        raise ValueError("dataset_factory result scope mismatch")
+    if getattr(dataset, "subject_id", None) != spec.subject:
+        raise ValueError(
+            "dataset_factory result subject differs from TrainingCellSpec"
+        )
     return dataset
 
 
@@ -956,33 +1440,267 @@ def _cpu_generator_state(value: object, context: str) -> torch.Tensor:
         or value.device.type != "cpu"
         or value.dtype != torch.uint8
         or value.ndim != 1
+        or value.numel() == 0
     ):
         raise ValueError(f"{context} must be a CPU byte tensor")
     return value.detach().clone()
 
 
-def _validated_resume_checkpoint(
-    spec: TrainingCellSpec,
-) -> dict[str, object]:
-    payload = dict(
-        _mapping(spec.resume_checkpoint, "resume_checkpoint")
+def _exact_keys(
+    value: Mapping[object, object],
+    expected: set[str],
+    context: str,
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(str(key) for key in actual if key not in expected)
+        raise ValueError(
+            f"{context} schema mismatch; missing={missing}, unknown={unknown}"
+        )
+
+
+def _semantic_value(value: object, context: str) -> object:
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{context} contains a non-finite float")
+        return value
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        if tensor.layout != torch.strided:
+            raise ValueError(f"{context} tensor must use strided layout")
+        if (
+            torch.is_floating_point(tensor)
+            or torch.is_complex(tensor)
+        ) and not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(f"{context} tensor is non-finite")
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        return {
+            "__tensor__": {
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "data_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        }
+    if isinstance(value, Mapping):
+        items = [
+            (
+                _semantic_value(key, f"{context}.key"),
+                _semantic_value(item, f"{context}[{key!r}]"),
+            )
+            for key, item in value.items()
+        ]
+        items.sort(key=lambda item: repr(item[0]))
+        return {"__mapping__": items}
+    if isinstance(value, tuple):
+        return {
+            "__tuple__": [
+                _semantic_value(item, f"{context}[{index}]")
+                for index, item in enumerate(value)
+            ]
+        }
+    if isinstance(value, list):
+        return {
+            "__list__": [
+                _semantic_value(item, f"{context}[{index}]")
+                for index, item in enumerate(value)
+            ]
+        }
+    raise ValueError(f"{context} contains unsupported state type")
+
+
+def _semantic_sha256(value: object, context: str) -> str:
+    return sha256_json(_semantic_value(value, context))
+
+
+def _numpy_rng_payload() -> dict[str, object]:
+    name, keys, position, has_gauss, cached = np.random.get_state()
+    return {
+        "bit_generator": name,
+        "keys": torch.from_numpy(keys.copy()),
+        "position": int(position),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached),
+    }
+
+
+def _validate_rng_schema(payload: Mapping[str, object]) -> None:
+    python_state = payload["python_rng_state"]
+    if (
+        not isinstance(python_state, tuple)
+        or len(python_state) != 3
+        or type(python_state[0]) is not int
+        or not isinstance(python_state[1], tuple)
+        or not python_state[1]
+        or any(type(item) is not int for item in python_state[1])
+        or (
+            python_state[2] is not None
+            and (
+                type(python_state[2]) is not float
+                or not math.isfinite(python_state[2])
+            )
+        )
+    ):
+        raise ValueError("checkpoint Python RNG state is invalid")
+    numpy_state = _mapping(
+        payload["numpy_rng_state"],
+        "checkpoint NumPy RNG state",
     )
-    if payload.get("schema_version") != 1:
-        raise ValueError("checkpoint schema_version must be 1")
-    if payload.get("payload_type") != CHECKPOINT_PAYLOAD_TYPE:
-        raise ValueError("checkpoint payload_type mismatch")
-    epoch = payload.get("epoch")
-    global_step = payload.get("global_step")
+    _exact_keys(
+        numpy_state,
+        {
+            "bit_generator",
+            "keys",
+            "position",
+            "has_gauss",
+            "cached_gaussian",
+        },
+        "checkpoint NumPy RNG state",
+    )
+    keys = numpy_state["keys"]
+    if (
+        numpy_state["bit_generator"] != "MT19937"
+        or not isinstance(keys, torch.Tensor)
+        or keys.device.type != "cpu"
+        or keys.dtype != torch.uint32
+        or keys.ndim != 1
+        or keys.numel() != 624
+        or type(numpy_state["position"]) is not int
+        or not 0 <= numpy_state["position"] <= 624
+        or type(numpy_state["has_gauss"]) is not int
+        or numpy_state["has_gauss"] not in (0, 1)
+        or type(numpy_state["cached_gaussian"]) is not float
+        or not math.isfinite(numpy_state["cached_gaussian"])
+    ):
+        raise ValueError("checkpoint NumPy RNG state is invalid")
+    _cpu_generator_state(
+        payload["torch_rng_state"],
+        "checkpoint Torch RNG state",
+    )
+    _cpu_generator_state(
+        payload["loader_generator_state"],
+        "checkpoint loader generator state",
+    )
+    cuda_states = payload["cuda_rng_states"]
+    if not isinstance(cuda_states, list):
+        raise ValueError("checkpoint CUDA RNG states must be a list")
+    for index, state in enumerate(cuda_states):
+        _cpu_generator_state(
+            state,
+            f"checkpoint CUDA RNG state {index}",
+        )
+
+
+def _validate_checkpoint_schema(
+    payload: Mapping[str, object],
+    context: str,
+) -> None:
+    _exact_keys(payload, _CHECKPOINT_KEYS, context)
+    if payload["schema_version"] != 1:
+        raise ValueError(f"{context} schema_version must be 1")
+    if payload["payload_type"] != CHECKPOINT_PAYLOAD_TYPE:
+        raise ValueError(f"{context} payload_type mismatch")
+    model_state = _mapping(
+        payload["model_state_dict"],
+        f"{context} model state",
+    )
+    if not model_state or any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, torch.Tensor)
+        for key, value in model_state.items()
+    ):
+        raise ValueError(f"{context} model state schema is invalid")
+    claimed_model_hash = _require_sha256(
+        payload["model_state_sha256"],
+        f"{context} model_state_sha256",
+    )
+    if hash_state_dict(model_state) != claimed_model_hash:
+        raise ValueError(f"{context} model state hash mismatch")
+    optimizer_state = _mapping(
+        payload["optimizer_state_dict"],
+        f"{context} optimizer state",
+    )
+    _exact_keys(
+        optimizer_state,
+        {"state", "param_groups"},
+        f"{context} optimizer state",
+    )
+    if (
+        not isinstance(optimizer_state["state"], Mapping)
+        or not isinstance(optimizer_state["param_groups"], list)
+        or not optimizer_state["param_groups"]
+    ):
+        raise ValueError(f"{context} optimizer state schema is invalid")
+    scheduler_state = _mapping(
+        payload["scheduler_state_dict"],
+        f"{context} scheduler state",
+    )
+    for name in ("base_lrs", "last_epoch", "_step_count", "_last_lr"):
+        if name not in scheduler_state:
+            raise ValueError(
+                f"{context} scheduler state schema is missing {name}"
+            )
+    _semantic_sha256(optimizer_state, f"{context} optimizer state")
+    _semantic_sha256(scheduler_state, f"{context} scheduler state")
+    _validate_rng_schema(payload)
+    _mapping(payload["sampler_state_dict"], f"{context} sampler state")
+    validation = _mapping(
+        payload["validation_metrics"],
+        f"{context} validation metrics",
+    )
+    _exact_keys(
+        validation,
+        {
+            "query_count",
+            "gallery_count",
+            "top1_count",
+            "top5_count",
+            "top1_rate",
+            "top5_rate",
+            "router_mode",
+            "similarity",
+        },
+        f"{context} validation metrics",
+    )
+    _semantic_sha256(validation, f"{context} validation metrics")
+    _validate_hash_mapping(payload["input_hashes"], f"{context} input_hashes")
+    _mapping(payload["run_manifest"], f"{context} run_manifest")
+    _mapping(payload["candidate_spec"], f"{context} candidate_spec")
+    environment = _mapping(payload["environment"], f"{context} environment")
+    _exact_keys(
+        environment,
+        {"python", "torch", "numpy", "cuda"},
+        f"{context} environment",
+    )
+    runtime = _mapping(payload["runtime_state"], f"{context} runtime state")
+    _exact_keys(runtime, _RUNTIME_STATE_KEYS, f"{context} runtime state")
+    retention = _mapping(payload["retention"], f"{context} retention")
+    _exact_keys(retention, _RETENTION_KEYS, f"{context} retention")
+
+
+def _validate_checkpoint_position(
+    payload: Mapping[str, object],
+    *,
+    spec: TrainingCellSpec,
+    dataset_size: int,
+    context: str,
+) -> None:
+    _validate_checkpoint_schema(payload, context)
+    epoch = payload["epoch"]
+    global_step = payload["global_step"]
     if (
         type(epoch) is not int
         or not 1 <= epoch <= TOTAL_EPOCHS
         or type(global_step) is not int
         or global_step < 0
     ):
-        raise ValueError("checkpoint epoch/step is invalid")
+        raise ValueError(f"{context} epoch/global step is invalid")
     expected_stage = "stage1" if epoch <= STAGE1_EPOCHS else "stage2"
-    if payload.get("optimizer_stage") != expected_stage:
-        raise ValueError("checkpoint optimizer stage mismatch")
+    if payload["optimizer_stage"] != expected_stage:
+        raise ValueError(f"{context} optimizer stage mismatch")
     expected_values: tuple[tuple[str, object], ...] = (
         ("subject", spec.subject),
         ("seed", spec.seed),
@@ -996,38 +1714,189 @@ def _validated_resume_checkpoint(
         ("candidate_spec", dict(spec.candidate_spec)),
     )
     for name, expected in expected_values:
-        if payload.get(name) != expected:
-            raise ValueError(f"checkpoint {name} mismatch")
-    runtime = _mapping(
-        payload.get("runtime_state"),
-        "checkpoint runtime_state",
-    )
-    if runtime.get("schema_version") != 1:
-        raise ValueError("checkpoint runtime state schema mismatch")
-    next_epoch = runtime.get("next_epoch")
-    epoch_complete = runtime.get("epoch_complete")
+        if payload[name] != expected:
+            raise ValueError(f"{context} {name} mismatch")
+    runtime = _mapping(payload["runtime_state"], f"{context} runtime state")
+    if runtime["schema_version"] != 1:
+        raise ValueError(f"{context} runtime state schema mismatch")
+    epoch_complete = runtime["epoch_complete"]
     if type(epoch_complete) is not bool:
-        raise ValueError("checkpoint epoch_complete must be boolean")
-    expected_next = epoch + int(epoch_complete)
-    if next_epoch != expected_next:
-        raise ValueError("checkpoint next_epoch mismatch")
-    _integer_list(
-        runtime.get("snapshot_epochs"),
-        "checkpoint snapshot_epochs",
+        raise ValueError(f"{context} epoch_complete must be boolean")
+    if runtime["next_epoch"] != epoch + int(epoch_complete):
+        raise ValueError(f"{context} next_epoch mismatch")
+    expected_base_lr = 1e-4 if expected_stage == "stage1" else 5e-5
+    if runtime["optimizer_base_lr"] != expected_base_lr:
+        raise ValueError(f"{context} optimizer base LR mismatch")
+    _cpu_generator_state(
+        runtime["iterator_generator_state"],
+        f"{context} iterator generator state",
     )
-    if runtime.get("required_retained_epochs") != list(LAST10_EPOCHS):
-        raise ValueError("checkpoint retention window mismatch")
-    _mapping(
-        payload.get("sampler_state_dict"),
-        "checkpoint sampler_state_dict",
+    snapshots = _integer_list(
+        runtime["snapshot_epochs"],
+        f"{context} snapshot epochs",
     )
-    retention = _mapping(
-        payload.get("retention"),
-        "checkpoint retention",
+    expected_snapshots = list(range(1, epoch + int(epoch_complete)))
+    if snapshots != expected_snapshots:
+        raise ValueError(f"{context} snapshot prefix mismatch")
+    if runtime["required_retained_epochs"] != list(LAST10_EPOCHS):
+        raise ValueError(f"{context} retention window mismatch")
+    sampler_state = _mapping(
+        payload["sampler_state_dict"],
+        f"{context} sampler state",
     )
-    if retention.get("required_epochs") != list(LAST10_EPOCHS):
-        raise ValueError("checkpoint retention policy mismatch")
+    validator = StatefulEpochSampler(
+        dataset_size=dataset_size,
+        seed=spec.seed,
+    )
+    validator.load_state_dict(sampler_state)
+    if validator.epoch != epoch:
+        raise ValueError(f"{context} sampler epoch mismatch")
+    if epoch_complete:
+        if validator.position != dataset_size:
+            raise ValueError(
+                f"{context} epoch_complete disagrees with sampler position"
+            )
+    elif validator.position >= dataset_size:
+        raise ValueError(
+            f"{context} incomplete epoch disagrees with sampler position"
+        )
+    if not epoch_complete and validator.position % spec.batch_size != 0:
+        raise ValueError(f"{context} sampler position is not a batch boundary")
+    steps_per_epoch = dataset_size // spec.batch_size
+    expected_global_step = (
+        (epoch - 1) * steps_per_epoch
+        + min(validator.position // spec.batch_size, steps_per_epoch)
+    )
+    if global_step != expected_global_step:
+        raise ValueError(
+            f"{context} global step disagrees with sampler position"
+        )
+    stage_steps = (
+        global_step
+        if expected_stage == "stage1"
+        else global_step - STAGE1_EPOCHS * steps_per_epoch
+    )
+    scheduler_state = _mapping(
+        payload["scheduler_state_dict"],
+        f"{context} scheduler state",
+    )
+    if (
+        scheduler_state["last_epoch"] != stage_steps
+        or scheduler_state["_step_count"] != stage_steps + 1
+    ):
+        raise ValueError(f"{context} scheduler step mismatch")
+    optimizer_state = _mapping(
+        payload["optimizer_state_dict"],
+        f"{context} optimizer state",
+    )
+    groups = optimizer_state["param_groups"]
+    if (
+        not isinstance(groups, list)
+        or not groups
+        or not isinstance(groups[0], Mapping)
+        or groups[0].get("lr") != expected_base_lr
+    ):
+        raise ValueError(f"{context} optimizer stage/LR mismatch")
+    base_lrs = scheduler_state["base_lrs"]
+    last_lrs = scheduler_state["_last_lr"]
+    group_lrs = [group.get("lr") for group in groups]
+    if base_lrs != group_lrs or last_lrs != group_lrs:
+        raise ValueError(f"{context} optimizer/scheduler LR mismatch")
+    retention = _mapping(payload["retention"], f"{context} retention")
+    if (
+        retention["policy"] != "retain_exact_epochs_51_through_60"
+        or retention["required_epochs"] != list(LAST10_EPOCHS)
+        or type(retention["retain_for_averaging"]) is not bool
+        or retention["retain_for_averaging"]
+        != (epoch_complete and epoch in LAST10_EPOCHS)
+    ):
+        raise ValueError(f"{context} retention policy mismatch")
+
+
+def _validated_resume_checkpoint(
+    spec: TrainingCellSpec,
+    *,
+    dataset_size: int,
+) -> dict[str, object]:
+    payload = dict(
+        _mapping(spec.resume_checkpoint, "resume_checkpoint")
+    )
+    _validate_checkpoint_position(
+        payload,
+        spec=spec,
+        dataset_size=dataset_size,
+        context="checkpoint",
+    )
     return payload
+
+
+def _verify_restored_checkpoint(
+    payload: Mapping[str, object],
+    *,
+    model: SAMGARuntimeModel,
+    optimizer: torch.optim.AdamW,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    generator: torch.Generator,
+) -> None:
+    claimed_model_hash = str(payload["model_state_sha256"])
+    if hash_state_dict(model.state_dict()) != claimed_model_hash:
+        raise ValueError("post-restore model state hash mismatch")
+    if _semantic_sha256(
+        optimizer.state_dict(),
+        "post-restore optimizer",
+    ) != _semantic_sha256(
+        payload["optimizer_state_dict"],
+        "checkpoint optimizer",
+    ):
+        raise ValueError("post-restore optimizer state mismatch")
+    if _semantic_sha256(
+        scheduler.state_dict(),
+        "post-restore scheduler",
+    ) != _semantic_sha256(
+        payload["scheduler_state_dict"],
+        "checkpoint scheduler",
+    ):
+        raise ValueError("post-restore scheduler state mismatch")
+    expected_generator = _cpu_generator_state(
+        payload["loader_generator_state"],
+        "checkpoint loader generator state",
+    )
+    if not torch.equal(generator.get_state(), expected_generator):
+        raise ValueError("post-restore generator state mismatch")
+    if _semantic_sha256(
+        random.getstate(),
+        "post-restore Python RNG",
+    ) != _semantic_sha256(
+        payload["python_rng_state"],
+        "checkpoint Python RNG",
+    ):
+        raise ValueError("post-restore RNG state mismatch")
+    if _semantic_sha256(
+        _numpy_rng_payload(),
+        "post-restore NumPy RNG",
+    ) != _semantic_sha256(
+        payload["numpy_rng_state"],
+        "checkpoint NumPy RNG",
+    ):
+        raise ValueError("post-restore RNG state mismatch")
+    torch_state = _cpu_generator_state(
+        payload["torch_rng_state"],
+        "checkpoint Torch RNG state",
+    )
+    if not torch.equal(torch.get_rng_state(), torch_state):
+        raise ValueError("post-restore RNG state mismatch")
+    cuda_states = payload["cuda_rng_states"]
+    if (
+        torch.cuda.is_available()
+        and isinstance(cuda_states, list)
+        and cuda_states
+        and _semantic_sha256(
+            torch.cuda.get_rng_state_all(),
+            "post-restore CUDA RNG",
+        )
+        != _semantic_sha256(cuda_states, "checkpoint CUDA RNG")
+    ):
+        raise ValueError("post-restore RNG state mismatch")
 
 
 def _training_batch(
@@ -1138,6 +2007,12 @@ def _validate_global(
     device: torch.device,
     seed: int,
 ) -> ValidationResult:
+    if getattr(dataset, "scope", None) != "val-dev":
+        raise PermissionError(
+            "development evaluation requires exactly the val-dev scope"
+        )
+    if getattr(dataset, "subject_id", None) != model.subject_id:
+        raise ValueError("val-dev dataset subject differs from model subject")
     query_ids = _validation_ids(dataset, "query_ids")
     gallery_ids = _validation_ids(dataset, "gallery_ids")
     validation_generator = torch.Generator(device="cpu")
@@ -1187,6 +2062,86 @@ def _validate_global(
         similarity=np.array(similarity, copy=True, order="C"),
         metrics=metrics,
     )
+
+
+def _validate_built_checkpoint(
+    payload: Mapping[str, object],
+    *,
+    spec: TrainingCellSpec,
+    model: SAMGARuntimeModel,
+    optimizer: torch.optim.AdamW,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    generator: torch.Generator,
+    sampler: StatefulEpochSampler,
+    validation_metrics: Mapping[str, object],
+) -> None:
+    _validate_checkpoint_position(
+        payload,
+        spec=spec,
+        dataset_size=sampler.dataset_size,
+        context="checkpoint builder result",
+    )
+    if hash_state_dict(model.state_dict()) != payload["model_state_sha256"]:
+        raise ValueError("checkpoint builder model state hash mismatch")
+    comparisons = (
+        (
+            optimizer.state_dict(),
+            payload["optimizer_state_dict"],
+            "optimizer",
+        ),
+        (
+            scheduler.state_dict(),
+            payload["scheduler_state_dict"],
+            "scheduler",
+        ),
+        (
+            generator.get_state(),
+            payload["loader_generator_state"],
+            "loader generator",
+        ),
+        (
+            sampler.state_dict(),
+            payload["sampler_state_dict"],
+            "sampler",
+        ),
+        (
+            dict(validation_metrics),
+            payload["validation_metrics"],
+            "validation metrics",
+        ),
+        (
+            random.getstate(),
+            payload["python_rng_state"],
+            "Python RNG",
+        ),
+        (
+            _numpy_rng_payload(),
+            payload["numpy_rng_state"],
+            "NumPy RNG",
+        ),
+        (
+            torch.get_rng_state(),
+            payload["torch_rng_state"],
+            "Torch RNG",
+        ),
+    )
+    for actual, recorded, label in comparisons:
+        if _semantic_sha256(
+            actual,
+            f"current {label}",
+        ) != _semantic_sha256(
+            recorded,
+            f"checkpoint {label}",
+        ):
+            raise ValueError(f"checkpoint builder {label} mismatch")
+    if torch.cuda.is_available() and _semantic_sha256(
+        torch.cuda.get_rng_state_all(),
+        "current CUDA RNG",
+    ) != _semantic_sha256(
+        payload["cuda_rng_states"],
+        "checkpoint CUDA RNG",
+    ):
+        raise ValueError("checkpoint builder CUDA RNG mismatch")
 
 
 def _build_checkpoint(
@@ -1257,6 +2212,16 @@ def _build_checkpoint(
         "required_epochs": list(LAST10_EPOCHS),
         "retain_for_averaging": retain_for_averaging,
     }
+    _validate_built_checkpoint(
+        payload,
+        spec=spec,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        generator=generator,
+        sampler=sampler,
+        validation_metrics=validation_metrics,
+    )
     return payload
 
 
@@ -1265,9 +2230,7 @@ def _publish_checkpoint(
     payload: dict[str, object],
     *,
     retain_for_averaging: bool,
-) -> CheckpointPublication | None:
-    if sink is None:
-        return None
+) -> CheckpointPublication:
     receipt = sink(
         payload,
         retain_for_averaging=retain_for_averaging,
@@ -1279,5 +2242,9 @@ def _publish_checkpoint(
     ):
         raise ValueError(
             "checkpoint sink must attest exclusive, atomic, verified publication"
+        )
+    if retain_for_averaging and not receipt.durable_retention:
+        raise ValueError(
+            "checkpoint sink must attest durable retention for epochs 51-60"
         )
     return receipt
