@@ -17,6 +17,7 @@ import torch
 from torch import nn
 from torch.optim.swa_utils import AveragedModel
 
+from .checkpoint_io import load_typed_torch_checkpoint
 from .hashing import canonical_json_bytes
 
 
@@ -45,19 +46,60 @@ _SEALED_COMPONENTS = {
     "test_images",
     "val_confirm",
 }
-_REQUIRED_KEYS = frozenset(
+_CANONICAL_FORMAL_TEST_RECORD_SHA256 = (
+    "02d7e33b3fe8e5a571f8db232ca5fa86"
+    "abb0c16981876ec84feae7ba64636f1a"
+)
+_CHECKPOINT_BODY_KEYS = frozenset(
     {
-        "schema_version",
-        "payload_type",
-        "epoch",
-        "subject",
-        "seed",
+        "candidate_spec",
         "config_sha256",
-        "schedule_sha256",
-        "optimizer_stage",
-        "trajectory_sha256",
+        "cuda_rng_states",
+        "data_order_sha256",
+        "effective_batch",
+        "environment",
+        "epoch",
+        "global_step",
+        "input_hashes",
+        "loader_generator_state",
         "model_state_dict",
+        "model_state_sha256",
+        "numpy_rng_state",
+        "optimizer_stage",
         "optimizer_state_dict",
+        "payload_type",
+        "python_rng_state",
+        "retention",
+        "run_manifest",
+        "runtime_state",
+        "sampler_state_dict",
+        "schedule_sha256",
+        "scheduler_state_dict",
+        "schema_version",
+        "seed",
+        "subject",
+        "torch_rng_state",
+        "trajectory_sha256",
+        "validation_metrics",
+    }
+)
+_CHECKPOINT_SCOPE_KEYS = frozenset(
+    {"observed_scopes", "scope", "validation_scope"}
+)
+_SIDECAR_PROVENANCE_KEYS = frozenset(
+    {"config_sha256", "manifest_sha256", "protocol_sha256", "seed", "subject"}
+)
+_SIDECAR_METADATA_KEYS = frozenset(
+    {"complete", "observed_scopes", "ordered_ids", "retention", "source_records"}
+)
+_SOURCE_RECORD_KEYS = frozenset(
+    {
+        "manifest_sha256",
+        "records_sha256",
+        "role",
+        "role_payload_sha256",
+        "source_manifest_sha256",
+        "source_payload_sha256",
     }
 )
 _AVERAGED_BODY_KEYS = frozenset(
@@ -135,6 +177,12 @@ def _require_sha256(value: object, context: str) -> str:
 def _require_positive_integer(value: object, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{context} must be a positive integer")
+    return value
+
+
+def _require_nonnegative_integer(value: object, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context} must be a non-negative integer")
     return value
 
 
@@ -356,24 +404,169 @@ def _validate_model_state(
     return state
 
 
-def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
-    normalized = _normalized(path)
-    payload, digest = _load_torch_mapping(normalized, "checkpoint")
-    missing = _REQUIRED_KEYS - set(payload)
-    if missing:
-        raise ValueError(f"checkpoint is missing keys: {sorted(missing)}")
-    if payload["schema_version"] != 1:
-        raise ValueError("checkpoint schema_version must be 1")
-    if payload["payload_type"] != CHECKPOINT_PAYLOAD_TYPE:
-        raise ValueError("checkpoint payload_type mismatch")
+def _require_mapping(value: object, context: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} must be a mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{context} keys must be strings")
+    return value
+
+
+def _require_exact_keys(
+    value: Mapping[str, object],
+    expected: frozenset[str],
+    context: str,
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(
+            f"{context} schema mismatch: missing={missing}, extra={extra}"
+        )
+
+
+def _reject_sealed_checkpoint_metadata(
+    value: object,
+    *,
+    context: str = "checkpoint",
+) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{context} keys must be strings")
+            token = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+            if token in _SEALED_COMPONENTS or re.fullmatch(
+                r"sub_?\d+_test(?:_.*)?",
+                token,
+            ):
+                raise PermissionError(
+                    f"{context} contains sealed test/formal/confirm metadata"
+                )
+            _reject_sealed_checkpoint_metadata(
+                child,
+                context=f"{context}.{key}",
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _reject_sealed_checkpoint_metadata(
+                child,
+                context=f"{context}[{index}]",
+            )
+        return
+    if isinstance(value, str):
+        if _CANONICAL_FORMAL_TEST_RECORD_SHA256 in value.lower():
+            raise PermissionError(
+                f"{context} contains the formal-test record hash"
+            )
+        for component in Path(value).parts:
+            token = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                component.lower(),
+            ).strip("_")
+            if token in _SEALED_COMPONENTS or re.fullmatch(
+                r"sub_?\d+_test(?:_.*)?",
+                token,
+            ):
+                raise PermissionError(
+                    f"{context} contains a sealed path component"
+                )
+
+
+def _validate_source_records(
+    value: object,
+    *,
+    provenance: Mapping[str, object],
+) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(
+            "checkpoint sidecar source_records must contain train and val-dev"
+        )
+    expected_roles = ("train", "val-dev")
+    shared: tuple[object, ...] | None = None
+    for index, (raw, role) in enumerate(
+        zip(value, expected_roles, strict=True)
+    ):
+        record = _require_mapping(
+            raw,
+            f"checkpoint sidecar source record {index}",
+        )
+        _require_exact_keys(
+            record,
+            _SOURCE_RECORD_KEYS,
+            f"checkpoint sidecar source record {index}",
+        )
+        if record["role"] != role:
+            raise ValueError("checkpoint sidecar source role mismatch")
+        for key in _SOURCE_RECORD_KEYS - {"role"}:
+            _require_sha256(
+                record[key],
+                f"checkpoint sidecar source record {index} {key}",
+            )
+        if record["manifest_sha256"] != provenance["manifest_sha256"]:
+            raise ValueError(
+                "checkpoint sidecar source manifest binding mismatch"
+            )
+        current_shared = (
+            record["manifest_sha256"],
+            record["records_sha256"],
+            record["source_manifest_sha256"],
+            record["source_payload_sha256"],
+        )
+        if shared is None:
+            shared = current_shared
+        elif current_shared != shared:
+            raise ValueError(
+                "checkpoint sidecar source-record identity mismatch"
+            )
+
+
+def _validate_checkpoint_bundle(
+    payload: Mapping[str, object],
+    envelope: Mapping[str, object],
+) -> tuple[
+    int,
+    int,
+    int,
+    str,
+    str,
+    str,
+    str,
+    dict[str, torch.Tensor],
+]:
+    _require_exact_keys(
+        payload,
+        _CHECKPOINT_BODY_KEYS | _CHECKPOINT_SCOPE_KEYS,
+        "checkpoint payload",
+    )
+    if (
+        payload["schema_version"] != 1
+        or payload["payload_type"] != CHECKPOINT_PAYLOAD_TYPE
+    ):
+        raise ValueError("checkpoint payload identity/schema mismatch")
     epoch = _require_positive_integer(payload["epoch"], "checkpoint epoch")
+    if epoch > 60:
+        raise ValueError("checkpoint epoch must be in 1..60")
+    _require_nonnegative_integer(
+        payload["global_step"],
+        "checkpoint global_step",
+    )
     subject = _require_positive_integer(payload["subject"], "checkpoint subject")
     if subject > 10:
         raise ValueError("checkpoint subject must be in 1..10")
-    seed = _require_positive_integer(payload["seed"], "checkpoint seed")
+    seed = _require_nonnegative_integer(payload["seed"], "checkpoint seed")
     config = _require_sha256(payload["config_sha256"], "checkpoint config")
     schedule = _require_sha256(payload["schedule_sha256"], "checkpoint schedule")
-    trajectory = _require_sha256(payload["trajectory_sha256"], "checkpoint trajectory")
+    trajectory = _require_sha256(
+        payload["trajectory_sha256"],
+        "checkpoint trajectory",
+    )
+    _require_sha256(
+        payload["data_order_sha256"],
+        "checkpoint data order",
+    )
     optimizer_stage = payload["optimizer_stage"]
     if not isinstance(optimizer_stage, str) or not optimizer_stage:
         raise ValueError("checkpoint optimizer stage must be a nonempty string")
@@ -381,9 +574,110 @@ def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
         payload["model_state_dict"],
         context="checkpoint model state",
     )
+    claimed_state_hash = _require_sha256(
+        payload["model_state_sha256"],
+        "checkpoint model state",
+    )
+    if hash_state_dict(state) != claimed_state_hash:
+        raise ValueError("checkpoint model-state hash mismatch")
+    for key in (
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "numpy_rng_state",
+        "sampler_state_dict",
+        "validation_metrics",
+        "input_hashes",
+        "environment",
+        "run_manifest",
+        "candidate_spec",
+        "runtime_state",
+        "retention",
+    ):
+        _require_mapping(payload[key], f"checkpoint {key}")
+    if (
+        payload["scope"] != "train"
+        or payload["validation_scope"] != "val-dev"
+        or payload["observed_scopes"] != ["train", "val-dev"]
+    ):
+        raise PermissionError("checkpoint is not development-only")
+
+    provenance = _require_mapping(
+        envelope.get("provenance"),
+        "checkpoint sidecar provenance",
+    )
+    _require_exact_keys(
+        provenance,
+        _SIDECAR_PROVENANCE_KEYS,
+        "checkpoint sidecar provenance",
+    )
+    for key in ("manifest_sha256", "protocol_sha256"):
+        _require_sha256(provenance[key], f"checkpoint sidecar {key}")
+    expected_provenance = {
+        "config_sha256": config,
+        "seed": seed,
+        "subject": subject,
+    }
+    for key, expected in expected_provenance.items():
+        if provenance[key] != expected:
+            raise ValueError(
+                f"checkpoint sidecar provenance {key} binding mismatch"
+            )
+
+    metadata = _require_mapping(
+        envelope.get("metadata"),
+        "checkpoint sidecar metadata",
+    )
+    _require_exact_keys(
+        metadata,
+        _SIDECAR_METADATA_KEYS,
+        "checkpoint sidecar metadata",
+    )
+    if (
+        metadata["complete"] is not True
+        or metadata["observed_scopes"] != ["train", "val-dev"]
+        or metadata["retention"] != payload["retention"]
+    ):
+        raise ValueError("checkpoint sidecar metadata binding mismatch")
+    _validate_source_records(
+        metadata["source_records"],
+        provenance=provenance,
+    )
+    _reject_sealed_checkpoint_metadata(payload)
+    return (
+        epoch,
+        subject,
+        seed,
+        config,
+        schedule,
+        optimizer_stage,
+        trajectory,
+        state,
+    )
+
+
+def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
+    normalized = validate_development_checkpoint_path(
+        Path(path),
+        "checkpoint path",
+    )
+    loaded = load_typed_torch_checkpoint(
+        normalized,
+        payload_type=CHECKPOINT_PAYLOAD_TYPE,
+        requested_scope="train",
+    )
+    (
+        epoch,
+        subject,
+        seed,
+        config,
+        schedule,
+        optimizer_stage,
+        trajectory,
+        state,
+    ) = _validate_checkpoint_bundle(loaded.payload, loaded.envelope)
     return _LoadedCheckpoint(
         path=normalized,
-        sha256=digest,
+        sha256=loaded.sha256,
         epoch=epoch,
         subject=subject,
         seed=seed,
@@ -628,7 +922,7 @@ def verify_averaged_checkpoint_payload(value: object) -> dict[str, object]:
     subject = _require_positive_integer(payload["subject"], "averaged subject")
     if subject > 10:
         raise ValueError("averaged subject must be in 1..10")
-    _require_positive_integer(payload["seed"], "averaged seed")
+    _require_nonnegative_integer(payload["seed"], "averaged seed")
     _require_sha256(payload["config_sha256"], "averaged config")
     _require_sha256(payload["schedule_sha256"], "averaged schedule")
     _require_sha256(payload["trajectory_sha256"], "averaged trajectory")

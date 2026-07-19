@@ -103,6 +103,7 @@ _GENERIC_PAYLOAD_TYPES = frozenset(
         "samga_brain_rw.protocol_config",
         "samga_brain_rw.semantic_config",
         "samga_brain_rw.checkpoint",
+        "samga_brain_rw.epoch_checkpoint",
         "samga_brain_rw.score_matrix",
         "samga_brain_rw.refit_artifact",
         "samga_brain_rw.refit_manifest",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import runpy
 import subprocess
@@ -12,6 +13,11 @@ import pytest
 import torch
 import samga_brain_rw.checkpoints as checkpoints_module
 
+from samga_brain_rw.hashing import (
+    canonical_json_bytes,
+    ordered_ids_sha256,
+    sha256_json,
+)
 from samga_brain_rw.checkpoints import (
     AVERAGING_CANDIDATES,
     average_state_dicts,
@@ -55,12 +61,101 @@ def _write_checkpoint(
         "optimizer_state_dict": {"must_not_be_averaged": epoch},
     }
     torch.save(payload, path)
-    return path
+    return _make_typed_checkpoint(path)
 
 
 def _window(tmp_path: Path, start: int = 56) -> list[Path]:
     return [
         _write_checkpoint(tmp_path / f"checkpoint_epoch{epoch:03d}.pt", epoch=epoch)
+        for epoch in range(start, 61)
+    ]
+
+
+def _make_typed_checkpoint(path: Path) -> Path:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload.update(
+        {
+            "global_step": int(payload["epoch"]) * 10,
+            "data_order_sha256": _h("data-order"),
+            "model_state_sha256": hash_state_dict(payload["model_state_dict"]),
+            "scheduler_state_dict": {},
+            "python_rng_state": [1, 2, 3],
+            "numpy_rng_state": {},
+            "torch_rng_state": torch.tensor([1, 2, 3], dtype=torch.uint8),
+            "cuda_rng_states": [],
+            "loader_generator_state": torch.tensor([4, 5], dtype=torch.uint8),
+            "sampler_state_dict": {},
+            "validation_metrics": {},
+            "input_hashes": {},
+            "effective_batch": {},
+            "environment": {},
+            "run_manifest": {},
+            "candidate_spec": {},
+            "runtime_state": {},
+            "retention": {"retain_for_averaging": True},
+            "scope": "train",
+            "validation_scope": "val-dev",
+            "observed_scopes": ["train", "val-dev"],
+        }
+    )
+    torch.save(payload, path)
+    payload_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    source_records = [
+        {
+            "manifest_sha256": _h("manifest"),
+            "records_sha256": _h("records"),
+            "role": role,
+            "role_payload_sha256": _h(role),
+            "source_manifest_sha256": _h("source-manifest"),
+            "source_payload_sha256": _h("source-payload"),
+        }
+        for role in ("train", "val-dev")
+    ]
+    ordered_ids = ["train:0", "val-dev:0"]
+    provenance = {
+        "config_sha256": payload["config_sha256"],
+        "manifest_sha256": _h("manifest"),
+        "protocol_sha256": _h("protocol"),
+        "seed": payload["seed"],
+        "subject": payload["subject"],
+    }
+    metadata = {
+        "complete": True,
+        "observed_scopes": ["train", "val-dev"],
+        "ordered_ids": ordered_ids,
+        "retention": payload["retention"],
+        "source_records": source_records,
+    }
+    envelope = {
+        "schema_version": 1,
+        "payload_type": "samga_brain_rw.epoch_checkpoint",
+        "scope": "train",
+        "source_records_sha256": sha256_json(source_records),
+        "ordered_ids_sha256": ordered_ids_sha256(ordered_ids),
+        "payload_sha256": payload_sha256,
+        "provenance": provenance,
+        "provenance_sha256": sha256_json(provenance),
+        "metadata": metadata,
+        "metadata_sha256": sha256_json(metadata),
+    }
+    path.with_suffix(path.suffix + ".meta.json").write_bytes(
+        canonical_json_bytes(envelope) + b"\n"
+    )
+    return path
+
+
+def _typed_window(
+    tmp_path: Path,
+    start: int = 56,
+    *,
+    seed: object = 42,
+) -> list[Path]:
+    return [
+        _write_checkpoint(
+            tmp_path / f"typed_checkpoint_epoch{epoch:03d}.pt",
+            epoch=epoch,
+            seed=seed,  # type: ignore[arg-type]
+        )
         for epoch in range(start, 61)
     ]
 
@@ -124,6 +219,66 @@ def test_exact_candidate_registry_is_locked() -> None:
             (51, 52, 53, 54, 55, 56, 57, 58, 59, 60),
         ),
     }
+
+
+def test_averaging_rejects_checkpoint_without_typed_sidecar(
+    tmp_path: Path,
+) -> None:
+    paths = _window(tmp_path)
+    paths[0].with_suffix(paths[0].suffix + ".meta.json").unlink()
+    with pytest.raises(ValueError, match="envelope|sidecar|typed"):
+        average_state_dicts(paths)
+
+
+def test_averaging_accepts_seed_zero_from_typed_checkpoint_bundle(
+    tmp_path: Path,
+) -> None:
+    averaged = average_state_dicts(_typed_window(tmp_path, seed=0))
+    assert torch.equal(averaged["weight"], torch.tensor([58.0, 60.0]))
+
+
+def test_build_averaged_checkpoint_accepts_seed_zero(
+    tmp_path: Path,
+) -> None:
+    result = build_averaged_checkpoint(
+        _typed_window(tmp_path, seed=0),
+        candidate_id="s2-avg-last5",
+    )
+    assert result["seed"] == 0
+
+
+@pytest.mark.parametrize("seed", [-1, True, False])
+def test_averaging_rejects_negative_or_boolean_seed(
+    tmp_path: Path,
+    seed: object,
+) -> None:
+    with pytest.raises(ValueError, match="seed"):
+        average_state_dicts(_typed_window(tmp_path, seed=seed))
+
+
+def test_averaging_rejects_checkpoint_payload_hash_tamper(
+    tmp_path: Path,
+) -> None:
+    paths = _typed_window(tmp_path)
+    payload = torch.load(paths[-1], map_location="cpu", weights_only=True)
+    payload["model_state_dict"]["weight"][0] += 1
+    torch.save(payload, paths[-1])
+
+    with pytest.raises(ValueError, match="payload.*SHA-256|digest|hash"):
+        average_state_dicts(paths)
+
+
+def test_averaging_rejects_checkpoint_sidecar_tamper(
+    tmp_path: Path,
+) -> None:
+    paths = _typed_window(tmp_path)
+    sidecar = paths[-1].with_suffix(paths[-1].suffix + ".meta.json")
+    document = json.loads(sidecar.read_text(encoding="utf-8"))
+    document["provenance"]["seed"] = 0
+    sidecar.write_bytes(canonical_json_bytes(document) + b"\n")
+
+    with pytest.raises(ValueError, match="provenance.*SHA-256|envelope|hash"):
+        average_state_dicts(paths)
 
 
 def test_arithmetic_average_uses_floating_state_only(tmp_path: Path) -> None:
@@ -210,6 +365,7 @@ def test_rejects_mismatched_checkpoint_identity(
     payload = torch.load(paths[-1], map_location="cpu", weights_only=False)
     mutation(payload)  # type: ignore[operator]
     torch.save(payload, paths[-1])
+    _make_typed_checkpoint(paths[-1])
     with pytest.raises(ValueError, match=message):
         average_state_dicts(paths)
 
@@ -244,6 +400,7 @@ def test_rejects_state_contract_mismatch(
     payload = torch.load(paths[-1], map_location="cpu", weights_only=False)
     payload["model_state_dict"] = state
     torch.save(payload, paths[-1])
+    _make_typed_checkpoint(paths[-1])
     with pytest.raises(ValueError, match=message):
         average_state_dicts(paths)
 
@@ -410,6 +567,17 @@ def test_development_checkpoint_guard_rejects_all_test_artifact_names(
             tmp_path / relative,
             "checkpoint",
         )
+
+
+def test_averaging_rejects_typed_checkpoint_under_sealed_directory(
+    tmp_path: Path,
+) -> None:
+    sealed_directory = tmp_path / "formal-test"
+    sealed_directory.mkdir()
+    paths = _typed_window(sealed_directory)
+
+    with pytest.raises(ValueError, match="sealed"):
+        average_state_dicts(paths)
 
 
 def test_checkpoint_read_fails_closed_on_intermediate_symlink_swap(
