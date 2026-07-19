@@ -6,8 +6,10 @@ import hashlib
 import io
 import math
 import os
+import pickle
 import re
 import stat
+import struct
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +19,9 @@ import torch
 from torch import nn
 from torch.optim.swa_utils import AveragedModel
 
+from .checkpoint_identity import (
+    validate_epoch_checkpoint_identity,
+)
 from .checkpoint_io import load_typed_torch_checkpoint
 from .hashing import canonical_json_bytes
 
@@ -34,7 +39,7 @@ AVERAGING_CANDIDATES = {
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUBJECT_TEST_RE = re.compile(
-    r"^sub-\d{2}_test(?:\.[A-Za-z0-9._-]+)?$",
+    r"^sub[-_]?\d{2}[-_]?test(?:\.[A-Za-z0-9._-]+)?$",
     re.IGNORECASE,
 )
 _SEALED_COMPONENTS = {
@@ -90,7 +95,15 @@ _SIDECAR_PROVENANCE_KEYS = frozenset(
     {"config_sha256", "manifest_sha256", "protocol_sha256", "seed", "subject"}
 )
 _SIDECAR_METADATA_KEYS = frozenset(
-    {"complete", "observed_scopes", "ordered_ids", "retention", "source_records"}
+    {
+        "complete",
+        "observed_scopes",
+        "ordered_ids",
+        "retention",
+        "source_records",
+        "train_ordered_ids",
+        "val_dev_ordered_ids",
+    }
 )
 _SOURCE_RECORD_KEYS = frozenset(
     {
@@ -112,6 +125,10 @@ _AVERAGED_BODY_KEYS = frozenset(
         "subject",
         "seed",
         "config_sha256",
+        "data_order_sha256",
+        "candidate_spec_sha256",
+        "input_bundle_sha256",
+        "run_key",
         "schedule_sha256",
         "optimizer_stage",
         "trajectory_sha256",
@@ -141,6 +158,10 @@ class _LoadedCheckpoint:
     schedule_sha256: str
     optimizer_stage: str
     trajectory_sha256: str
+    data_order_sha256: str
+    candidate_spec_sha256: str
+    input_bundle_sha256: str
+    run_key: str
     model_state_dict: dict[str, torch.Tensor]
 
 
@@ -371,7 +392,18 @@ def _load_torch_mapping(path: Path, context: str) -> tuple[dict[str, object], st
             map_location="cpu",
             weights_only=True,
         )
-    except Exception as exc:  # torch raises several format-specific errors
+    except (
+        AssertionError,
+        EOFError,
+        IndexError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        struct.error,
+        TypeError,
+        ValueError,
+        pickle.UnpicklingError,
+    ) as exc:
         raise ValueError(f"invalid {context}: {normalized}") from exc
     if not isinstance(payload, Mapping):
         raise ValueError(f"{context} payload must be a mapping")
@@ -541,6 +573,7 @@ def _validate_checkpoint_bundle(
         _CHECKPOINT_BODY_KEYS | _CHECKPOINT_SCOPE_KEYS,
         "checkpoint payload",
     )
+    validate_epoch_checkpoint_identity(payload, envelope)
     if (
         payload["schema_version"] != 1
         or payload["payload_type"] != CHECKPOINT_PAYLOAD_TYPE
@@ -685,6 +718,30 @@ def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
         schedule_sha256=schedule,
         optimizer_stage=optimizer_stage,
         trajectory_sha256=trajectory,
+        data_order_sha256=_require_sha256(
+            loaded.payload["data_order_sha256"],
+            "checkpoint data order",
+        ),
+        candidate_spec_sha256=_require_sha256(
+            _require_mapping(
+                loaded.payload["candidate_spec"],
+                "checkpoint candidate_spec",
+            )["candidate_spec_sha256"],
+            "checkpoint candidate spec",
+        ),
+        input_bundle_sha256=_require_sha256(
+            _require_mapping(
+                loaded.payload["candidate_spec"],
+                "checkpoint candidate_spec",
+            )["input_bundle_sha256"],
+            "checkpoint input bundle",
+        ),
+        run_key=str(
+            _require_mapping(
+                loaded.payload["run_manifest"],
+                "checkpoint run manifest",
+            )["run_key"]
+        ),
         model_state_dict=state,
     )
 
@@ -712,6 +769,10 @@ def _validate_window(paths: Sequence[Path]) -> tuple[_LoadedCheckpoint, ...]:
         ("schedule", "schedule_sha256"),
         ("optimizer stage", "optimizer_stage"),
         ("trajectory", "trajectory_sha256"),
+        ("data order", "data_order_sha256"),
+        ("candidate", "candidate_spec_sha256"),
+        ("input bundle", "input_bundle_sha256"),
+        ("run key", "run_key"),
     )
     for item in checkpoints[1:]:
         for label, field in identity_fields:
@@ -887,7 +948,10 @@ def _verify_source_checkpoints(
         )
         _require_sha256(entry["sha256"], "source checkpoint sha256")
         result.append(entry)
-    if len({entry["path"] for entry in result}) != len(result):
+    normalized_paths = {
+        _normalized(Path(str(entry["path"]))) for entry in result
+    }
+    if len(normalized_paths) != len(result):
         raise ValueError("source checkpoint paths must be unique")
     return result
 
@@ -924,6 +988,17 @@ def verify_averaged_checkpoint_payload(value: object) -> dict[str, object]:
         raise ValueError("averaged subject must be in 1..10")
     _require_nonnegative_integer(payload["seed"], "averaged seed")
     _require_sha256(payload["config_sha256"], "averaged config")
+    _require_sha256(payload["data_order_sha256"], "averaged data order")
+    _require_sha256(
+        payload["candidate_spec_sha256"],
+        "averaged candidate spec",
+    )
+    _require_sha256(
+        payload["input_bundle_sha256"],
+        "averaged input bundle",
+    )
+    if not isinstance(payload["run_key"], str) or not payload["run_key"]:
+        raise ValueError("averaged run key must be nonempty")
     _require_sha256(payload["schedule_sha256"], "averaged schedule")
     _require_sha256(payload["trajectory_sha256"], "averaged trajectory")
     if payload["optimizer_stage"] != "stage2":
@@ -1008,6 +1083,10 @@ def build_averaged_checkpoint(
         "subject": first.subject,
         "seed": first.seed,
         "config_sha256": first.config_sha256,
+        "data_order_sha256": first.data_order_sha256,
+        "candidate_spec_sha256": first.candidate_spec_sha256,
+        "input_bundle_sha256": first.input_bundle_sha256,
+        "run_key": first.run_key,
         "schedule_sha256": first.schedule_sha256,
         "optimizer_stage": first.optimizer_stage,
         "trajectory_sha256": first.trajectory_sha256,

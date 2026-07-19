@@ -6,11 +6,13 @@ import json
 import os
 import runpy
 import subprocess
+import struct
 import sys
 from pathlib import Path
 
 import pytest
 import torch
+import samga_brain_rw.checkpoint_io as checkpoint_io_module
 import samga_brain_rw.checkpoints as checkpoints_module
 
 from samga_brain_rw.hashing import (
@@ -42,6 +44,7 @@ def _write_checkpoint(
     optimizer_stage: str = "stage2",
     trajectory_sha256: str | None = None,
     state: dict[str, torch.Tensor] | None = None,
+    candidate_config_id: str = "fixture",
 ) -> Path:
     payload = {
         "schema_version": 1,
@@ -61,7 +64,10 @@ def _write_checkpoint(
         "optimizer_state_dict": {"must_not_be_averaged": epoch},
     }
     torch.save(payload, path)
-    return _make_typed_checkpoint(path)
+    return _make_typed_checkpoint(
+        path,
+        candidate_config_id=candidate_config_id,
+    )
 
 
 def _window(tmp_path: Path, start: int = 56) -> list[Path]:
@@ -71,8 +77,85 @@ def _window(tmp_path: Path, start: int = 56) -> list[Path]:
     ]
 
 
-def _make_typed_checkpoint(path: Path) -> Path:
+def _make_typed_checkpoint(
+    path: Path,
+    *,
+    candidate_config_id: str = "fixture",
+) -> Path:
     payload = torch.load(path, map_location="cpu", weights_only=True)
+    ordered_ids = ["train:0", "val-dev:0"]
+    input_hashes = {
+        "cache_sha256": _h("cache"),
+        "checkpoint_sha256": _h("initial-checkpoint"),
+        "manifest_sha256": _h("manifest"),
+        "model_sha256": _h("model"),
+        "ordered_ids_sha256": ordered_ids_sha256(ordered_ids),
+        "protocol_sha256": _h("protocol"),
+        "records_sha256": _h("records"),
+        "source_manifest_sha256": _h("source-manifest"),
+        "source_payload_byte_count_sha256": _h("source-payload-bytes"),
+        "source_payload_path_sha256": _h("source-payload-path"),
+        "source_payload_sha256": _h("source-payload"),
+        "train_ordered_ids_sha256": ordered_ids_sha256(ordered_ids[:1]),
+        "train_role_sha256": _h("train"),
+        "val_dev_ordered_ids_sha256": ordered_ids_sha256(ordered_ids[1:]),
+        "val_dev_role_sha256": _h("val-dev"),
+    }
+    input_bundle_sha256 = sha256_json(dict(sorted(input_hashes.items())))
+    run_key = (
+        f"stage2__{candidate_config_id}__sub-{int(payload['subject']):02d}__"
+        f"seed-{int(payload['seed'])}__"
+        f"config-{payload['config_sha256']}__inputs-{input_bundle_sha256}"
+    )
+    candidate_body = {
+        "schema_version": 1,
+        "config_id": candidate_config_id,
+        "stage": "stage2",
+        "subject": payload["subject"],
+        "seed": payload["seed"],
+        "baseline_config_sha256": _h("baseline-config"),
+        "stage2_config_sha256": _h("stage2-config"),
+        "semantic_config_sha256": payload["config_sha256"],
+        "input_bundle_sha256": input_bundle_sha256,
+        "run_key": run_key,
+        "layernorm_config_id": "s2-layernorm-off",
+        "whitening_config_id": "s2-whitening-off",
+        "preprojector_config_id": "s2-preproj-shared",
+        "adapter_kind": "identity",
+        "adapter_rank": None,
+        "adapter_lr_ratio": None,
+        "whitening_payload": None,
+        "full_task_initialization_sha256": _h("full-init"),
+        "shared_parameter_intersection_name": "fixture-shared",
+        "shared_parameter_intersection_sha256": _h("shared-init"),
+        "architecture_specific_initialization_sha256": _h("specific-init"),
+        "data_order_sha256": _h("data-order"),
+        "trajectory_sha256": payload["trajectory_sha256"],
+    }
+    candidate_spec = {
+        **candidate_body,
+        "candidate_spec_sha256": sha256_json(candidate_body),
+    }
+    run_manifest_body = {
+        "schema_version": 1,
+        "payload_type": "samga_brain_rw.development_run",
+        "stage": 2,
+        "subject": payload["subject"],
+        "seed": payload["seed"],
+        "config_id": candidate_config_id,
+        "config_sha256": payload["config_sha256"],
+        "protocol_sha256": input_hashes["protocol_sha256"],
+        "cache_sha256": input_hashes["cache_sha256"],
+        "git_sha": "1" * 40,
+        "upstream_sha": "1a63745b7ff6f98dad34b0f0b8246a9b5260d9c1",
+        "data_order_sha256": _h("data-order"),
+        "candidate_spec_sha256": candidate_spec["candidate_spec_sha256"],
+        "run_key": run_key,
+    }
+    run_manifest = {
+        **run_manifest_body,
+        "run_manifest_sha256": sha256_json(run_manifest_body),
+    }
     payload.update(
         {
             "global_step": int(payload["epoch"]) * 10,
@@ -86,11 +169,11 @@ def _make_typed_checkpoint(path: Path) -> Path:
             "loader_generator_state": torch.tensor([4, 5], dtype=torch.uint8),
             "sampler_state_dict": {},
             "validation_metrics": {},
-            "input_hashes": {},
+            "input_hashes": input_hashes,
             "effective_batch": {},
             "environment": {},
-            "run_manifest": {},
-            "candidate_spec": {},
+            "run_manifest": run_manifest,
+            "candidate_spec": candidate_spec,
             "runtime_state": {},
             "retention": {"retain_for_averaging": True},
             "scope": "train",
@@ -111,7 +194,6 @@ def _make_typed_checkpoint(path: Path) -> Path:
         }
         for role in ("train", "val-dev")
     ]
-    ordered_ids = ["train:0", "val-dev:0"]
     provenance = {
         "config_sha256": payload["config_sha256"],
         "manifest_sha256": _h("manifest"),
@@ -123,6 +205,8 @@ def _make_typed_checkpoint(path: Path) -> Path:
         "complete": True,
         "observed_scopes": ["train", "val-dev"],
         "ordered_ids": ordered_ids,
+        "train_ordered_ids": ordered_ids[:1],
+        "val_dev_ordered_ids": ordered_ids[1:],
         "retention": payload["retention"],
         "source_records": source_records,
     }
@@ -268,6 +352,33 @@ def test_averaging_rejects_checkpoint_payload_hash_tamper(
         average_state_dicts(paths)
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        struct.error("broken struct"),
+        KeyError("broken key"),
+        AssertionError("broken assertion"),
+    ],
+)
+def test_typed_loader_normalizes_additional_malformed_pickle_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    path = _write_checkpoint(tmp_path / "checkpoint_epoch056.pt", epoch=56)
+
+    def fail_load(*args: object, **kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(checkpoint_io_module.torch, "load", fail_load)
+    with pytest.raises(ValueError, match="could not be loaded safely"):
+        checkpoint_io_module.load_typed_torch_checkpoint(
+            path,
+            payload_type="samga_brain_rw.epoch_checkpoint",
+            requested_scope="train",
+        )
+
+
 def test_averaging_rejects_checkpoint_sidecar_tamper(
     tmp_path: Path,
 ) -> None:
@@ -367,6 +478,20 @@ def test_rejects_mismatched_checkpoint_identity(
     torch.save(payload, paths[-1])
     _make_typed_checkpoint(paths[-1])
     with pytest.raises(ValueError, match=message):
+        average_state_dicts(paths)
+
+
+def test_averaging_rejects_different_candidate_identity_with_same_config(
+    tmp_path: Path,
+) -> None:
+    paths = _window(tmp_path)
+    _write_checkpoint(
+        paths[-1],
+        epoch=60,
+        candidate_config_id="other-candidate",
+    )
+
+    with pytest.raises(ValueError, match="candidate|run key"):
         average_state_dicts(paths)
 
 
@@ -480,6 +605,10 @@ def test_averaged_payload_hash_binds_every_semantic_field_and_tensor(
         "subject",
         "seed",
         "config_sha256",
+        "data_order_sha256",
+        "candidate_spec_sha256",
+        "input_bundle_sha256",
+        "run_key",
         "schedule_sha256",
         "optimizer_stage",
         "trajectory_sha256",
@@ -489,6 +618,7 @@ def test_averaged_payload_hash_binds_every_semantic_field_and_tensor(
         "alias_of",
         "model_state_dict",
         "model_state_sha256",
+        "arithmetic_model_state_sha256",
         "payload_sha256",
     )
     for target in targets:
@@ -509,13 +639,19 @@ def test_averaged_payload_hash_binds_every_semantic_field_and_tensor(
             tampered[target] = 43
         elif target in {
             "config_sha256",
+            "data_order_sha256",
+            "candidate_spec_sha256",
+            "input_bundle_sha256",
             "schedule_sha256",
             "trajectory_sha256",
             "strict_control_checkpoint_sha256",
             "model_state_sha256",
+            "arithmetic_model_state_sha256",
             "payload_sha256",
         }:
             tampered[target] = "0" * 64
+        elif target == "run_key":
+            tampered[target] = "other-run"
         elif target == "optimizer_stage":
             tampered[target] = "stage1"
         elif target == "source_checkpoints":
@@ -530,6 +666,25 @@ def test_averaged_payload_hash_binds_every_semantic_field_and_tensor(
             raise AssertionError(target)
         with pytest.raises(ValueError, match="payload.*SHA-256|hash"):
             checkpoints_module.verify_averaged_checkpoint_payload(tampered)
+
+
+def test_averaged_sources_reject_normalization_equivalent_paths(
+    tmp_path: Path,
+) -> None:
+    result = build_averaged_checkpoint(
+        _window(tmp_path),
+        candidate_id="s2-avg-last5",
+    )
+    sources = result["source_checkpoints"]
+    assert isinstance(sources, list)
+    first_path = Path(sources[0]["path"])
+    sources[1]["path"] = f"{first_path.parent}/./{first_path.name}"
+    result["payload_sha256"] = (
+        checkpoints_module.hash_averaged_checkpoint_payload(result)
+    )
+
+    with pytest.raises(ValueError, match="paths must be unique"):
+        checkpoints_module.verify_averaged_checkpoint_payload(result)
 
 
 def test_averaged_checkpoint_loader_rejects_tampered_payload(tmp_path: Path) -> None:
@@ -556,6 +711,10 @@ def test_averaged_checkpoint_loader_rejects_tampered_payload(tmp_path: Path) -> 
         Path("formal") / "averaged.pt",
         Path("sub-01_test.json"),
         Path("sub-01_test.pt"),
+        Path("sub_01_test.pt"),
+        Path("sub01_test.pt"),
+        Path("sub-01-test.pt"),
+        Path("SUB_01_TEST.PT"),
     ),
 )
 def test_development_checkpoint_guard_rejects_all_test_artifact_names(

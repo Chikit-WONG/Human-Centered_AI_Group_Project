@@ -7,6 +7,8 @@ for validating the checkpoint's payload-specific semantic schema.
 from __future__ import annotations
 
 import json
+import pickle
+import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,7 +78,18 @@ def load_typed_torch_checkpoint(
                 map_location="cpu",
                 weights_only=True,
             )
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        except (
+            AssertionError,
+            EOFError,
+            IndexError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            struct.error,
+            TypeError,
+            ValueError,
+            pickle.UnpicklingError,
+        ) as exc:
             raise ValueError(
                 "typed checkpoint payload could not be loaded safely"
             ) from exc
