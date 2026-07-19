@@ -105,9 +105,28 @@ def test_train_artifact_returns_frozen_verified_capability(tmp_path: Path) -> No
     assert capability.payload_sha256 == hashlib.sha256(
         artifact.payload_path.read_bytes()
     ).hexdigest()
+    envelope_stat = artifact.envelope_path.stat()
+    assert (
+        capability.envelope_device,
+        capability.envelope_inode,
+        capability.envelope_size,
+        capability.envelope_mtime_ns,
+        capability.envelope_ctime_ns,
+    ) == (
+        envelope_stat.st_dev,
+        envelope_stat.st_ino,
+        envelope_stat.st_size,
+        envelope_stat.st_mtime_ns,
+        envelope_stat.st_ctime_ns,
+    )
+    assert capability.envelope_sha256 == hashlib.sha256(
+        artifact.envelope_path.read_bytes()
+    ).hexdigest()
     assert capability.revalidate() is None
     with pytest.raises(FrozenInstanceError):
         capability.size = 0  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        capability.envelope_size = 0  # type: ignore[misc]
 
 
 def test_required_wrapper_delegates_and_returns_none(tmp_path: Path) -> None:
@@ -368,6 +387,55 @@ def test_open_verified_rejects_path_replacement(tmp_path: Path) -> None:
             pytest.fail("replacement inode must not be yielded")
 
 
+def test_open_envelope_verified_rechecks_content_on_the_same_identity(
+    tmp_path: Path,
+) -> None:
+    artifact, _ = _generic_artifact(tmp_path)
+    capability = verify_typed_artifacts("train", [artifact])[0]
+    original = artifact.envelope_path.read_bytes()
+    original_stat = artifact.envelope_path.stat()
+    marker = b"synthetic-unit-test"
+    assert marker in original
+    mutated = original.replace(marker, b"synthetic-unit-tost", 1)
+    assert len(mutated) == len(original)
+    artifact.envelope_path.write_bytes(mutated)
+    os.utime(
+        artifact.envelope_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+
+    with pytest.raises(ValueError, match="envelope.*identity|envelope.*digest"):
+        with capability.open_envelope_verified():
+            pytest.fail("mutated envelope must not be yielded")
+
+
+def test_open_envelope_verified_rejects_path_replacement(
+    tmp_path: Path,
+) -> None:
+    artifact, _ = _generic_artifact(tmp_path)
+    capability = verify_typed_artifacts("train", [artifact])[0]
+    replacement = tmp_path / "replacement-envelope.json"
+    replacement.write_bytes(artifact.envelope_path.read_bytes())
+    artifact.envelope_path.unlink()
+    os.link(replacement, artifact.envelope_path)
+
+    with pytest.raises(ValueError, match="envelope.*identity"):
+        with capability.open_envelope_verified():
+            pytest.fail("replacement envelope inode must not be yielded")
+
+
+def test_open_envelope_verified_yields_exact_verified_bytes(
+    tmp_path: Path,
+) -> None:
+    artifact, _ = _generic_artifact(tmp_path)
+    expected = artifact.envelope_path.read_bytes()
+    capability = verify_typed_artifacts("train", [artifact])[0]
+
+    with capability.open_envelope_verified() as envelope_file:
+        assert envelope_file.read() == expected
+    capability.revalidate_envelope()
+
+
 def test_rejection_never_invokes_semantic_loader(tmp_path: Path) -> None:
     artifact, _ = _generic_artifact(tmp_path)
     artifact.payload_path.write_bytes(b"tampered before verification")
@@ -492,6 +560,20 @@ def test_task2_validates_only_selected_role_and_recomputes_it(
     _write_json(artifact.envelope_path, tampered)
     with pytest.raises(ValueError, match="ordered-ID|payload SHA-256"):
         verify_typed_artifacts("train", [artifact])
+
+
+def test_task2_capability_binds_same_file_as_payload_and_envelope(
+    tmp_path: Path,
+) -> None:
+    artifact, _ = _task2_protocol_artifact(tmp_path)
+
+    capability = verify_typed_artifacts("train", [artifact])[0]
+
+    assert capability.device == capability.envelope_device
+    assert capability.inode == capability.envelope_inode
+    assert capability.payload_sha256 == capability.envelope_sha256
+    with capability.open_envelope_verified() as envelope_file:
+        assert envelope_file.read() == artifact.envelope_path.read_bytes()
 
 
 @pytest.mark.parametrize(

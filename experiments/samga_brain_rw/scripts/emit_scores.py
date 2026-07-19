@@ -79,6 +79,18 @@ def _source_directory(
     return next(iter(parents))
 
 
+def _require_output_outside_source(
+    source_directory: Path,
+    output_directory: Path,
+) -> None:
+    source = _normalized(source_directory)
+    output = _normalized(output_directory)
+    if output == source or source in output.parents:
+        raise ValueError(
+            "output directory must be outside the source bundle"
+        )
+
+
 def _thaw_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _thaw_json(child) for key, child in value.items()}
@@ -95,6 +107,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.input_similarity,
             arguments.input_envelope,
             arguments.input_predictions,
+        )
+        _require_output_outside_source(
+            source_directory,
+            arguments.output_directory,
         )
         source = ScoreArtifact.load(
             source_directory,

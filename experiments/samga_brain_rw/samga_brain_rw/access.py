@@ -241,6 +241,46 @@ class VerifiedArtifact:
     mtime_ns: int
     ctime_ns: int
     payload_sha256: str
+    envelope_device: int = -1
+    envelope_inode: int = -1
+    envelope_size: int = -1
+    envelope_mtime_ns: int = -1
+    envelope_ctime_ns: int = -1
+    envelope_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        missing = (
+            self.envelope_device == -1,
+            self.envelope_inode == -1,
+            self.envelope_size == -1,
+            self.envelope_mtime_ns == -1,
+            self.envelope_ctime_ns == -1,
+            self.envelope_sha256 == "",
+        )
+        if all(missing):
+            if _normalized_path(
+                self.artifact.payload_path
+            ) != _normalized_path(self.artifact.envelope_path):
+                raise ValueError(
+                    "envelope identity is required when payload and "
+                    "envelope paths differ"
+                )
+            object.__setattr__(
+                self, "envelope_device", self.device
+            )
+            object.__setattr__(self, "envelope_inode", self.inode)
+            object.__setattr__(self, "envelope_size", self.size)
+            object.__setattr__(
+                self, "envelope_mtime_ns", self.mtime_ns
+            )
+            object.__setattr__(
+                self, "envelope_ctime_ns", self.ctime_ns
+            )
+            object.__setattr__(
+                self, "envelope_sha256", self.payload_sha256
+            )
+        elif any(missing):
+            raise ValueError("envelope identity must be complete")
 
     @property
     def dev(self) -> int:
@@ -294,6 +334,76 @@ class VerifiedArtifact:
         finally:
             if fd >= 0:
                 os.close(fd)
+
+    @contextmanager
+    def open_envelope_verified(self) -> Iterator[BinaryIO]:
+        """Yield the same no-follow envelope bytes that were verified."""
+
+        fd = _open_readonly_nofollow(
+            self.artifact.envelope_path, "verified envelope"
+        )
+        try:
+            before = os.fstat(fd)
+            _require_regular_file(before, "verified envelope")
+            self._check_envelope_identity(before)
+            digest = _sha256_fd(fd)
+            after = os.fstat(fd)
+            _require_stable_identity(
+                before, after, "verified envelope"
+            )
+            self._check_envelope_identity(after)
+            if digest != self.envelope_sha256:
+                raise ValueError(
+                    "verified envelope changed: SHA-256 digest mismatch"
+                )
+            os.lseek(fd, 0, os.SEEK_SET)
+            with os.fdopen(fd, "rb", closefd=True) as envelope_file:
+                fd = -1
+                yield envelope_file
+
+                live_fd = envelope_file.fileno()
+                post_load = os.fstat(live_fd)
+                self._check_envelope_identity(post_load)
+                post_digest = _sha256_fd(live_fd)
+                final = os.fstat(live_fd)
+                _require_stable_identity(
+                    post_load, final, "verified envelope"
+                )
+                self._check_envelope_identity(final)
+                if post_digest != self.envelope_sha256:
+                    raise ValueError(
+                        "verified envelope changed while it was in use"
+                    )
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def revalidate_envelope(self) -> None:
+        """Recheck the verified envelope identity and digest."""
+
+        with self.open_envelope_verified():
+            pass
+
+    def _check_envelope_identity(
+        self,
+        current: os.stat_result,
+    ) -> None:
+        identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        expected = (
+            self.envelope_device,
+            self.envelope_inode,
+            self.envelope_size,
+            self.envelope_mtime_ns,
+            self.envelope_ctime_ns,
+        )
+        if identity != expected:
+            raise ValueError("verified envelope file identity changed")
 
     def revalidate(self) -> None:
         """Recheck identity and digest without semantically loading bytes."""
@@ -382,6 +492,12 @@ def verify_typed_artifacts(
                 mtime_ns=payload_stat.st_mtime_ns,
                 ctime_ns=payload_stat.st_ctime_ns,
                 payload_sha256=payload_digest,
+                envelope_device=envelope_stat.st_dev,
+                envelope_inode=envelope_stat.st_ino,
+                envelope_size=envelope_stat.st_size,
+                envelope_mtime_ns=envelope_stat.st_mtime_ns,
+                envelope_ctime_ns=envelope_stat.st_ctime_ns,
+                envelope_sha256=envelope_digest,
             )
         )
     return tuple(verified)

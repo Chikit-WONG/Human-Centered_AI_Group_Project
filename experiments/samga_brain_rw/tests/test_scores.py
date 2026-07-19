@@ -660,3 +660,301 @@ def test_emit_scores_cli_preserves_preexisting_output_on_conflict(
     assert result.returncode != 0
     assert sentinel.read_bytes() == b"owned"
     assert set(output.iterdir()) == {sentinel}
+
+
+def _rebind_source_records(
+    directory: Path,
+    source_records: list[object],
+) -> None:
+    envelope = _read_envelope(directory)
+    bound = envelope["metadata"]
+    provenance = envelope["provenance"]
+    source_hash = _sha256_json(source_records)
+    bound["source_records"] = source_records
+    bound["source_records_sha256"] = source_hash
+    provenance["source_records_sha256"] = source_hash
+    envelope["source_records_sha256"] = source_hash
+    envelope["metadata_sha256"] = _sha256_json(bound)
+    envelope["provenance_sha256"] = _sha256_json(provenance)
+    _write_envelope(directory, envelope)
+
+
+def _rebind_subject(directory: Path, subject: int) -> None:
+    envelope = _read_envelope(directory)
+    envelope["metadata"]["subject"] = subject
+    envelope["provenance"]["subject"] = subject
+    envelope["metadata_sha256"] = _sha256_json(envelope["metadata"])
+    envelope["provenance_sha256"] = _sha256_json(envelope["provenance"])
+    _write_envelope(directory, envelope)
+
+
+def test_late_extra_file_after_typed_verification_rejects_before_numpy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory, _, _, _ = _save_bundle(tmp_path)
+    real_verify = score_module.verify_typed_artifacts
+    load_count = 0
+
+    def verify_then_add_extra(*args, **kwargs):
+        capabilities = real_verify(*args, **kwargs)
+        (directory / "late-extra.txt").write_bytes(b"late")
+        return capabilities
+
+    def tracked_load(*args, **kwargs):
+        nonlocal load_count
+        load_count += 1
+        pytest.fail("np.load must not run after a late extra file appears")
+
+    monkeypatch.setattr(
+        score_module, "verify_typed_artifacts", verify_then_add_extra
+    )
+    monkeypatch.setattr(score_module.np, "load", tracked_load)
+
+    with pytest.raises(ValueError, match="file set"):
+        ScoreArtifact.load(directory, allowed_scopes={"val-dev"})
+    assert load_count == 0
+
+
+def test_extra_file_added_during_numpy_load_is_rejected_at_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory, _, _, _ = _save_bundle(tmp_path)
+    real_load = score_module.np.load
+
+    def load_then_add_extra(*args, **kwargs):
+        value = real_load(*args, **kwargs)
+        (directory / "late-extra.txt").write_bytes(b"late")
+        return value
+
+    monkeypatch.setattr(score_module.np, "load", load_then_add_extra)
+
+    with pytest.raises(ValueError, match="file set"):
+        ScoreArtifact.load(directory, allowed_scopes={"val-dev"})
+
+
+def test_envelope_replacement_after_verifier_is_rejected_before_numpy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory, _, _, _ = _save_bundle(tmp_path)
+    replacement = tmp_path / "replacement-metadata.json"
+    real_verify = score_module.verify_typed_artifacts
+    load_count = 0
+
+    def verify_then_replace(*args, **kwargs):
+        capabilities = real_verify(*args, **kwargs)
+        replacement.write_bytes((directory / "metadata.json").read_bytes())
+        (directory / "metadata.json").unlink()
+        os.link(replacement, directory / "metadata.json")
+        return capabilities
+
+    def tracked_load(*args, **kwargs):
+        nonlocal load_count
+        load_count += 1
+        pytest.fail("np.load must not run after envelope replacement")
+
+    monkeypatch.setattr(
+        score_module, "verify_typed_artifacts", verify_then_replace
+    )
+    monkeypatch.setattr(score_module.np, "load", tracked_load)
+
+    with pytest.raises(ValueError, match="envelope.*identity"):
+        ScoreArtifact.load(directory, allowed_scopes={"val-dev"})
+    assert load_count == 0
+
+
+_FORBIDDEN_SOURCE_RECORDS = [
+    [{"manifest_path": "/sealed/sub-01_test.json"}],
+    [{"scope": "val-confirm"}],
+    [{"split": "formal-test"}],
+    [{"test": {"metrics": {"top1": 0.9}}}],
+    [
+        {
+            "formal": {
+                "scores": [0.9],
+                "predictions": ["query-a"],
+                "rank": 1,
+                "top5": 1,
+            }
+        }
+    ],
+    [{"image_path": "/sealed/test_images/image-001.jpg"}],
+    [
+        {
+            "record_digest": (
+                "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84"
+                "feae7ba64636f1a"
+            )
+        }
+    ],
+]
+
+
+@pytest.mark.parametrize("source_records", _FORBIDDEN_SOURCE_RECORDS)
+def test_save_strictly_rejects_test_or_formal_source_records(
+    tmp_path: Path,
+    source_records: list[object],
+) -> None:
+    scores, query_ids, gallery_ids = _scores_and_ids()
+    metadata = _metadata()
+    metadata["source_records"] = source_records
+    directory = tmp_path / "forbidden-source"
+
+    with pytest.raises((PermissionError, ValueError), match="test|formal|val-dev"):
+        ScoreArtifact.save(
+            directory,
+            scores,
+            query_ids,
+            gallery_ids,
+            metadata,
+        )
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("source_records", _FORBIDDEN_SOURCE_RECORDS)
+def test_load_strictly_rejects_test_or_formal_source_records(
+    tmp_path: Path,
+    source_records: list[object],
+) -> None:
+    directory, _, _, _ = _save_bundle(tmp_path)
+    _rebind_source_records(directory, source_records)
+
+    with pytest.raises(
+        (PermissionError, ValueError),
+        match="denied|test|formal|val-dev",
+    ):
+        ScoreArtifact.load(directory, allowed_scopes={"val-dev"})
+
+
+def test_subject_must_be_between_one_and_ten_on_save_and_load(
+    tmp_path: Path,
+) -> None:
+    scores, query_ids, gallery_ids = _scores_and_ids()
+    metadata = _metadata()
+    metadata["subject"] = 11
+    rejected = tmp_path / "subject-11"
+
+    with pytest.raises(ValueError, match="subject.*1.*10"):
+        ScoreArtifact.save(
+            rejected,
+            scores,
+            query_ids,
+            gallery_ids,
+            metadata,
+        )
+    assert not rejected.exists()
+
+    directory, _, _, _ = _save_bundle(tmp_path / "load")
+    _rebind_subject(directory, 11)
+    with pytest.raises(ValueError, match="subject.*1.*10"):
+        ScoreArtifact.load(directory, allowed_scopes={"val-dev"})
+
+
+def test_loaded_similarity_cannot_regain_write_permission(
+    tmp_path: Path,
+) -> None:
+    directory, _, _, _ = _save_bundle(tmp_path)
+
+    loaded = ScoreArtifact.load(directory, allowed_scopes={"val-dev"})
+
+    assert loaded.similarity.flags.writeable is False
+    with pytest.raises(ValueError):
+        loaded.similarity.setflags(write=True)
+
+
+@pytest.mark.parametrize(
+    "relative_output",
+    [
+        Path("test_images") / "scores",
+        Path("val-confirm") / "scores",
+        Path("formal-test") / "nested" / "scores",
+        Path("nested") / "sub-01_test.json" / "scores",
+        Path(
+            "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84"
+            "feae7ba64636f1a"
+        )
+        / "scores",
+    ],
+)
+def test_save_rejects_forbidden_output_components_before_publication(
+    tmp_path: Path,
+    relative_output: Path,
+) -> None:
+    scores, query_ids, gallery_ids = _scores_and_ids()
+    directory = tmp_path / relative_output
+
+    with pytest.raises((PermissionError, ValueError), match="output|forbidden"):
+        ScoreArtifact.save(
+            directory,
+            scores,
+            query_ids,
+            gallery_ids,
+            _metadata(),
+        )
+    assert not directory.exists()
+
+
+def test_component_symlink_swap_cannot_escape_score_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe = tmp_path / "safe"
+    parent = safe / "parent"
+    parent.mkdir(parents=True)
+    parked = tmp_path / "parked"
+    outside = tmp_path / "outside"
+    (outside / "parent").mkdir(parents=True)
+    destination = parent / "bundle"
+    scores, query_ids, gallery_ids = _scores_and_ids()
+    real_preflight = score_module._preflight_path
+
+    def preflight_then_swap(path: Path, context: str) -> None:
+        real_preflight(path, context)
+        if context == "score output parent":
+            safe.rename(parked)
+            safe.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(score_module, "_preflight_path", preflight_then_swap)
+
+    with pytest.raises(ValueError, match="component|symlink|secure"):
+        ScoreArtifact.save(
+            destination,
+            scores,
+            query_ids,
+            gallery_ids,
+            _metadata(),
+        )
+    assert not (outside / "parent" / "bundle").exists()
+    assert not (parked / "parent" / "bundle").exists()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_emit_scores_rejects_output_at_or_inside_source_without_mutation(
+    tmp_path: Path,
+    experiment_root: Path,
+    nested: bool,
+) -> None:
+    source, _, _, _ = _save_bundle(tmp_path / "source")
+    before = {
+        name: (source / name).read_bytes()
+        for name in os.listdir(source)
+    }
+    output = source / "nested" if nested else source
+
+    result = _run_emit_scores(
+        experiment_root,
+        source / "similarity.npy",
+        source / "metadata.json",
+        source / "predictions.csv",
+        output,
+    )
+
+    assert result.returncode != 0
+    assert "outside the source bundle" in result.stderr
+    assert set(os.listdir(source)) == set(before)
+    assert {
+        name: (source / name).read_bytes()
+        for name in os.listdir(source)
+    } == before

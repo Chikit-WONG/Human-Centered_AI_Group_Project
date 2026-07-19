@@ -296,48 +296,73 @@ class ScoreArtifact:
         _require_development_scopes(allowed_scopes)
         bundle = _absolute_path(Path(directory))
         _preflight_path(bundle, "score bundle")
-        _require_exact_bundle_files(bundle)
+        return _load_score_bundle(bundle)
+
+
+def _load_score_bundle(bundle: Path) -> ScoreArtifact:
+    bundle_fd = _open_directory_components(
+        bundle,
+        create=False,
+        context="score bundle",
+    )
+    initial_directory_stat = os.fstat(bundle_fd)
+    try:
+        if not stat.S_ISDIR(initial_directory_stat.st_mode):
+            raise ValueError("score bundle must be a directory")
+        _require_exact_bundle_files(bundle_fd)
 
         descriptor = TypedArtifact(
             payload_type=SCORE_PAYLOAD_TYPE,
             payload_path=bundle / "similarity.npy",
             envelope_path=bundle / "metadata.json",
         )
-        # This is the mandatory typed-artifact gate.  It validates scope and
-        # every generic envelope/payload digest before np.load can run.
         verified = verify_typed_artifacts(SCORE_SCOPE, [descriptor])[0]
+        _require_exact_bundle_files(bundle_fd)
 
-        envelope_raw = _read_regular_bytes(
-            bundle / "metadata.json",
-            context="score metadata",
-            limit=_MAX_METADATA_BYTES,
+        envelope_raw, envelope_stat, envelope_digest = (
+            _read_relative_regular_bytes(
+                bundle_fd,
+                "metadata.json",
+                context="score metadata",
+                limit=_MAX_METADATA_BYTES,
+            )
+        )
+        _require_verified_file(
+            envelope_stat,
+            envelope_digest,
+            expected_identity=(
+                verified.envelope_device,
+                verified.envelope_inode,
+                verified.envelope_size,
+                verified.envelope_mtime_ns,
+                verified.envelope_ctime_ns,
+            ),
+            expected_sha256=verified.envelope_sha256,
+            context="verified envelope",
         )
         envelope = _parse_json_object(envelope_raw, "score metadata")
-        bound, provenance, queries, galleries, declared_shape, declared_dtype = (
-            _validate_envelope(envelope, verified)
-        )
+        (
+            bound,
+            provenance,
+            queries,
+            galleries,
+            declared_shape,
+            declared_dtype,
+        ) = _validate_envelope(envelope, verified)
 
-        prediction_bytes = _read_regular_bytes(
-            bundle / "predictions.csv",
-            context="predictions CSV",
-            limit=_MAX_PREDICTIONS_BYTES,
+        prediction_bytes, _, prediction_digest = (
+            _read_relative_regular_bytes(
+                bundle_fd,
+                "predictions.csv",
+                context="predictions CSV",
+                limit=_MAX_PREDICTIONS_BYTES,
+            )
         )
-        if _sha256_bytes(prediction_bytes) != bound["predictions_sha256"]:
+        if prediction_digest != bound["predictions_sha256"]:
             raise ValueError("predictions SHA-256 mismatch")
 
-        with verified.open_verified() as handle:
-            try:
-                loaded = np.load(handle, allow_pickle=False)
-            except (OSError, ValueError, TypeError) as exc:
-                raise ValueError(
-                    "verified score payload is not a safe NumPy array"
-                ) from exc
-            if not isinstance(loaded, np.ndarray):
-                raise ValueError(
-                    "verified score payload must contain exactly one array"
-                )
-            matrix = loaded
-
+        _require_exact_bundle_files(bundle_fd)
+        matrix = _load_relative_similarity(bundle_fd, verified)
         _validate_loaded_matrix(
             matrix,
             queries,
@@ -351,17 +376,26 @@ class ScoreArtifact:
             galleries,
         )
         if _metrics_payload(metrics) != bound["retrieval_metrics"]:
-            raise ValueError("declared retrieval metrics do not match scores")
+            raise ValueError(
+                "declared retrieval metrics do not match scores"
+            )
         expected_predictions = _predictions_csv_bytes(metrics)
         if prediction_bytes != expected_predictions:
             raise ValueError(
                 "predictions CSV does not match independently ranked scores"
             )
 
-        matrix.setflags(write=False)
-        return cls(
+        immutable_matrix = _immutable_matrix_copy(matrix)
+        _require_exact_bundle_files(bundle_fd)
+        final_directory_stat = os.fstat(bundle_fd)
+        if _stat_identity(initial_directory_stat) != _stat_identity(
+            final_directory_stat
+        ):
+            raise ValueError("score bundle directory changed during load")
+        _require_bundle_path_identity(bundle, initial_directory_stat)
+        return ScoreArtifact(
             directory=bundle,
-            similarity=matrix,
+            similarity=immutable_matrix,
             query_ids=queries,
             gallery_ids=galleries,
             metadata=_deep_freeze(bound),
@@ -369,6 +403,8 @@ class ScoreArtifact:
             metrics=metrics,
             verified=verified,
         )
+    finally:
+        os.close(bundle_fd)
 
 
 def independent_retrieval_metrics(
@@ -496,8 +532,8 @@ def _validate_input_metadata(
         raise ValueError("git_sha must be a lowercase 40- or 64-hex digest")
     _require_nonnegative_int(cloned["seed"], "seed")
     subject = _require_positive_int(cloned["subject"], "subject")
-    if subject > 10_000:
-        raise ValueError("subject is outside the supported range")
+    if subject > 10:
+        raise ValueError("subject must be between 1 and 10")
     stage = cloned["stage"]
     if not isinstance(stage, str) or not stage:
         raise ValueError("stage must be a non-empty string")
@@ -691,8 +727,8 @@ def _validate_bound_identity_values(bound: Mapping[str, object]) -> None:
         raise ValueError("git_sha must be a lowercase 40- or 64-hex digest")
     _require_nonnegative_int(bound["seed"], "seed")
     subject = _require_positive_int(bound["subject"], "subject")
-    if subject > 10_000:
-        raise ValueError("subject is outside the supported range")
+    if subject > 10:
+        raise ValueError("subject must be between 1 and 10")
     if not isinstance(bound["stage"], str) or not bound["stage"]:
         raise ValueError("stage must be a non-empty string")
 
@@ -762,7 +798,7 @@ def _require_development_scopes(allowed_scopes: Collection[str]) -> None:
         )
 
 
-def _require_exact_bundle_files(directory: Path) -> None:
+def _require_exact_bundle_files(directory: Path | int) -> None:
     try:
         actual = frozenset(os.listdir(directory))
     except OSError as exc:
@@ -774,6 +810,60 @@ def _require_exact_bundle_files(directory: Path) -> None:
         )
 
 
+def _open_directory_components(
+    path: Path,
+    *,
+    create: bool,
+    context: str,
+) -> int:
+    absolute = _absolute_path(path)
+    descriptor = os.open(
+        absolute.anchor,
+        os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC,
+    )
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_descriptor = os.open(
+                    component,
+                    os.O_RDONLY
+                    | _O_DIRECTORY
+                    | _O_NOFOLLOW
+                    | _O_CLOEXEC,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError as exc:
+                if not create:
+                    raise ValueError(
+                        f"{context} could not be opened securely"
+                    ) from exc
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    next_descriptor = os.open(
+                        component,
+                        os.O_RDONLY
+                        | _O_DIRECTORY
+                        | _O_NOFOLLOW
+                        | _O_CLOEXEC,
+                        dir_fd=descriptor,
+                    )
+                except OSError as create_exc:
+                    raise ValueError(
+                        f"{context} contains an unsafe component"
+                    ) from create_exc
+            except OSError as exc:
+                raise ValueError(
+                    f"{context} contains a symlink or unsafe component"
+                ) from exc
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _publish_bundle(
     destination: Path,
     *,
@@ -781,14 +871,15 @@ def _publish_bundle(
     predictions_bytes: bytes,
     metadata_bytes: bytes,
 ) -> None:
+    destination = _absolute_path(destination)
     _preflight_path(destination, "score output path")
     if destination == destination.parent or not destination.name:
         raise ValueError("score output must name a bundle directory")
-    destination.parent.mkdir(parents=True, exist_ok=True)
     _preflight_path(destination.parent, "score output parent")
-    parent_fd = os.open(
+    parent_fd = _open_directory_components(
         destination.parent,
-        os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC,
+        create=True,
+        context="score output parent",
     )
     bundle_fd = -1
     created_files: list[str] = []
@@ -867,11 +958,25 @@ def _preflight_path(path: Path, context: str) -> None:
         raise ValueError(f"{context} contains a NUL byte")
     lowered = raw.lower()
     if _FORMAL_TEST_RECORD_SHA256 in lowered:
-        raise ValueError(f"{context} contains the formal-test record digest")
-    if any(part.lower() == "test_images" for part in Path(raw).parts):
-        raise ValueError(f"{context} contains a test_images component")
-    if _SUBJECT_TEST_FILENAME_RE.fullmatch(Path(raw).name):
-        raise ValueError(f"{context} names a formal-test subject manifest")
+        raise ValueError(
+            f"{context} forbidden: contains the formal-test record digest"
+        )
+    for component in Path(raw).parts:
+        normalized = _normalize_semantic_name(component)
+        if normalized in {
+            "formal_input",
+            "formal_refit",
+            "formal_test",
+            "test_images",
+            "val_confirm",
+        }:
+            raise ValueError(
+                f"{context} forbidden: contains {component!r}"
+            )
+        if _SUBJECT_TEST_FILENAME_RE.fullmatch(component):
+            raise ValueError(
+                f"{context} forbidden: formal-test subject manifest"
+            )
 
     absolute = _absolute_path(path)
     current = Path(absolute.anchor)
@@ -887,22 +992,52 @@ def _preflight_path(path: Path, context: str) -> None:
             raise ValueError(f"{context} contains a symlink component")
 
 
-def _read_regular_bytes(path: Path, *, context: str, limit: int) -> bytes:
-    _preflight_path(path, context)
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC,
+def _open_relative_regular(
+    directory_fd: int,
+    name: str,
+    *,
+    context: str,
+) -> int:
+    if not name or Path(name).name != name:
+        raise ValueError(f"{context} must be a single filename")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"{context} could not be opened securely") from exc
+    value = os.fstat(descriptor)
+    if not stat.S_ISREG(value.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"{context} must be a regular file")
+    return descriptor
+
+
+def _read_relative_regular_bytes(
+    directory_fd: int,
+    name: str,
+    *,
+    context: str,
+    limit: int,
+) -> tuple[bytes, os.stat_result, str]:
+    descriptor = _open_relative_regular(
+        directory_fd,
+        name,
+        context=context,
     )
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{context} must be a regular file")
         if before.st_size > limit:
             raise ValueError(f"{context} exceeds its size limit")
         chunks: list[bytes] = []
         size = 0
         while True:
-            chunk = os.read(descriptor, min(1024 * 1024, limit + 1 - size))
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, limit + 1 - size),
+            )
             if not chunk:
                 break
             chunks.append(chunk)
@@ -910,11 +1045,153 @@ def _read_regular_bytes(path: Path, *, context: str, limit: int) -> bytes:
             if size > limit:
                 raise ValueError(f"{context} exceeds its size limit")
         after = os.fstat(descriptor)
-        if _stat_identity(before) != _stat_identity(after):
-            raise ValueError(f"{context} changed while it was read")
-        return b"".join(chunks)
+        _require_stable_stat(before, after, context)
+        raw = b"".join(chunks)
+        return raw, after, _sha256_bytes(raw)
     finally:
         os.close(descriptor)
+
+
+def _load_relative_similarity(
+    directory_fd: int,
+    verified: VerifiedArtifact,
+) -> np.ndarray:
+    descriptor = _open_relative_regular(
+        directory_fd,
+        "similarity.npy",
+        context="verified score payload",
+    )
+    try:
+        before = os.fstat(descriptor)
+        digest = _sha256_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        _require_stable_stat(before, after, "verified score payload")
+        _require_verified_file(
+            after,
+            digest,
+            expected_identity=(
+                verified.device,
+                verified.inode,
+                verified.size,
+                verified.mtime_ns,
+                verified.ctime_ns,
+            ),
+            expected_sha256=verified.payload_sha256,
+            context="verified payload",
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            try:
+                loaded = np.load(handle, allow_pickle=False)
+            except (OSError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "verified score payload is not a safe NumPy array"
+                ) from exc
+            if not isinstance(loaded, np.ndarray):
+                raise ValueError(
+                    "verified score payload must contain exactly one array"
+                )
+            post_load = os.fstat(handle.fileno())
+            _require_verified_file(
+                post_load,
+                verified.payload_sha256,
+                expected_identity=(
+                    verified.device,
+                    verified.inode,
+                    verified.size,
+                    verified.mtime_ns,
+                    verified.ctime_ns,
+                ),
+                expected_sha256=verified.payload_sha256,
+                context="verified payload",
+            )
+            post_digest = _sha256_descriptor(handle.fileno())
+            final = os.fstat(handle.fileno())
+            _require_stable_stat(
+                post_load,
+                final,
+                "verified score payload",
+            )
+            _require_verified_file(
+                final,
+                post_digest,
+                expected_identity=(
+                    verified.device,
+                    verified.inode,
+                    verified.size,
+                    verified.mtime_ns,
+                    verified.ctime_ns,
+                ),
+                expected_sha256=verified.payload_sha256,
+                context="verified payload",
+            )
+            return loaded
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _require_verified_file(
+    value: os.stat_result,
+    digest: str,
+    *,
+    expected_identity: tuple[int, int, int, int, int],
+    expected_sha256: str,
+    context: str,
+) -> None:
+    if _stat_identity(value) != expected_identity:
+        raise ValueError(f"{context} file identity mismatch")
+    if digest != expected_sha256:
+        raise ValueError(f"{context} SHA-256 digest mismatch")
+
+
+def _require_stable_stat(
+    before: os.stat_result,
+    after: os.stat_result,
+    context: str,
+) -> None:
+    if _stat_identity(before) != _stat_identity(after):
+        raise ValueError(f"{context} changed while it was read")
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def _require_bundle_path_identity(
+    bundle: Path,
+    expected: os.stat_result,
+) -> None:
+    descriptor = _open_directory_components(
+        bundle,
+        create=False,
+        context="score bundle",
+    )
+    try:
+        if _stat_identity(os.fstat(descriptor)) != _stat_identity(expected):
+            raise ValueError("score bundle directory identity changed")
+    finally:
+        os.close(descriptor)
+
+
+def _immutable_matrix_copy(matrix: np.ndarray) -> np.ndarray:
+    immutable_bytes = matrix.tobytes(order="C")
+    immutable = np.ndarray(
+        matrix.shape,
+        dtype=matrix.dtype,
+        buffer=immutable_bytes,
+        order="C",
+    )
+    if immutable.flags.writeable:
+        raise AssertionError("bytes-backed score matrix must be immutable")
+    return immutable
 
 
 def _parse_json_object(raw: bytes, context: str) -> dict[str, object]:
@@ -962,6 +1239,8 @@ def _reject_formal_scope_markers(
     *,
     path: tuple[str, ...],
 ) -> None:
+    if path == ("source_records",):
+        _reject_strict_source_records(value)
     if isinstance(value, Mapping):
         for key, child in value.items():
             if not isinstance(key, str):
@@ -992,6 +1271,131 @@ def _reject_formal_scope_markers(
             raise ValueError("source_records contain the formal-test digest")
         if any(part.lower() == "test_images" for part in re.split(r"[\\/]", value)):
             raise ValueError("source_records contain a test_images path")
+
+
+def _reject_strict_source_records(
+    value: object,
+    *,
+    semantic_path: tuple[str, ...] = (),
+    test_context: bool = False,
+) -> None:
+    if isinstance(value, Mapping):
+        normalized_items: list[tuple[str, object]] = []
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError("source_records keys must be strings")
+            _reject_forbidden_source_text(key)
+            normalized_items.append(
+                (_normalize_semantic_name(key), child)
+            )
+        mapping_context = test_context or any(
+            _is_test_or_formal_context(key)
+            or (
+                key in {"role", "scope", "split", "split_role", "subset"}
+                and isinstance(child, str)
+                and _normalize_semantic_name(child)
+                in {
+                    "formal_input",
+                    "formal_refit",
+                    "formal_test",
+                    "test",
+                    "val_confirm",
+                }
+            )
+            for key, child in normalized_items
+        )
+        for normalized, child in normalized_items:
+            if (
+                normalized in {"role", "scope", "split", "split_role", "subset"}
+                and isinstance(child, str)
+                and _normalize_semantic_name(child)
+                in {
+                    "formal_input",
+                    "formal_refit",
+                    "formal_test",
+                    "test",
+                    "val_confirm",
+                }
+            ):
+                raise PermissionError(
+                    "source_records contain a non-val-dev scope marker"
+                )
+            child_context = (
+                mapping_context or _is_test_or_formal_context(normalized)
+            )
+            if child_context and _has_sensitive_output_term(normalized):
+                raise PermissionError(
+                    "source_records contain test/formal score outputs"
+                )
+            _reject_strict_source_records(
+                child,
+                semantic_path=semantic_path + (normalized,),
+                test_context=child_context,
+            )
+        return
+    if isinstance(value, list):
+        for child in value:
+            _reject_strict_source_records(
+                child,
+                semantic_path=semantic_path,
+                test_context=test_context,
+            )
+        return
+    if isinstance(value, str):
+        _reject_forbidden_source_text(value)
+        path = semantic_path + (_normalize_semantic_name(value),)
+        if (
+            test_context
+            or any(_is_test_or_formal_context(item) for item in path)
+        ) and any(_has_sensitive_output_term(item) for item in path):
+            raise PermissionError(
+                "source_records contain test/formal score outputs"
+            )
+
+
+def _normalize_semantic_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _is_test_or_formal_context(value: str) -> bool:
+    return (
+        value in {"formal", "formal_input", "formal_refit", "formal_test", "test"}
+        or value.startswith("formal_")
+        or value.startswith("test_")
+        or value.endswith("_test")
+    )
+
+
+def _has_sensitive_output_term(value: str) -> bool:
+    return any(
+        term in value
+        for term in (
+            "metric",
+            "prediction",
+            "rank",
+            "score",
+            "top1",
+            "top_1",
+            "top5",
+            "top_5",
+        )
+    )
+
+
+def _reject_forbidden_source_text(value: str) -> None:
+    lowered = value.lower()
+    if _FORMAL_TEST_RECORD_SHA256 in lowered:
+        raise ValueError("source_records contain the formal-test digest")
+    components = re.split(r"[\\/]+", value)
+    if any(part.lower() == "test_images" for part in components):
+        raise ValueError("source_records contain a test_images path")
+    if any(
+        _SUBJECT_TEST_FILENAME_RE.fullmatch(part) is not None
+        for part in components
+    ):
+        raise ValueError(
+            "source_records contain a formal-test subject manifest"
+        )
 
 
 def _strict_keys(
