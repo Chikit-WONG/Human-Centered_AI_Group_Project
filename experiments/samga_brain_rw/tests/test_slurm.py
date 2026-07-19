@@ -29,6 +29,16 @@ QUEUE_COMMAND = [
     "%.10i %.14P %.10u %.2t %.10M %.6D %R",
 ]
 
+JOB_ENVIRONMENT_NAMES = (
+    "SAMGA_JOB_MAP",
+    "SAMGA_JOB_MAP_SHA256",
+    "SAMGA_JOB_ROW_SHA256",
+    "SAMGA_JOB_CLAIM",
+    "SAMGA_JOB_ARRAY_INDEX",
+    "SAMGA_JOB_ARRAY_MIN",
+    "SAMGA_JOB_ARRAY_MAX",
+)
+
 
 def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
@@ -122,6 +132,42 @@ def _row(
 def _rehash(payload: dict[str, object]) -> None:
     body = {key: value for key, value in payload.items() if key != "payload_sha256"}
     payload["payload_sha256"] = sha256_json(body)
+
+
+def _claimed_job_environment(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    Path,
+    dict[str, str],
+]:
+    map_path = tmp_path / "env-map.json"
+    payload = jobmap_module.write_job_map([_row(tmp_path)], map_path)
+    row = payload["rows"][0]
+    claim = jobmap_module.claim_job_row(payload, row)
+    array_min, array_max = payload["array_bounds"]
+    environment = {
+        "SAMGA_JOB_MAP": str(map_path),
+        "SAMGA_JOB_MAP_SHA256": str(payload["payload_sha256"]),
+        "SAMGA_JOB_ROW_SHA256": sha256_json(row),
+        "SAMGA_JOB_CLAIM": str(claim.path),
+        "SAMGA_JOB_ARRAY_INDEX": str(row["array_index"]),
+        "SAMGA_JOB_ARRAY_MIN": str(array_min),
+        "SAMGA_JOB_ARRAY_MAX": str(array_max),
+    }
+    return payload, row, map_path, environment
+
+
+def _install_job_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    for name in JOB_ENVIRONMENT_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
 
 
 def test_static_launchers_lock_gpu_logs_environment_and_conda(
@@ -376,6 +422,176 @@ def test_selected_row_requires_exact_map_hash_bounds_and_index(
             array_min=0,
             array_max=1,
         )
+
+
+def test_run_row_exports_exact_array_context_to_child(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "run-row-map.json"
+    payload = jobmap_module.write_job_map(
+        [
+            _row(tmp_path, subject=1, seed=42),
+            _row(tmp_path, subject=5, seed=43),
+        ],
+        map_path,
+    )
+    row = payload["rows"][1]
+    output_hashes = {"metrics_sha256": _h("run-row-metrics")}
+    observed: dict[str, str] = {}
+
+    def fake_run(command: object, **kwargs: object) -> SimpleNamespace:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        observed.update(
+            {
+                name: environment[name]
+                for name in JOB_ENVIRONMENT_NAMES
+            }
+        )
+        assert command == row["argv"]
+        assert kwargs["check"] is False
+        jobmap_module.complete_job_row(payload, row, output_hashes)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(jobmap_module.subprocess, "run", fake_run)
+    result = jobmap_module.main(
+        [
+            "run-row",
+            "--job-map",
+            str(map_path),
+            "--job-map-sha256",
+            str(payload["payload_sha256"]),
+            "--array-index",
+            "1",
+            "--array-min",
+            "0",
+            "--array-max",
+            "1",
+        ]
+    )
+    assert result == 0
+    assert observed == {
+        "SAMGA_JOB_MAP": str(map_path),
+        "SAMGA_JOB_MAP_SHA256": str(payload["payload_sha256"]),
+        "SAMGA_JOB_ROW_SHA256": sha256_json(row),
+        "SAMGA_JOB_CLAIM": observed["SAMGA_JOB_CLAIM"],
+        "SAMGA_JOB_ARRAY_INDEX": "1",
+        "SAMGA_JOB_ARRAY_MIN": "0",
+        "SAMGA_JOB_ARRAY_MAX": "1",
+    }
+    assert Path(observed["SAMGA_JOB_CLAIM"]).is_file()
+    assert jobmap_module.completion_is_valid(payload, row)
+
+
+def test_complete_env_reloads_and_completes_only_selected_claim(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload, row, _, environment = _claimed_job_environment(
+        jobmap_module,
+        tmp_path,
+    )
+    _install_job_environment(monkeypatch, environment)
+    output_hashes = {"metrics_sha256": _h("complete-env-metrics")}
+
+    result = jobmap_module.main(
+        [
+            "complete-env",
+            "--output-hashes",
+            json.dumps(output_hashes),
+        ]
+    )
+
+    assert result == 0
+    assert jobmap_module.completion_is_valid(payload, row)
+
+
+@pytest.mark.parametrize("missing_name", JOB_ENVIRONMENT_NAMES)
+def test_complete_env_rejects_each_missing_context_variable(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    _, row, _, environment = _claimed_job_environment(
+        jobmap_module,
+        tmp_path,
+    )
+    _install_job_environment(monkeypatch, environment)
+    monkeypatch.delenv(missing_name)
+
+    with pytest.raises(ValueError, match=missing_name):
+        jobmap_module.main(
+            [
+                "complete-env",
+                "--output-hashes",
+                json.dumps({"metrics_sha256": _h("missing-env")}),
+            ]
+        )
+    assert not Path(row["completion_path"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "match"),
+    (
+        ("map-path", "SAMGA_JOB_MAP|sealed|read"),
+        ("map-sha256", "hash"),
+        ("row-sha256", "row hash"),
+        ("claim-path", "claim path"),
+        ("array-index-invalid", "SAMGA_JOB_ARRAY_INDEX"),
+        ("array-index-range", "index|range"),
+        ("array-min", "bounds"),
+        ("array-max", "bounds"),
+    ),
+)
+def test_complete_env_rejects_tampered_context(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tamper: str,
+    match: str,
+) -> None:
+    _, row, _, environment = _claimed_job_environment(
+        jobmap_module,
+        tmp_path,
+    )
+    if tamper == "map-path":
+        environment["SAMGA_JOB_MAP"] = str(tmp_path / "missing-map.json")
+    elif tamper == "map-sha256":
+        environment["SAMGA_JOB_MAP_SHA256"] = _h("tampered-map")
+    elif tamper == "row-sha256":
+        environment["SAMGA_JOB_ROW_SHA256"] = _h("tampered-row")
+    elif tamper == "claim-path":
+        other_map = jobmap_module.build_job_map(
+            [_row(tmp_path, subject=5, seed=43)]
+        )
+        other_row = other_map["rows"][0]
+        other_claim = jobmap_module.claim_job_row(other_map, other_row)
+        environment["SAMGA_JOB_CLAIM"] = str(other_claim.path)
+    elif tamper == "array-index-invalid":
+        environment["SAMGA_JOB_ARRAY_INDEX"] = "not-an-integer"
+    elif tamper == "array-index-range":
+        environment["SAMGA_JOB_ARRAY_INDEX"] = "1"
+    elif tamper == "array-min":
+        environment["SAMGA_JOB_ARRAY_MIN"] = "1"
+    elif tamper == "array-max":
+        environment["SAMGA_JOB_ARRAY_MAX"] = "1"
+    else:
+        raise AssertionError(tamper)
+    _install_job_environment(monkeypatch, environment)
+
+    with pytest.raises(ValueError, match=match):
+        jobmap_module.main(
+            [
+                "complete-env",
+                "--output-hashes",
+                json.dumps({"metrics_sha256": _h("tampered-env")}),
+            ]
+        )
+    assert not Path(row["completion_path"]).exists()
 
 
 def test_completion_is_idempotent_and_prevents_resubmission(

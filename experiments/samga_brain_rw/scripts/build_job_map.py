@@ -1054,6 +1054,9 @@ def _run_selected_row(args: argparse.Namespace) -> int:
             "SAMGA_JOB_MAP_SHA256": str(job_map["payload_sha256"]),
             "SAMGA_JOB_ROW_SHA256": row_sha256,
             "SAMGA_JOB_CLAIM": str(claim.path),
+            "SAMGA_JOB_ARRAY_INDEX": str(args.array_index),
+            "SAMGA_JOB_ARRAY_MIN": str(args.array_min),
+            "SAMGA_JOB_ARRAY_MAX": str(args.array_max),
         }
     )
     if args.confirmation_seal is not None:
@@ -1082,6 +1085,77 @@ def _add_selection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--array-max", required=True, type=int)
 
 
+def _require_job_environment(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        raise ValueError(f"missing required environment variable {name}")
+    return value
+
+
+def _job_environment_index(name: str) -> int:
+    text = _require_job_environment(name)
+    if (
+        not text.isascii()
+        or not text.isdecimal()
+        or str(int(text)) != text
+    ):
+        raise ValueError(
+            f"{name} must be a canonical non-negative integer"
+        )
+    return int(text)
+
+
+def complete_job_row_from_environment(
+    output_hashes: Mapping[str, str],
+) -> JobCompletion:
+    """Complete only the row and claim reconstructed from the job environment."""
+
+    job_map_path = Path(_require_job_environment("SAMGA_JOB_MAP"))
+    expected_map_sha256 = _require_sha256(
+        _require_job_environment("SAMGA_JOB_MAP_SHA256"),
+        "SAMGA_JOB_MAP_SHA256",
+    )
+    job_map = load_job_map(
+        job_map_path,
+        expected_sha256=expected_map_sha256,
+    )
+    array_index = _job_environment_index("SAMGA_JOB_ARRAY_INDEX")
+    array_min = _job_environment_index("SAMGA_JOB_ARRAY_MIN")
+    array_max = _job_environment_index("SAMGA_JOB_ARRAY_MAX")
+    row = select_job_row(
+        job_map,
+        expected_sha256=expected_map_sha256,
+        array_index=array_index,
+        array_min=array_min,
+        array_max=array_max,
+    )
+    expected_row_sha256 = _require_sha256(
+        _require_job_environment("SAMGA_JOB_ROW_SHA256"),
+        "SAMGA_JOB_ROW_SHA256",
+    )
+    actual_row_sha256 = sha256_json(row)
+    if actual_row_sha256 != expected_row_sha256:
+        raise ValueError("selected row hash does not match SAMGA_JOB_ROW_SHA256")
+
+    _, checked_row, map_sha256, row_sha256 = _row_context(job_map, row)
+    claims = _load_claim_chain(
+        checked_row,
+        map_sha256=map_sha256,
+        row_sha256=row_sha256,
+    )
+    if not claims:
+        raise ValueError("SAMGA_JOB_CLAIM has no current claim")
+    current_claim = claims[-1]
+    submitted_claim_path = Path(
+        _require_job_environment("SAMGA_JOB_CLAIM")
+    )
+    if submitted_claim_path != current_claim.path:
+        raise ValueError(
+            "SAMGA_JOB_CLAIM claim path does not match the selected row"
+        )
+    return complete_job_row(job_map, checked_row, output_hashes)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1107,6 +1181,12 @@ def _parser() -> argparse.ArgumentParser:
     complete = subparsers.add_parser("complete", help="complete one claimed row")
     _add_selection_arguments(complete)
     complete.add_argument("--output-hashes", required=True)
+
+    complete_env = subparsers.add_parser(
+        "complete-env",
+        help="complete the exact row and claim bound in the job environment",
+    )
+    complete_env.add_argument("--output-hashes", required=True)
 
     run_row = subparsers.add_parser("run-row", help="run one exact array row")
     _add_selection_arguments(run_row)
@@ -1153,6 +1233,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "run-row":
         return _run_selected_row(args)
+    if args.command == "complete-env":
+        try:
+            output_hashes = json.loads(args.output_hashes)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "--output-hashes must contain valid JSON"
+            ) from exc
+        if not isinstance(output_hashes, dict):
+            raise ValueError("--output-hashes must decode to an object")
+        completion = complete_job_row_from_environment(output_hashes)
+        print(completion.path)
+        return 0
 
     payload, row = _load_selected(args)
     if args.command == "select":
