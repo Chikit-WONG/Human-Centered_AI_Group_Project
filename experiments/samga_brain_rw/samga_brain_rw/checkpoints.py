@@ -148,12 +148,16 @@ _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 @dataclass(frozen=True)
-class _LoadedCheckpoint:
+class VerifiedEpochCheckpoint:
+    """A transport-, schema-, state-, and identity-verified epoch checkpoint."""
+
     path: Path
     sha256: str
     epoch: int
+    global_step: int
     subject: int
     seed: int
+    config_id: str
     config_sha256: str
     schedule_sha256: str
     optimizer_stage: str
@@ -162,6 +166,13 @@ class _LoadedCheckpoint:
     candidate_spec_sha256: str
     input_bundle_sha256: str
     run_key: str
+    payload: Mapping[str, object]
+    input_hashes: Mapping[str, object]
+    environment: Mapping[str, object]
+    run_manifest: Mapping[str, object]
+    candidate_spec: Mapping[str, object]
+    runtime_state: Mapping[str, object]
+    retention: Mapping[str, object]
     model_state_dict: dict[str, torch.Tensor]
 
 
@@ -696,7 +707,9 @@ def _validate_checkpoint_bundle(
     )
 
 
-def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
+def verify_epoch_checkpoint(path: Path) -> VerifiedEpochCheckpoint:
+    """Fully verify one development epoch checkpoint bundle."""
+
     normalized = validate_development_checkpoint_path(
         Path(path),
         "checkpoint path",
@@ -716,12 +729,47 @@ def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
         trajectory,
         state,
     ) = _validate_checkpoint_bundle(loaded.payload, loaded.envelope)
-    return _LoadedCheckpoint(
+    input_hashes = _require_mapping(
+        loaded.payload["input_hashes"],
+        "checkpoint input_hashes",
+    )
+    environment = _require_mapping(
+        loaded.payload["environment"],
+        "checkpoint environment",
+    )
+    run_manifest = _require_mapping(
+        loaded.payload["run_manifest"],
+        "checkpoint run manifest",
+    )
+    candidate_spec = _require_mapping(
+        loaded.payload["candidate_spec"],
+        "checkpoint candidate_spec",
+    )
+    runtime_state = _require_mapping(
+        loaded.payload["runtime_state"],
+        "checkpoint runtime state",
+    )
+    retention = _require_mapping(
+        loaded.payload["retention"],
+        "checkpoint retention",
+    )
+    config_id = run_manifest["config_id"]
+    if not isinstance(config_id, str) or not config_id:
+        raise ValueError("checkpoint config_id must be nonempty")
+    run_key = run_manifest["run_key"]
+    if not isinstance(run_key, str) or not run_key:
+        raise ValueError("checkpoint run_key must be nonempty")
+    return VerifiedEpochCheckpoint(
         path=normalized,
         sha256=loaded.sha256,
         epoch=epoch,
+        global_step=_require_nonnegative_integer(
+            loaded.payload["global_step"],
+            "checkpoint global_step",
+        ),
         subject=subject,
         seed=seed,
+        config_id=config_id,
         config_sha256=config,
         schedule_sha256=schedule,
         optimizer_stage=optimizer_stage,
@@ -731,30 +779,32 @@ def _load_checkpoint(path: Path) -> _LoadedCheckpoint:
             "checkpoint data order",
         ),
         candidate_spec_sha256=_require_sha256(
-            _require_mapping(
-                loaded.payload["candidate_spec"],
-                "checkpoint candidate_spec",
-            )["candidate_spec_sha256"],
+            candidate_spec["candidate_spec_sha256"],
             "checkpoint candidate spec",
         ),
         input_bundle_sha256=_require_sha256(
-            _require_mapping(
-                loaded.payload["candidate_spec"],
-                "checkpoint candidate_spec",
-            )["input_bundle_sha256"],
+            candidate_spec["input_bundle_sha256"],
             "checkpoint input bundle",
         ),
-        run_key=str(
-            _require_mapping(
-                loaded.payload["run_manifest"],
-                "checkpoint run manifest",
-            )["run_key"]
-        ),
+        run_key=run_key,
+        payload=loaded.payload,
+        input_hashes=input_hashes,
+        environment=environment,
+        run_manifest=run_manifest,
+        candidate_spec=candidate_spec,
+        runtime_state=runtime_state,
+        retention=retention,
         model_state_dict=state,
     )
 
 
-def _validate_window(paths: Sequence[Path]) -> tuple[_LoadedCheckpoint, ...]:
+def _load_checkpoint(path: Path) -> VerifiedEpochCheckpoint:
+    return verify_epoch_checkpoint(path)
+
+
+def _validate_window(
+    paths: Sequence[Path],
+) -> tuple[VerifiedEpochCheckpoint, ...]:
     if isinstance(paths, (str, bytes, bytearray)):
         raise TypeError("checkpoint paths must be a sequence")
     normalized = tuple(Path(path) for path in paths)
@@ -806,7 +856,9 @@ def _validate_window(paths: Sequence[Path]) -> tuple[_LoadedCheckpoint, ...]:
     return checkpoints
 
 
-def _arithmetic(checkpoints: Sequence[_LoadedCheckpoint]) -> dict[str, torch.Tensor]:
+def _arithmetic(
+    checkpoints: Sequence[VerifiedEpochCheckpoint],
+) -> dict[str, torch.Tensor]:
     reference = checkpoints[0].model_state_dict
     result: dict[str, torch.Tensor] = {}
     for key, original in reference.items():
@@ -839,7 +891,9 @@ class _SwaCarrier(nn.Module):
                 destination.copy_(source)
 
 
-def _swa(checkpoints: Sequence[_LoadedCheckpoint]) -> dict[str, torch.Tensor]:
+def _swa(
+    checkpoints: Sequence[VerifiedEpochCheckpoint],
+) -> dict[str, torch.Tensor]:
     reference = checkpoints[0].model_state_dict
     floating_keys = tuple(
         key for key, value in reference.items() if torch.is_floating_point(value)
@@ -1191,6 +1245,7 @@ def write_averaged_checkpoint_exclusive(
 
 __all__ = [
     "AVERAGING_CANDIDATES",
+    "VerifiedEpochCheckpoint",
     "average_state_dicts",
     "build_averaged_checkpoint",
     "hash_averaged_checkpoint_payload",
@@ -1198,6 +1253,7 @@ __all__ = [
     "load_averaged_checkpoint",
     "swa_state_dicts",
     "validate_development_checkpoint_path",
+    "verify_epoch_checkpoint",
     "verify_averaged_checkpoint_payload",
     "write_averaged_checkpoint_exclusive",
 ]

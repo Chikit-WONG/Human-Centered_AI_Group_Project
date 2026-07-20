@@ -402,16 +402,24 @@ def _real_run_summary(
         if smoke
         else "checkpoint_epoch060.pt"
     )
-    checkpoint_sha256 = _h(f"checkpoint:{arguments.mode}")
+    checkpoint_hashes = (
+        {checkpoint_name: _h(f"checkpoint:{arguments.mode}")}
+        if smoke
+        else {
+            f"checkpoint_epoch{epoch:03d}.pt": _h(
+                f"checkpoint:full:{epoch}"
+            )
+            for epoch in range(51, 61)
+        }
+    )
+    checkpoint_sha256 = checkpoint_hashes[checkpoint_name]
     return {
         **_real_run_manifest(arguments),
         "completed": not smoke,
         "global_step": global_step,
         "final_checkpoint": checkpoint_name,
         "final_checkpoint_sha256": checkpoint_sha256,
-        "checkpoint_hashes": {
-            checkpoint_name: checkpoint_sha256,
-        },
+        "checkpoint_hashes": checkpoint_hashes,
         "in_loop_score_directory": "in_loop",
         "max_train_steps": arguments.max_train_steps,
         "resume_source_checkpoint_sha256": (
@@ -421,6 +429,52 @@ def _real_run_summary(
         "top1_rate": 0.1,
         "top5_rate": 0.5,
     }
+
+
+def _legacy_stage0_run_summary(
+    arguments: object,
+) -> dict[str, object]:
+    summary = _real_run_summary(arguments)
+    summary["git_sha"] = (
+        "aed25e2e5756cc1f08a859d385ffb116364fa2f9"
+    )
+    body = {
+        key: summary[key]
+        for key in _RUN_MANIFEST_BASE_KEYS_FOR_TEST
+        if key != "run_manifest_sha256"
+    }
+    summary["run_manifest_sha256"] = sha256_json(body)
+    summary["checkpoint_hashes"] = {
+        f"checkpoint_epoch{epoch:03d}.pt": _h(
+            f"legacy-checkpoint:{epoch}"
+        )
+        for epoch in range(1, 61)
+    }
+    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
+        "checkpoint_epoch060.pt"
+    ]
+    return summary
+
+
+_RUN_MANIFEST_BASE_KEYS_FOR_TEST = frozenset(
+    {
+        "schema_version",
+        "payload_type",
+        "stage",
+        "subject",
+        "seed",
+        "config_id",
+        "config_sha256",
+        "protocol_sha256",
+        "cache_sha256",
+        "git_sha",
+        "upstream_sha",
+        "data_order_sha256",
+        "candidate_spec_sha256",
+        "run_key",
+        "run_manifest_sha256",
+    }
+)
 
 
 def test_runner_accepts_exact_real_smoke_and_full_run_summary_shapes(
@@ -437,6 +491,537 @@ def test_runner_accepts_exact_real_smoke_and_full_run_summary_shapes(
         assert (
             runner_module._validate_run_manifest(summary, arguments)
             == summary
+        )
+
+
+def test_run_manifest_accepts_only_exact_sealed_stage0_legacy_retention(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(
+        _argv(tmp_path, mode="full", stage=0)
+    )
+    legacy = _legacy_stage0_run_summary(arguments)
+    legacy_file_sha256 = hashlib.sha256(
+        canonical_json_bytes(legacy) + b"\n"
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="checkpoint.*retention|51.*60"):
+        runner_module._validate_run_manifest(
+            legacy,
+            arguments,
+            run_manifest_file_sha256=legacy_file_sha256,
+        )
+    monkeypatch.setattr(
+        runner_module,
+        "_LEGACY_STAGE0_RUN_MANIFEST_FILE_SHA256",
+        {arguments.run_key: legacy_file_sha256},
+    )
+    assert (
+        runner_module._validate_run_manifest(
+            legacy,
+            arguments,
+            run_manifest_file_sha256=legacy_file_sha256,
+        )
+        == legacy
+    )
+
+    missing = copy.deepcopy(legacy)
+    del missing["checkpoint_hashes"]["checkpoint_epoch001.pt"]
+    with pytest.raises(
+        ValueError,
+        match="legacy|checkpoint.*retention|1.*60|51.*60",
+    ):
+        runner_module._validate_run_manifest(
+            missing,
+            arguments,
+            run_manifest_file_sha256=legacy_file_sha256,
+        )
+
+    nonlegacy = copy.deepcopy(legacy)
+    nonlegacy["git_sha"] = "b" * 40
+    body = {
+        key: nonlegacy[key]
+        for key in runner_module._RUN_MANIFEST_BASE_KEYS
+        if key != "run_manifest_sha256"
+    }
+    nonlegacy["run_manifest_sha256"] = sha256_json(body)
+    with pytest.raises(ValueError, match="checkpoint.*retention|51.*60"):
+        runner_module._validate_run_manifest(nonlegacy, arguments)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "full_missing_epoch_51",
+        "full_extra_epoch_50",
+        "smoke_extra_previous",
+    ),
+)
+def test_run_manifest_rejects_noncanonical_checkpoint_retention(
+    runner_module: ModuleType,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    mode = "smoke" if mutation == "smoke_extra_previous" else "full"
+    arguments = runner_module.parse_arguments(
+        _argv(
+            tmp_path,
+            mode=mode,
+            max_train_steps=1 if mode == "smoke" else None,
+        )
+    )
+    summary = _real_run_summary(arguments)
+    hashes = summary["checkpoint_hashes"]
+    assert isinstance(hashes, dict)
+    if mutation == "full_missing_epoch_51":
+        del hashes["checkpoint_epoch051.pt"]
+    elif mutation == "full_extra_epoch_50":
+        hashes["checkpoint_epoch050.pt"] = _h("extra")
+    elif mutation == "smoke_extra_previous":
+        hashes["checkpoint_epoch001.pt"] = _h("previous")
+    else:
+        raise AssertionError("unknown mutation")
+
+    with pytest.raises(ValueError, match="checkpoint.*retention|epochs 51|latest"):
+        runner_module._validate_run_manifest(summary, arguments)
+
+
+@pytest.mark.parametrize("with_transient", (False, True))
+def test_smoke_manifest_accepts_late_partial_durable_prefix(
+    runner_module: ModuleType,
+    tmp_path: Path,
+    with_transient: bool,
+) -> None:
+    arguments = runner_module.parse_arguments(
+        _argv(tmp_path, mode="smoke", max_train_steps=525)
+    )
+    summary = _real_run_summary(arguments)
+    hashes = {
+        "checkpoint_epoch051.pt": _h("late-partial-51"),
+        "checkpoint_epoch052.pt": _h("late-partial-52"),
+    }
+    final_name = "checkpoint_epoch052.pt"
+    if with_transient:
+        final_name = "checkpoint_epoch053_step00000525.pt"
+        hashes[final_name] = _h("late-partial-53-step-525")
+    summary["checkpoint_hashes"] = hashes
+    summary["final_checkpoint"] = final_name
+    summary["final_checkpoint_sha256"] = hashes[final_name]
+
+    assert (
+        runner_module._validate_checkpoint_retention_manifest(
+            summary,
+            arguments,
+        )
+        == hashes
+    )
+
+
+def test_smoke_manifest_rejects_gapped_late_partial_durable_retention(
+    runner_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(
+        _argv(tmp_path, mode="smoke", max_train_steps=525)
+    )
+    summary = _real_run_summary(arguments)
+    final_name = "checkpoint_epoch053_step00000525.pt"
+    summary["checkpoint_hashes"] = {
+        "checkpoint_epoch051.pt": _h("late-partial-51"),
+        final_name: _h("late-partial-53-step-525"),
+    }
+    summary["final_checkpoint"] = final_name
+    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
+        final_name
+    ]
+
+    with pytest.raises(ValueError, match="contiguous|prefix|retention"):
+        runner_module._validate_checkpoint_retention_manifest(
+            summary,
+            arguments,
+        )
+
+
+def _write_validator_checkpoint_bundle(
+    output: Path,
+    name: str,
+) -> str:
+    checkpoint = output / name
+    checkpoint.write_bytes(f"checkpoint:{name}".encode("utf-8"))
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    (output / f"{name}.meta.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "complete": True,
+                "payload_sha256": digest,
+                "payload_type": "samga_brain_rw.epoch_checkpoint",
+                "schema_version": 1,
+                "scope": "train",
+            }
+        )
+        + b"\n"
+    )
+    return digest
+
+
+def _verified_checkpoint_fixture(
+    runner_module: ModuleType,
+    arguments: object,
+    summary: dict[str, object],
+    path: Path,
+    *,
+    retention: dict[str, object] | None = None,
+    run_key: str | None = None,
+    payload: dict[str, object] | None = None,
+    input_hashes: dict[str, object] | None = None,
+) -> SimpleNamespace:
+    match = runner_module._CHECKPOINT_NAME_RE.fullmatch(path.name)
+    assert match is not None
+    epoch = int(match.group("epoch"))
+    nested_manifest = {
+        key: summary[key]
+        for key in runner_module._RUN_MANIFEST_BASE_KEYS
+    }
+    effective_run_key = run_key or arguments.run_key
+    nested_manifest["run_key"] = effective_run_key
+    candidate_spec = {
+        "candidate_spec_sha256": summary["candidate_spec_sha256"],
+        "config_id": arguments.config_id,
+        "data_order_sha256": summary["data_order_sha256"],
+        "input_bundle_sha256": arguments.expected_input_bundle_sha256,
+        "run_key": effective_run_key,
+        "trajectory_sha256": _h("trajectory"),
+    }
+    runtime_state = {
+        "epoch_complete": match.group("partial") is None,
+        "resume_source_checkpoint_sha256": summary[
+            "resume_source_checkpoint_sha256"
+        ],
+    }
+    retention_value = retention or {
+        "policy": "retain_exact_epochs_51_through_60",
+        "required_epochs": list(range(51, 61)),
+        "retain_for_averaging": (
+            path.name in runner_module._FULL_RETAINED_CHECKPOINT_NAMES
+        ),
+    }
+    checkpoint_payload = payload if payload is not None else {}
+    candidate_value = dict(
+        checkpoint_payload.get("candidate_spec", {})
+    )
+    for key, value in candidate_spec.items():
+        candidate_value.setdefault(key, value)
+    checkpoint_payload["candidate_spec"] = candidate_value
+    checkpoint_payload.setdefault("environment", summary["environment"])
+    checkpoint_payload.setdefault("retention", retention_value)
+    checkpoint_payload.setdefault("run_manifest", nested_manifest)
+    checkpoint_payload.setdefault("runtime_state", runtime_state)
+    checkpoint_payload.setdefault("input_hashes", input_hashes or {})
+    return SimpleNamespace(
+        path=path.resolve(),
+        sha256=summary["checkpoint_hashes"][path.name],
+        epoch=epoch,
+        global_step=(
+            summary["global_step"]
+            if path.name == summary["final_checkpoint"]
+            else epoch * 10
+        ),
+        subject=arguments.subject,
+        seed=arguments.seed,
+        config_id=arguments.config_id,
+        config_sha256=arguments.expected_config_sha256,
+        schedule_sha256=runner_module.SCHEDULE_SHA256,
+        optimizer_stage="stage2",
+        trajectory_sha256=_h("trajectory"),
+        data_order_sha256=summary["data_order_sha256"],
+        candidate_spec_sha256=summary["candidate_spec_sha256"],
+        input_bundle_sha256=arguments.expected_input_bundle_sha256,
+        run_key=effective_run_key,
+        payload=MappingProxyType(checkpoint_payload),
+        input_hashes=checkpoint_payload["input_hashes"],
+        environment=checkpoint_payload["environment"],
+        run_manifest=checkpoint_payload["run_manifest"],
+        candidate_spec=checkpoint_payload["candidate_spec"],
+        runtime_state=checkpoint_payload["runtime_state"],
+        retention=checkpoint_payload["retention"],
+        model_state_dict={"weight": object()},
+    )
+
+
+@pytest.mark.parametrize("with_transient", (False, True))
+def test_smoke_output_validator_accepts_late_partial_durable_prefix(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    with_transient: bool,
+) -> None:
+    arguments = runner_module.parse_arguments(
+        _argv(tmp_path, mode="smoke", max_train_steps=525)
+    )
+    output = Path(arguments.output_dir)
+    output.mkdir()
+    summary = _real_run_summary(arguments)
+    names = [
+        "checkpoint_epoch051.pt",
+        "checkpoint_epoch052.pt",
+    ]
+    if with_transient:
+        names.append("checkpoint_epoch053_step00000525.pt")
+    hashes = {
+        name: _write_validator_checkpoint_bundle(output, name)
+        for name in names
+    }
+    summary["checkpoint_hashes"] = hashes
+    summary["final_checkpoint"] = names[-1]
+    summary["final_checkpoint_sha256"] = hashes[names[-1]]
+    monkeypatch.setattr(
+        runner_module,
+        "verify_epoch_checkpoint",
+        lambda path: _verified_checkpoint_fixture(
+            runner_module,
+            arguments,
+            summary,
+            path,
+        ),
+    )
+
+    observed_hashes, final = (
+        runner_module._validate_retained_checkpoint_outputs(
+            output,
+            summary,
+            arguments,
+        )
+    )
+
+    assert observed_hashes == hashes
+    assert final.path == (output / names[-1]).resolve()
+
+
+def test_full_output_validator_requires_exact_last_ten_checkpoint_bundles(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(_argv(tmp_path, mode="full"))
+    output = Path(arguments.output_dir)
+    output.mkdir()
+    summary = _real_run_summary(arguments)
+    summary["checkpoint_hashes"] = {
+        f"checkpoint_epoch{epoch:03d}.pt": (
+            _write_validator_checkpoint_bundle(
+                output,
+                f"checkpoint_epoch{epoch:03d}.pt",
+            )
+        )
+        for epoch in range(51, 61)
+    }
+    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
+        "checkpoint_epoch060.pt"
+    ]
+    loaded_epochs: list[int] = []
+
+    def verify_retained(path: Path) -> SimpleNamespace:
+        epoch = int(path.name.removeprefix("checkpoint_epoch")[:3])
+        loaded_epochs.append(epoch)
+        return _verified_checkpoint_fixture(
+            runner_module,
+            arguments,
+            summary,
+            path,
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "verify_epoch_checkpoint",
+        verify_retained,
+    )
+    stable_bytes = runner_module._stable_regular_bytes_at
+
+    def sidecar_bytes_only(
+        directory_fd: int,
+        name: str,
+        *,
+        context: str,
+    ) -> bytes:
+        assert name.endswith(".meta.json")
+        return stable_bytes(directory_fd, name, context=context)
+
+    monkeypatch.setattr(
+        runner_module,
+        "_stable_regular_bytes_at",
+        sidecar_bytes_only,
+    )
+
+    runner_module._validate_retained_checkpoint_outputs(
+        output,
+        summary,
+        arguments,
+    )
+    assert loaded_epochs == list(range(51, 61))
+
+    (output / "checkpoint_epoch051.pt.meta.json").unlink()
+    with pytest.raises(ValueError, match="checkpoint.*retention|sidecar|exact"):
+        runner_module._validate_retained_checkpoint_outputs(
+            output,
+            summary,
+            arguments,
+        )
+
+
+def test_full_output_validator_rejects_retained_payload_policy_drift(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(_argv(tmp_path, mode="full"))
+    output = Path(arguments.output_dir)
+    output.mkdir()
+    summary = _real_run_summary(arguments)
+    summary["checkpoint_hashes"] = {
+        f"checkpoint_epoch{epoch:03d}.pt": (
+            _write_validator_checkpoint_bundle(
+                output,
+                f"checkpoint_epoch{epoch:03d}.pt",
+            )
+        )
+        for epoch in range(51, 61)
+    }
+    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
+        "checkpoint_epoch060.pt"
+    ]
+
+    def verify_retained(path: Path) -> SimpleNamespace:
+        epoch = int(path.name.removeprefix("checkpoint_epoch")[:3])
+        return _verified_checkpoint_fixture(
+            runner_module,
+            arguments,
+            summary,
+            path,
+            retention={
+                "policy": "retain_exact_epochs_51_through_60",
+                "required_epochs": list(range(51, 61)),
+                "retain_for_averaging": epoch != 55,
+            },
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "verify_epoch_checkpoint",
+        verify_retained,
+    )
+
+    with pytest.raises(ValueError, match="retention.*epoch|epoch.*retention"):
+        runner_module._validate_retained_checkpoint_outputs(
+            output,
+            summary,
+            arguments,
+        )
+
+
+def test_full_output_validator_rejects_mixed_run_checkpoint_window(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(_argv(tmp_path, mode="full"))
+    output = Path(arguments.output_dir)
+    output.mkdir()
+    summary = _real_run_summary(arguments)
+    summary["checkpoint_hashes"] = {
+        f"checkpoint_epoch{epoch:03d}.pt": (
+            _write_validator_checkpoint_bundle(
+                output,
+                f"checkpoint_epoch{epoch:03d}.pt",
+            )
+        )
+        for epoch in range(51, 61)
+    }
+    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
+        "checkpoint_epoch060.pt"
+    ]
+
+    def verify_retained(path: Path) -> SimpleNamespace:
+        epoch = int(path.name.removeprefix("checkpoint_epoch")[:3])
+        run_key = arguments.run_key if epoch != 55 else "mixed-run"
+        return _verified_checkpoint_fixture(
+            runner_module,
+            arguments,
+            summary,
+            path,
+            run_key=run_key,
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "verify_epoch_checkpoint",
+        verify_retained,
+    )
+
+    with pytest.raises(ValueError, match="run.?key|mixed"):
+        runner_module._validate_retained_checkpoint_outputs(
+            output,
+            summary,
+            arguments,
+        )
+
+
+def test_smoke_output_validator_rejects_previous_transient_bundle(
+    runner_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(
+        _argv(tmp_path, mode="smoke", max_train_steps=1)
+    )
+    output = Path(arguments.output_dir)
+    output.mkdir()
+    summary = _real_run_summary(arguments)
+    final_name = str(summary["final_checkpoint"])
+    final_digest = _write_validator_checkpoint_bundle(
+        output,
+        final_name,
+    )
+    summary["final_checkpoint_sha256"] = final_digest
+    summary["checkpoint_hashes"] = {final_name: final_digest}
+    previous_name = "checkpoint_epoch001.pt"
+    _write_validator_checkpoint_bundle(output, previous_name)
+
+    with pytest.raises(ValueError, match="checkpoint.*retention|latest|exact"):
+        runner_module._validate_retained_checkpoint_outputs(
+            output,
+            summary,
+            arguments,
+        )
+
+
+def test_output_validator_rejects_symlinked_checkpoint_sidecar(
+    runner_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    arguments = runner_module.parse_arguments(
+        _argv(tmp_path, mode="smoke", max_train_steps=1)
+    )
+    output = Path(arguments.output_dir)
+    output.mkdir()
+    summary = _real_run_summary(arguments)
+    final_name = str(summary["final_checkpoint"])
+    final_digest = _write_validator_checkpoint_bundle(
+        output,
+        final_name,
+    )
+    summary["final_checkpoint_sha256"] = final_digest
+    summary["checkpoint_hashes"] = {final_name: final_digest}
+    sidecar = output / f"{final_name}.meta.json"
+    target = output / "sidecar-target.json"
+    sidecar.replace(target)
+    sidecar.symlink_to(target)
+
+    with pytest.raises(ValueError, match="sidecar|symlink|regular|safe"):
+        runner_module._validate_retained_checkpoint_outputs(
+            output,
+            summary,
+            arguments,
         )
 
 
@@ -597,32 +1182,16 @@ def test_checkpoint_identity_validator_runs_before_subset_crossbinding(
     ).hexdigest()
     run_manifest = _real_run_summary(arguments)
     run_manifest["final_checkpoint_sha256"] = checkpoint_sha256
-    payload = MappingProxyType({"scientific_identity": "drifted"})
-    envelope = MappingProxyType({"sidecar": "drifted"})
-    calls: list[tuple[object, object]] = []
+    calls: list[Path] = []
 
-    monkeypatch.setattr(
-        runner_module,
-        "load_typed_torch_checkpoint",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            payload=payload,
-            envelope=envelope,
-            sha256=checkpoint_sha256,
-        ),
-    )
-
-    def reject_identity(
-        candidate_payload: object,
-        candidate_envelope: object,
-    ) -> None:
-        calls.append((candidate_payload, candidate_envelope))
+    def reject_identity(path: Path) -> None:
+        calls.append(path)
         raise ValueError("scientific identity drift")
 
     monkeypatch.setattr(
         runner_module,
-        "validate_epoch_checkpoint_identity",
+        "verify_epoch_checkpoint",
         reject_identity,
-        raising=False,
     )
 
     with pytest.raises(ValueError, match="scientific identity drift"):
@@ -631,9 +1200,7 @@ def test_checkpoint_identity_validator_runs_before_subset_crossbinding(
             run_manifest,
             arguments,
         )
-    assert calls == [
-        ({"scientific_identity": "drifted"}, envelope)
-    ]
+    assert calls == [checkpoint]
 
 
 def test_checkpoint_transport_hash_mismatch_precedes_identity_validation(
@@ -651,20 +1218,11 @@ def test_checkpoint_transport_hash_mismatch_precedes_identity_validation(
     run_manifest["final_checkpoint_sha256"] = actual_sha256
     monkeypatch.setattr(
         runner_module,
-        "load_typed_torch_checkpoint",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            payload={},
-            envelope={},
+        "verify_epoch_checkpoint",
+        lambda path: SimpleNamespace(
+            path=path.resolve(),
             sha256=_h("wrong-transport"),
         ),
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "validate_epoch_checkpoint_identity",
-        lambda *_args: pytest.fail(
-            "identity validation must follow transport hash validation"
-        ),
-        raising=False,
     )
 
     with pytest.raises(ValueError, match="typed checkpoint hash"):
@@ -696,10 +1254,21 @@ def test_training_output_validation_binds_partial_checkpoint_and_run_identity(
     in_loop.mkdir()
     metadata = in_loop / "metadata.json"
     metadata.write_bytes(b'{"complete":true}\n')
-    checkpoint = output / "checkpoint_epoch001_step000000001.pt"
+    checkpoint = output / "checkpoint_epoch001_step00000001.pt"
     checkpoint.write_bytes(b"checkpoint")
-    (output / f"{checkpoint.name}.meta.json").write_bytes(b"{}\n")
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    (output / f"{checkpoint.name}.meta.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "complete": True,
+                "payload_sha256": checkpoint_sha,
+                "payload_type": "samga_brain_rw.epoch_checkpoint",
+                "schema_version": 1,
+                "scope": "train",
+            }
+        )
+        + b"\n"
+    )
     base_manifest = _real_run_manifest(arguments)
     run_manifest = {
         **base_manifest,
@@ -738,31 +1307,23 @@ def test_training_output_validation_binds_partial_checkpoint_and_run_identity(
         "run_manifest": base_manifest,
         "input_hashes": input_hashes,
     }
-    checkpoint_envelope = MappingProxyType(
-        {"scientific_sidecar": "fixture"}
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "load_typed_torch_checkpoint",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            payload=MappingProxyType(checkpoint_payload),
-            envelope=checkpoint_envelope,
-            sha256=checkpoint_sha,
-        ),
-    )
-    identity_calls: list[tuple[object, object]] = []
+    verifier_calls: list[Path] = []
 
-    def record_identity(
-        payload: object,
-        envelope: object,
-    ) -> None:
-        identity_calls.append((payload, envelope))
+    def verify_checkpoint(path: Path) -> SimpleNamespace:
+        verifier_calls.append(path)
+        return _verified_checkpoint_fixture(
+            runner_module,
+            arguments,
+            run_manifest,
+            path,
+            payload=checkpoint_payload,
+            input_hashes=input_hashes,
+        )
 
     monkeypatch.setattr(
         runner_module,
-        "validate_epoch_checkpoint_identity",
-        record_identity,
-        raising=False,
+        "verify_epoch_checkpoint",
+        verify_checkpoint,
     )
     score_artifact = _partial_score_artifact(
         arguments,
@@ -784,9 +1345,7 @@ def test_training_output_validation_binds_partial_checkpoint_and_run_identity(
     assert validated.in_loop_metadata_sha256 == hashlib.sha256(
         metadata.read_bytes()
     ).hexdigest()
-    assert identity_calls == [
-        (checkpoint_payload, checkpoint_envelope)
-    ]
+    assert verifier_calls == [checkpoint]
 
     checkpoint_payload["runtime_state"] = {"epoch_complete": True}
     with pytest.raises(ValueError, match="partial|epoch_complete"):

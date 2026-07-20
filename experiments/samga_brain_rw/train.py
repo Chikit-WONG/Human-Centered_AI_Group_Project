@@ -14,7 +14,7 @@ import secrets
 import stat
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from types import MappingProxyType
 
@@ -95,6 +95,13 @@ _SENSITIVE = {
     "val_confirm",
 }
 _CHECKPOINT_SCOPE_KEYS = frozenset({"scope", "validation_scope", "observed_scopes"})
+_DURABLE_CHECKPOINT_NAMES = tuple(
+    f"checkpoint_epoch{epoch:03d}.pt"
+    for epoch in range(51, 61)
+)
+_CHECKPOINT_NAME_RE = re.compile(
+    r"^checkpoint_epoch(?P<epoch>\d{3})(?:_step\d{8})?\.pt$"
+)
 
 
 @dataclass(frozen=True)
@@ -292,6 +299,466 @@ def _read_relative_regular(
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _regular_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _rename_stable_identity(value: tuple[int, ...]) -> tuple[int, ...]:
+    # Some filesystems update inode ctime when a directory entry is renamed.
+    # Device, inode, type, size, and mtime remain stable across that operation.
+    return value[:-1]
+
+
+def _read_prunable_regular(
+    parent: object,
+    leaf: str,
+    *,
+    context: str,
+) -> tuple[bytes, tuple[int, ...]]:
+    parent.verify()
+    try:
+        before = os.stat(
+            leaf,
+            dir_fd=parent.parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"{context} cannot be inspected safely") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{context} must be a regular file")
+    try:
+        raw = _read_relative_regular(
+            parent.parent_fd,
+            leaf,
+            context=context,
+        )
+        after = os.stat(
+            leaf,
+            dir_fd=parent.parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"{context} changed while read") from exc
+    identity = _regular_identity(before)
+    if _regular_identity(after) != identity:
+        raise ValueError(f"{context} changed while read")
+    parent.verify()
+    return raw, identity
+
+
+def _sha256_prunable_regular(
+    parent: object,
+    leaf: str,
+    *,
+    context: str,
+) -> tuple[str, tuple[int, ...]]:
+    parent.verify()
+    try:
+        descriptor = os.open(
+            leaf,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent.parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"{context} cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{context} must be a regular file")
+        identity = _regular_identity(before)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if _regular_identity(after) != identity:
+            raise ValueError(f"{context} changed while hashed")
+        try:
+            named = os.stat(
+                leaf,
+                dir_fd=parent.parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(f"{context} changed while hashed") from exc
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or _regular_identity(named) != identity
+        ):
+            raise ValueError(f"{context} changed while hashed")
+        parent.verify()
+        return digest.hexdigest(), identity
+    finally:
+        os.close(descriptor)
+
+
+def _tombstone_prunable_bundle(
+    parent: object,
+    *,
+    entries: Sequence[tuple[str, tuple[int, ...], str]],
+) -> None:
+    renamed: list[tuple[str, str, tuple[int, ...], str]] = []
+    try:
+        for leaf, expected_identity, context in entries:
+            parent.verify()
+            tombstone = (
+                f".{leaf}.prune-{os.getpid()}-{secrets.token_hex(16)}"
+            )
+            try:
+                os.stat(
+                    tombstone,
+                    dir_fd=parent.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ValueError(
+                    f"{context} tombstone cannot be inspected"
+                ) from exc
+            else:
+                raise ValueError(f"{context} tombstone collision")
+            try:
+                os.rename(
+                    leaf,
+                    tombstone,
+                    src_dir_fd=parent.parent_fd,
+                    dst_dir_fd=parent.parent_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"{context} could not be tombstoned safely"
+                ) from exc
+            renamed.append(
+                (leaf, tombstone, expected_identity, context)
+            )
+            try:
+                moved = os.stat(
+                    tombstone,
+                    dir_fd=parent.parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"{context} tombstone disappeared after rename"
+                ) from exc
+            if (
+                not stat.S_ISREG(moved.st_mode)
+                or _rename_stable_identity(_regular_identity(moved))
+                != _rename_stable_identity(expected_identity)
+            ):
+                raise ValueError(
+                    f"{context} identity changed after tombstone rename"
+                )
+        parent.verify()
+    except BaseException as original:
+        restoration_error: BaseException | None = None
+        for leaf, tombstone, _expected, context in reversed(renamed):
+            try:
+                try:
+                    os.stat(
+                        leaf,
+                        dir_fd=parent.parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError(
+                        f"{context} original name reappeared during restore"
+                    )
+                moved = os.stat(
+                    tombstone,
+                    dir_fd=parent.parent_fd,
+                    follow_symlinks=False,
+                )
+                moved_identity = _regular_identity(moved)
+                os.rename(
+                    tombstone,
+                    leaf,
+                    src_dir_fd=parent.parent_fd,
+                    dst_dir_fd=parent.parent_fd,
+                )
+                restored = os.stat(
+                    leaf,
+                    dir_fd=parent.parent_fd,
+                    follow_symlinks=False,
+                )
+                if _rename_stable_identity(
+                    _regular_identity(restored)
+                ) != _rename_stable_identity(moved_identity):
+                    raise ValueError(
+                        f"{context} restoration identity mismatch"
+                    )
+            except BaseException as exc:
+                restoration_error = exc
+        try:
+            os.fsync(parent.parent_fd)
+        except OSError as exc:
+            restoration_error = exc
+        parent.verify()
+        if restoration_error is not None:
+            raise ValueError(
+                "checkpoint tombstone restoration failed"
+            ) from restoration_error
+        raise original
+
+    for _leaf, tombstone, expected_identity, context in renamed:
+        parent.verify()
+        try:
+            current = os.stat(
+                tombstone,
+                dir_fd=parent.parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"{context} tombstone disappeared before pruning"
+            ) from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or _rename_stable_identity(_regular_identity(current))
+            != _rename_stable_identity(expected_identity)
+        ):
+            raise ValueError(
+                f"{context} tombstone identity changed before pruning"
+            )
+    for _leaf, tombstone, _expected_identity, context in renamed:
+        try:
+            os.unlink(tombstone, dir_fd=parent.parent_fd)
+        except OSError as exc:
+            raise ValueError(
+                f"{context} tombstone could not be pruned safely"
+            ) from exc
+    try:
+        os.fsync(parent.parent_fd)
+    except OSError as exc:
+        raise ValueError(
+            "checkpoint pruning directory fsync failed"
+        ) from exc
+    parent.verify()
+    for _leaf, tombstone, _expected_identity, context in renamed:
+        try:
+            os.stat(
+                tombstone,
+                dir_fd=parent.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                f"{context} tombstone removal cannot be verified"
+            ) from exc
+        raise ValueError(f"{context} tombstone still exists after pruning")
+
+
+def _prune_checkpoint_bundle(
+    checkpoint: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    checkpoint_path = reject_development_path(
+        checkpoint,
+        "transient checkpoint pruning",
+    )
+    expected_digest = _require_sha(
+        expected_sha256,
+        "transient checkpoint hash",
+    )
+    sidecar = reject_development_path(
+        samga_checkpoint_sidecar(checkpoint_path),
+        "transient checkpoint sidecar pruning",
+    )
+    if sidecar.parent != checkpoint_path.parent:
+        raise ValueError("checkpoint pruning pair must share one parent")
+    with _secure_parent_directory(
+        checkpoint_path,
+        context="transient checkpoint pruning",
+    ) as parent:
+        checkpoint_digest, checkpoint_identity = _sha256_prunable_regular(
+            parent,
+            parent.leaf,
+            context="transient checkpoint",
+        )
+        if checkpoint_digest != expected_digest:
+            raise ValueError("transient checkpoint hash mismatch")
+        sidecar_raw, sidecar_identity = _read_prunable_regular(
+            parent,
+            sidecar.name,
+            context="transient checkpoint sidecar",
+        )
+        try:
+            sidecar_document = json.loads(sidecar_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "transient checkpoint sidecar is invalid JSON"
+            ) from exc
+        if (
+            not isinstance(sidecar_document, dict)
+            or canonical_json_bytes(sidecar_document) + b"\n"
+            != sidecar_raw
+            or sidecar_document.get("schema_version") != 1
+            or sidecar_document.get("payload_type")
+            != CHECKPOINT_PAYLOAD_TYPE
+            or sidecar_document.get("scope") != "train"
+            or sidecar_document.get("payload_sha256") != expected_digest
+        ):
+            raise ValueError(
+                "transient checkpoint sidecar binding mismatch"
+            )
+        _tombstone_prunable_bundle(
+            parent,
+            entries=(
+                (
+                    sidecar.name,
+                    sidecar_identity,
+                    "transient checkpoint sidecar",
+                ),
+                (
+                    parent.leaf,
+                    checkpoint_identity,
+                    "transient checkpoint",
+                ),
+            ),
+        )
+
+
+@dataclass
+class _CheckpointRetention:
+    hashes: dict[str, str] = dataclass_field(default_factory=dict)
+    _transient: tuple[Path, str] | None = None
+
+    def record_published(
+        self,
+        checkpoint: Path,
+        digest: str,
+        *,
+        retain_for_averaging: bool,
+    ) -> None:
+        path = reject_development_path(
+            checkpoint,
+            "published checkpoint retention",
+        )
+        sha256 = _require_sha(digest, "published checkpoint hash")
+        if type(retain_for_averaging) is not bool:
+            raise TypeError("retain_for_averaging must be boolean")
+        if path.name in self.hashes:
+            raise ValueError("checkpoint was recorded more than once")
+        durable_names = tuple(
+            name
+            for name in _DURABLE_CHECKPOINT_NAMES
+            if name in self.hashes
+        )
+        if retain_for_averaging:
+            if path.name not in _DURABLE_CHECKPOINT_NAMES:
+                raise ValueError(
+                    "durable checkpoint is outside epochs 51 through 60"
+                )
+            expected_name = _DURABLE_CHECKPOINT_NAMES[len(durable_names)]
+            if path.name != expected_name:
+                raise ValueError(
+                    "durable checkpoint retention must be a contiguous "
+                    "prefix beginning at epoch 51"
+                )
+            if self._transient is not None:
+                transient_path, transient_sha256 = self._transient
+                _prune_checkpoint_bundle(
+                    transient_path,
+                    expected_sha256=transient_sha256,
+                )
+                del self.hashes[transient_path.name]
+                self._transient = None
+            self.hashes[path.name] = sha256
+            return
+        name_match = _CHECKPOINT_NAME_RE.fullmatch(path.name)
+        if name_match is None:
+            raise ValueError("transient checkpoint name is invalid")
+        if durable_names:
+            if len(durable_names) == len(_DURABLE_CHECKPOINT_NAMES):
+                raise ValueError(
+                    "transient checkpoint cannot follow completed durable "
+                    "retention"
+                )
+            expected_epoch = 51 + len(durable_names)
+            if int(name_match.group("epoch")) != expected_epoch:
+                raise ValueError(
+                    "late transient checkpoint must immediately follow the "
+                    "durable retention prefix"
+                )
+        if self._transient is not None:
+            transient_path, transient_sha256 = self._transient
+            _prune_checkpoint_bundle(
+                transient_path,
+                expected_sha256=transient_sha256,
+            )
+            del self.hashes[transient_path.name]
+        self.hashes[path.name] = sha256
+        self._transient = (path, sha256)
+
+    def validate_final(
+        self,
+        *,
+        completed: bool,
+        final_checkpoint: Path,
+    ) -> None:
+        if type(completed) is not bool:
+            raise TypeError("completed must be boolean")
+        final_path = reject_development_path(
+            final_checkpoint,
+            "final checkpoint retention",
+        )
+        if completed:
+            if (
+                self._transient is not None
+                or tuple(sorted(self.hashes))
+                != _DURABLE_CHECKPOINT_NAMES
+                or final_path.name != _DURABLE_CHECKPOINT_NAMES[-1]
+            ):
+                raise ValueError(
+                    "completed run must retain exact epochs 51 through 60"
+                )
+            return
+        durable_names = tuple(
+            name
+            for name in _DURABLE_CHECKPOINT_NAMES
+            if name in self.hashes
+        )
+        if durable_names != _DURABLE_CHECKPOINT_NAMES[: len(durable_names)]:
+            raise ValueError(
+                "partial durable checkpoint retention must be contiguous"
+            )
+        expected_hashes = {
+            name: self.hashes[name]
+            for name in durable_names
+        }
+        if self._transient is not None:
+            transient_path, transient_sha256 = self._transient
+            expected_hashes[transient_path.name] = transient_sha256
+            expected_final = transient_path
+        elif durable_names:
+            expected_final = final_path.with_name(durable_names[-1])
+        else:
+            raise ValueError(
+                "partial run must retain a checkpoint"
+            )
+        if self.hashes != expected_hashes or expected_final != final_path:
+            raise ValueError(
+                "partial run checkpoint retention is inconsistent"
+            )
 
 
 def save_samga_checkpoint(
@@ -1698,6 +2165,15 @@ def run_training(arguments: argparse.Namespace) -> int:
             requested_scope="train",
         )
         resume_payload = loaded_resume.payload
+        resume_epoch = resume_payload.get("epoch")
+        if type(resume_epoch) is not int or resume_epoch < 1:
+            raise ValueError("resume checkpoint epoch is invalid")
+        if resume_epoch >= 51:
+            raise ValueError(
+                f"resume checkpoint epoch {resume_epoch} requires fresh "
+                "recovery because earlier retained epochs cannot be "
+                "reconstructed"
+            )
         resume_source_checkpoint_sha256 = _require_sha(
             loaded_resume.sha256,
             "resume source checkpoint",
@@ -1815,7 +2291,7 @@ def run_training(arguments: argparse.Namespace) -> int:
         candidate_spec_sha256=candidate_spec["candidate_spec_sha256"],
         run_key=resolved.run_key,
     )
-    published_hashes: dict[str, str] = {}
+    checkpoint_retention = _CheckpointRetention()
 
     def checkpoint_sink(
         payload: dict[str, object],
@@ -1834,13 +2310,17 @@ def run_training(arguments: argparse.Namespace) -> int:
         )
         if verified.sha256 != digest:
             raise ValueError("published checkpoint SHA-256 verification mismatch")
-        published_hashes[checkpoint.name] = digest
+        checkpoint_retention.record_published(
+            checkpoint,
+            digest,
+            retain_for_averaging=retain_for_averaging,
+        )
         return CheckpointPublication(
             reference=str(checkpoint),
             exclusive_create=True,
             atomic_publish=True,
             verified=True,
-            durable_retention=True,
+            durable_retention=retain_for_averaging,
         )
 
     dataset_factory, development_datasets = _cached_dataset_factory(
@@ -1892,8 +2372,14 @@ def run_training(arguments: argparse.Namespace) -> int:
         paths.output_dir,
         result.final_checkpoint,
     )
+    checkpoint_retention.validate_final(
+        completed=result.completed,
+        final_checkpoint=final_checkpoint,
+    )
     try:
-        final_checkpoint_sha256 = published_hashes[final_checkpoint.name]
+        final_checkpoint_sha256 = checkpoint_retention.hashes[
+            final_checkpoint.name
+        ]
     except KeyError as exc:
         raise ValueError("final checkpoint was not durably published") from exc
 
@@ -1928,7 +2414,9 @@ def run_training(arguments: argparse.Namespace) -> int:
         "global_step": result.global_step,
         "final_checkpoint": final_checkpoint.name,
         "final_checkpoint_sha256": final_checkpoint_sha256,
-        "checkpoint_hashes": dict(sorted(published_hashes.items())),
+        "checkpoint_hashes": dict(
+            sorted(checkpoint_retention.hashes.items())
+        ),
         "in_loop_score_directory": "in_loop",
         "max_train_steps": arguments.max_train_steps,
         "resume_source_checkpoint_sha256": (resume_source_checkpoint_sha256),

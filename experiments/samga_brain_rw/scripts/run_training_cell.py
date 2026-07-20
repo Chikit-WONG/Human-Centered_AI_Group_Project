@@ -19,20 +19,20 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
-from samga_brain_rw.checkpoint_identity import (
-    validate_epoch_checkpoint_identity,
+from samga_brain_rw.checkpoints import (
+    CHECKPOINT_PAYLOAD_TYPE,
+    VerifiedEpochCheckpoint,
+    verify_epoch_checkpoint,
 )
-from samga_brain_rw.checkpoint_io import load_typed_torch_checkpoint
-from samga_brain_rw.checkpoints import CHECKPOINT_PAYLOAD_TYPE
 from samga_brain_rw.config import make_run_key
 from samga_brain_rw.hashing import canonical_json_bytes, sha256_json
 from samga_brain_rw.runtime_contract import (
     validate_environment_binding,
 )
 from samga_brain_rw.scores import ScoreArtifact
+from samga_brain_rw.trainer import SCHEDULE_SHA256
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -115,7 +115,55 @@ _EVALUATION_DIRECTORIES = (
     "reload_evaluation",
 )
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_FULL_RETAINED_CHECKPOINT_NAMES = tuple(
+    f"checkpoint_epoch{epoch:03d}.pt"
+    for epoch in range(51, 61)
+)
+_LEGACY_ALL_CHECKPOINT_NAMES = tuple(
+    f"checkpoint_epoch{epoch:03d}.pt"
+    for epoch in range(1, 61)
+)
+_LEGACY_STAGE0_ALL_CHECKPOINTS_GIT_SHA = (
+    "aed25e2e5756cc1f08a859d385ffb116364fa2f9"
+)
+_LEGACY_STAGE0_RUN_MANIFEST_FILE_SHA256 = {
+    (
+        "stage0__internvit_baseline_v1__sub-01__seed-42__"
+        "config-6a7bdeb6994c6d3475cc6eedf56a9d82fc8892cb6170d76c75610d09697b61b5__"
+        "inputs-89c0a111da7f96d4f7083432549d1031f7f22efce6e332e801f36c770a41b910"
+    ): "0589e81bd8e9154277aa0798a6cc07e02bc52493a48daa3fa577a5d4fd96588d",
+    (
+        "stage0__internvit_baseline_v1__sub-01__seed-43__"
+        "config-c2c1d2f5176ead7ac718e423f2c4c61308c1511041a61069ae324080e36f3e1e__"
+        "inputs-89c0a111da7f96d4f7083432549d1031f7f22efce6e332e801f36c770a41b910"
+    ): "ce6c95e7d04e73e1989d1045cccea2b4d80c4036ddf3e8dd87284a2d571b5b91",
+    (
+        "stage0__internvit_baseline_v1__sub-05__seed-42__"
+        "config-a51faacdceb44218412c05fd759b7da5df0971b6f5615af81e9842311153ce5f__"
+        "inputs-909cc2246a737c56febc52c8dc1fd914ff766d290921cf266cbb335cf3aed86c"
+    ): "af010b11e19bf995f00c064e8947e638476b961efdb4bf0e1d40bbf369e4e161",
+    (
+        "stage0__internvit_baseline_v1__sub-05__seed-43__"
+        "config-4943994fee90926122546bab2d52b3f16e82cc28f7af9a0dda4e63febac76f23__"
+        "inputs-909cc2246a737c56febc52c8dc1fd914ff766d290921cf266cbb335cf3aed86c"
+    ): "cabb097e9f540baf7a61022c59028132950f833c036bffa57d8bb2eee43267de",
+    (
+        "stage0__internvit_baseline_v1__sub-08__seed-42__"
+        "config-b4a4cc8125592793399c9aa7d27e8d88dcc41be8bc2f63c421446dc2870bb4e9__"
+        "inputs-0a7f7de9ba6843f213462ac4ab56456839beea9bd22f223032b0b4501c3f37c3"
+    ): "a857355d61a0b776bf2d0422c4e7923eb950bf2349373267b32a4ad8c9a179ba",
+    (
+        "stage0__internvit_baseline_v1__sub-08__seed-43__"
+        "config-1f95a5a666b5473dde4676ffb8529189c3c19c0b9f4ebc28602bc4418573ca4e__"
+        "inputs-0a7f7de9ba6843f213462ac4ab56456839beea9bd22f223032b0b4501c3f37c3"
+    ): "a1616a977610ce78506f2ba50023118d9f088f17899d61d9548b7714c420dbb3",
+}
+_CHECKPOINT_NAME_RE = re.compile(
+    r"^checkpoint_epoch(?P<epoch>\d{3})"
+    r"(?P<partial>_step\d{8})?\.pt$"
+)
 
 
 @dataclass(frozen=True)
@@ -318,6 +366,153 @@ def _sha256(value: object, context: str) -> str:
     return value
 
 
+def _is_allowed_legacy_stage0_manifest(
+    value: Mapping[str, object],
+    arguments: argparse.Namespace,
+    run_manifest_file_sha256: str | None,
+) -> bool:
+    if run_manifest_file_sha256 is None:
+        return False
+    actual_file_sha256 = hashlib.sha256(
+        canonical_json_bytes(value) + b"\n"
+    ).hexdigest()
+    expected_file_sha256 = _LEGACY_STAGE0_RUN_MANIFEST_FILE_SHA256.get(
+        arguments.run_key
+    )
+    return (
+        actual_file_sha256 == run_manifest_file_sha256
+        and expected_file_sha256 == run_manifest_file_sha256
+        and arguments.mode == "full"
+        and arguments.stage == 0
+        and arguments.config_id == "internvit_baseline_v1"
+        and value.get("schema_version") == 1
+        and value.get("payload_type")
+        == "samga_brain_rw.development_run"
+        and value.get("git_sha")
+        == _LEGACY_STAGE0_ALL_CHECKPOINTS_GIT_SHA
+        and value.get("run_key") == arguments.run_key
+    )
+
+
+def _validate_checkpoint_retention_manifest(
+    value: Mapping[str, object],
+    arguments: argparse.Namespace,
+    *,
+    run_manifest_file_sha256: str | None = None,
+) -> dict[str, str]:
+    final_name = value.get("final_checkpoint")
+    if (
+        not isinstance(final_name, str)
+        or Path(final_name).name != final_name
+        or _CHECKPOINT_NAME_RE.fullmatch(final_name) is None
+    ):
+        raise ValueError("final checkpoint retention name is invalid")
+    raw_hashes = _mapping(
+        value.get("checkpoint_hashes"),
+        "checkpoint retention hashes",
+    )
+    hashes = {
+        name: _sha256(digest, f"checkpoint retention hash {name}")
+        for name, digest in raw_hashes.items()
+    }
+    if final_name not in hashes:
+        raise ValueError(
+            "final checkpoint retention name is absent from hashes"
+        )
+    if any(
+        Path(name).name != name
+        or _CHECKPOINT_NAME_RE.fullmatch(name) is None
+        for name in hashes
+    ):
+        raise ValueError("checkpoint retention contains an invalid name")
+    legacy_stage0 = _is_allowed_legacy_stage0_manifest(
+        value,
+        arguments,
+        run_manifest_file_sha256,
+    )
+    if legacy_stage0:
+        if (
+            tuple(sorted(hashes)) != _LEGACY_ALL_CHECKPOINT_NAMES
+            or final_name != _LEGACY_ALL_CHECKPOINT_NAMES[-1]
+        ):
+            raise ValueError(
+                "sealed legacy Stage 0 checkpoint retention must contain "
+                "exact epochs 1 through 60"
+            )
+    elif arguments.mode == "full":
+        if (
+            tuple(sorted(hashes)) != _FULL_RETAINED_CHECKPOINT_NAMES
+            or final_name != _FULL_RETAINED_CHECKPOINT_NAMES[-1]
+        ):
+            raise ValueError(
+                "full checkpoint retention must contain exact epochs 51 "
+                "through 60"
+            )
+    else:
+        durable_names = tuple(
+            name
+            for name in _FULL_RETAINED_CHECKPOINT_NAMES
+            if name in hashes
+        )
+        if (
+            durable_names
+            != _FULL_RETAINED_CHECKPOINT_NAMES[: len(durable_names)]
+        ):
+            raise ValueError(
+                "smoke durable checkpoint retention must be a contiguous "
+                "prefix beginning at epoch 51"
+            )
+        transient_names = set(hashes).difference(durable_names)
+        if not durable_names:
+            if transient_names != {final_name}:
+                raise ValueError(
+                    "smoke checkpoint retention before epoch 51 must "
+                    "contain only its latest transient"
+                )
+            match = _CHECKPOINT_NAME_RE.fullmatch(final_name)
+            assert match is not None
+            if int(match.group("epoch")) > 51:
+                raise ValueError(
+                    "smoke checkpoint retention is missing its durable "
+                    "prefix"
+                )
+        elif not transient_names:
+            if final_name != durable_names[-1]:
+                raise ValueError(
+                    "smoke checkpoint retention boundary final checkpoint "
+                    "mismatch"
+                )
+        elif len(transient_names) == 1:
+            transient_name = next(iter(transient_names))
+            match = _CHECKPOINT_NAME_RE.fullmatch(transient_name)
+            assert match is not None
+            expected_epoch = 51 + len(durable_names)
+            if (
+                transient_name != final_name
+                or match.group("partial") is None
+                or int(match.group("epoch")) != expected_epoch
+                or expected_epoch > 60
+            ):
+                raise ValueError(
+                    "smoke late-partial checkpoint must immediately follow "
+                    "its durable retention prefix"
+                )
+        else:
+            raise ValueError(
+                "smoke checkpoint retention may contain at most one "
+                "transient"
+            )
+    final_sha256 = _sha256(
+        value.get("final_checkpoint_sha256"),
+        "final checkpoint retention hash",
+    )
+    if hashes[final_name] != final_sha256:
+        raise ValueError(
+            "final checkpoint retention hash differs from checkpoint_hashes"
+        )
+    return hashes
+
+
 def _validate_runtime_manifest_metadata(
     value: Mapping[str, object],
 ) -> None:
@@ -376,6 +571,8 @@ def _validate_runtime_manifest_metadata(
 def _validate_run_manifest(
     value: Mapping[str, object],
     arguments: argparse.Namespace,
+    *,
+    run_manifest_file_sha256: str | None = None,
 ) -> dict[str, object]:
     expected_keys = _RUN_MANIFEST_BASE_KEYS | _RUN_SUMMARY_EXTRA_KEYS
     if set(value) != expected_keys:
@@ -414,6 +611,11 @@ def _validate_run_manifest(
             "run manifest resume_source_checkpoint_sha256",
         )
     _validate_runtime_manifest_metadata(value)
+    _validate_checkpoint_retention_manifest(
+        value,
+        arguments,
+        run_manifest_file_sha256=run_manifest_file_sha256,
+    )
     if arguments.mode == "smoke":
         if value["completed"] is not False:
             raise ValueError("smoke run must remain partial")
@@ -429,88 +631,382 @@ def _validate_run_manifest(
     return dict(value)
 
 
+def _fd_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _stable_regular_bytes_at(
+    directory_fd: int,
+    name: str,
+    *,
+    context: str,
+) -> bytes:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"{context} cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{context} must be a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _fd_identity(before) != _fd_identity(after):
+            raise ValueError(f"{context} changed while read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _sha256_regular_at(
+    directory_fd: int,
+    name: str,
+    *,
+    context: str,
+) -> str:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"{context} cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{context} must be a regular file")
+        try:
+            named_before = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(f"{context} changed before read") from exc
+        if _fd_identity(named_before) != _fd_identity(before):
+            raise ValueError(f"{context} path identity mismatch")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 4 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        try:
+            named_after = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(f"{context} changed during read") from exc
+        if (
+            _fd_identity(before) != _fd_identity(after)
+            or _fd_identity(after) != _fd_identity(named_after)
+        ):
+            raise ValueError(f"{context} changed while read")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _canonical_json_document(
+    raw: bytes,
+    *,
+    context: str,
+) -> dict[str, object]:
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise ValueError(f"{context} must be one canonical JSON line")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{context} is invalid JSON") from exc
+    if (
+        not isinstance(value, dict)
+        or canonical_json_bytes(value) + b"\n" != raw
+    ):
+        raise ValueError(f"{context} is not canonical JSON")
+    return value
+
+
+def _crossbind_verified_checkpoint(
+    verified: VerifiedEpochCheckpoint,
+    *,
+    path: Path,
+    name: str,
+    expected_sha256: str,
+    run_manifest: Mapping[str, object],
+    arguments: argparse.Namespace,
+) -> None:
+    normalized_path = Path(
+        os.path.abspath(os.path.normpath(os.fspath(path)))
+    )
+    if verified.path != normalized_path:
+        raise ValueError(f"retained checkpoint {name} path mismatch")
+    if verified.sha256 != expected_sha256:
+        raise ValueError(
+            f"typed checkpoint hash mismatch for retained checkpoint {name}"
+        )
+    match = _CHECKPOINT_NAME_RE.fullmatch(name)
+    if match is None:
+        raise ValueError(f"retained checkpoint {name} name mismatch")
+    expected_epoch = int(match.group("epoch"))
+    expected_identity = {
+        "epoch": expected_epoch,
+        "subject": arguments.subject,
+        "seed": arguments.seed,
+        "config_id": arguments.config_id,
+        "config_sha256": arguments.expected_config_sha256,
+        "schedule_sha256": SCHEDULE_SHA256,
+        "data_order_sha256": run_manifest["data_order_sha256"],
+        "candidate_spec_sha256": run_manifest["candidate_spec_sha256"],
+        "input_bundle_sha256": arguments.expected_input_bundle_sha256,
+        "run_key": arguments.run_key,
+    }
+    for field, expected in expected_identity.items():
+        if getattr(verified, field) != expected:
+            raise ValueError(
+                f"retained checkpoint {name} {field} mismatch"
+            )
+    if expected_epoch >= 51 and verified.optimizer_stage != "stage2":
+        raise ValueError(
+            f"retained checkpoint {name} optimizer stage mismatch"
+        )
+    if (
+        validate_environment_binding(verified.environment)
+        != run_manifest["environment"]
+    ):
+        raise ValueError(
+            f"retained checkpoint {name} environment mismatch"
+        )
+    expected_manifest = {
+        key: run_manifest[key]
+        for key in _RUN_MANIFEST_BASE_KEYS
+    }
+    if dict(verified.run_manifest) != expected_manifest:
+        raise ValueError(
+            f"retained checkpoint {name} run_key/run manifest mismatch"
+        )
+    candidate_expected = {
+        "candidate_spec_sha256": run_manifest[
+            "candidate_spec_sha256"
+        ],
+        "config_id": arguments.config_id,
+        "data_order_sha256": run_manifest["data_order_sha256"],
+        "input_bundle_sha256": arguments.expected_input_bundle_sha256,
+        "run_key": arguments.run_key,
+        "trajectory_sha256": verified.trajectory_sha256,
+    }
+    for field, expected in candidate_expected.items():
+        if verified.candidate_spec.get(field) != expected:
+            raise ValueError(
+                f"retained checkpoint {name} candidate {field} mismatch"
+            )
+    epoch_complete = verified.runtime_state.get("epoch_complete")
+    if type(epoch_complete) is not bool:
+        raise ValueError(
+            f"retained checkpoint {name} epoch_complete mismatch"
+        )
+    expected_epoch_complete = match.group("partial") is None
+    if epoch_complete is not expected_epoch_complete:
+        raise ValueError(
+            f"retained checkpoint {name} epoch_complete/filename mismatch"
+        )
+    if verified.runtime_state.get(
+        "resume_source_checkpoint_sha256"
+    ) != run_manifest["resume_source_checkpoint_sha256"]:
+        raise ValueError(
+            f"retained checkpoint {name} resume source mismatch"
+        )
+    retention = verified.retention
+    if name in _FULL_RETAINED_CHECKPOINT_NAMES:
+        if (
+            retention.get("policy")
+            != "retain_exact_epochs_51_through_60"
+            or retention.get("required_epochs")
+            != list(range(51, 61))
+            or retention.get("retain_for_averaging") is not True
+        ):
+            raise ValueError(
+                f"retained checkpoint {name} epoch/retention mismatch"
+            )
+    elif retention.get("retain_for_averaging") is not False:
+        raise ValueError(
+            f"transient checkpoint {name} retention mismatch"
+        )
+
+
+def _validate_retained_checkpoint_outputs(
+    output_dir: Path,
+    run_manifest: Mapping[str, object],
+    arguments: argparse.Namespace,
+    *,
+    run_manifest_file_sha256: str | None = None,
+) -> tuple[dict[str, str], VerifiedEpochCheckpoint]:
+    output = _development_path(output_dir, "checkpoint retention output")
+    hashes = _validate_checkpoint_retention_manifest(
+        run_manifest,
+        arguments,
+        run_manifest_file_sha256=run_manifest_file_sha256,
+    )
+    legacy_stage0 = _is_allowed_legacy_stage0_manifest(
+        run_manifest,
+        arguments,
+        run_manifest_file_sha256,
+    )
+    expected_names = set(hashes)
+    expected_names.update(f"{name}.meta.json" for name in hashes)
+    try:
+        directory_fd = os.open(
+            output,
+            os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_DIRECTORY,
+        )
+    except OSError as exc:
+        raise ValueError(
+            "checkpoint retention output cannot be opened safely"
+        ) from exc
+    try:
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ValueError(
+                "checkpoint retention output must be a directory"
+            )
+        try:
+            path_before = os.stat(output, follow_symlinks=False)
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            raise ValueError(
+                "checkpoint retention output cannot be inspected safely"
+            ) from exc
+        if _fd_identity(path_before) != _fd_identity(before):
+            raise ValueError(
+                "checkpoint retention output path identity mismatch"
+            )
+        observed_names = {
+            name
+            for name in names
+            if name.lstrip(".").startswith("checkpoint_epoch")
+        }
+        if observed_names != expected_names:
+            raise ValueError(
+                "checkpoint retention output does not contain the exact "
+                "expected bundles"
+            )
+        final_verified: VerifiedEpochCheckpoint | None = None
+        for name, expected_sha256 in sorted(hashes.items()):
+            if legacy_stage0 and name not in _FULL_RETAINED_CHECKPOINT_NAMES:
+                if (
+                    _sha256_regular_at(
+                        directory_fd,
+                        name,
+                        context=f"retained checkpoint {name}",
+                    )
+                    != expected_sha256
+                ):
+                    raise ValueError(
+                        f"retained checkpoint {name} hash mismatch"
+                    )
+            else:
+                verified = verify_epoch_checkpoint(output / name)
+                _crossbind_verified_checkpoint(
+                    verified,
+                    path=output / name,
+                    name=name,
+                    expected_sha256=expected_sha256,
+                    run_manifest=run_manifest,
+                    arguments=arguments,
+                )
+                if name == run_manifest["final_checkpoint"]:
+                    final_verified = verified
+            sidecar_name = f"{name}.meta.json"
+            sidecar = _canonical_json_document(
+                _stable_regular_bytes_at(
+                    directory_fd,
+                    sidecar_name,
+                    context=f"retained checkpoint sidecar {sidecar_name}",
+                ),
+                context=f"retained checkpoint sidecar {sidecar_name}",
+            )
+            if (
+                sidecar.get("schema_version") != 1
+                or sidecar.get("payload_type") != CHECKPOINT_PAYLOAD_TYPE
+                or sidecar.get("scope") != "train"
+                or sidecar.get("payload_sha256") != expected_sha256
+            ):
+                raise ValueError(
+                    f"retained checkpoint sidecar {sidecar_name} "
+                    "binding mismatch"
+                )
+        after = os.fstat(directory_fd)
+        try:
+            path_after = os.stat(output, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(
+                "checkpoint retention output changed during validation"
+            ) from exc
+        if (
+            _fd_identity(before) != _fd_identity(after)
+            or _fd_identity(after) != _fd_identity(path_after)
+        ):
+            raise ValueError(
+                "checkpoint retention output changed during validation"
+            )
+    finally:
+        os.close(directory_fd)
+    if final_verified is None:
+        raise ValueError("final checkpoint did not receive full verification")
+    return hashes, final_verified
+
+
 def _validate_checkpoint(
     path: Path,
     run_manifest: Mapping[str, object],
     arguments: argparse.Namespace,
+    *,
+    verified: VerifiedEpochCheckpoint | None = None,
 ) -> tuple[Mapping[str, object], str]:
-    checkpoint_sha256 = _sha256_file(path, "final checkpoint")
-    if checkpoint_sha256 != _sha256(
+    expected_sha256 = _sha256(
         run_manifest["final_checkpoint_sha256"],
         "run manifest final checkpoint hash",
-    ):
-        raise ValueError("final checkpoint file hash mismatch")
-    loaded = load_typed_torch_checkpoint(
-        path,
-        payload_type=CHECKPOINT_PAYLOAD_TYPE,
-        requested_scope="train",
     )
-    if loaded.sha256 != checkpoint_sha256:
-        raise ValueError("typed checkpoint hash mismatch")
-    payload = _mapping(loaded.payload, "checkpoint payload")
-    validate_epoch_checkpoint_identity(
-        payload,
-        loaded.envelope,
+    checkpoint = verified or verify_epoch_checkpoint(path)
+    _crossbind_verified_checkpoint(
+        checkpoint,
+        path=path,
+        name=path.name,
+        expected_sha256=expected_sha256,
+        run_manifest=run_manifest,
+        arguments=arguments,
     )
-    expected = {
-        "payload_type": CHECKPOINT_PAYLOAD_TYPE,
-        "subject": arguments.subject,
-        "seed": arguments.seed,
-        "config_sha256": arguments.expected_config_sha256,
-        "global_step": run_manifest["global_step"],
-    }
-    for key, expected_value in expected.items():
-        if payload.get(key) != expected_value:
-            raise ValueError(f"checkpoint {key} mismatch")
-    checkpoint_environment = validate_environment_binding(
-        payload.get("environment")
-    )
-    if checkpoint_environment != run_manifest["environment"]:
-        raise ValueError(
-            "checkpoint environment differs from run manifest"
-        )
-    candidate = _mapping(payload.get("candidate_spec"), "checkpoint candidate_spec")
-    candidate_expected = {
-        "config_id": arguments.config_id,
-        "input_bundle_sha256": arguments.expected_input_bundle_sha256,
-        "run_key": arguments.run_key,
-    }
-    for key, expected_value in candidate_expected.items():
-        if candidate.get(key) != expected_value:
-            raise ValueError(f"checkpoint candidate {key} mismatch")
-    input_hashes = _mapping(payload.get("input_hashes"), "checkpoint input_hashes")
-    if sha256_json(dict(sorted(input_hashes.items()))) != (
-        arguments.expected_input_bundle_sha256
-    ):
-        raise ValueError("checkpoint input bundle mismatch")
-    nested_manifest = _mapping(
-        payload.get("run_manifest"),
-        "checkpoint run_manifest",
-    )
-    expected_manifest = {
-        key: run_manifest[key] for key in _RUN_MANIFEST_BASE_KEYS
-    }
-    if nested_manifest != expected_manifest:
-        raise ValueError("checkpoint run manifest mismatch")
-    runtime = _mapping(payload.get("runtime_state"), "checkpoint runtime_state")
-    epoch = payload.get("epoch")
-    if type(epoch) is not int or epoch <= 0:
-        raise ValueError("checkpoint epoch must be positive")
-    epoch_complete = runtime.get("epoch_complete")
-    if type(epoch_complete) is not bool:
-        raise ValueError("checkpoint epoch_complete must be boolean")
-    if runtime.get("resume_source_checkpoint_sha256") != (
-        run_manifest["resume_source_checkpoint_sha256"]
-    ):
-        raise ValueError(
-            "checkpoint resume source differs from run manifest"
-        )
+    if checkpoint.global_step != run_manifest["global_step"]:
+        raise ValueError("checkpoint global_step mismatch")
+    epoch_complete = checkpoint.runtime_state["epoch_complete"]
     if arguments.mode == "smoke":
-        if epoch_complete:
-            raise ValueError("smoke checkpoint must be partial (epoch_complete=false)")
-    elif epoch != 60 or not epoch_complete:
+        expected_complete = "_step" not in path.name
+        if epoch_complete is not expected_complete:
+            raise ValueError(
+                "smoke checkpoint completion differs from filename"
+            )
+    elif checkpoint.epoch != 60 or not epoch_complete:
         raise ValueError("full checkpoint must be epoch-60 complete")
-    return MappingProxyType(payload), checkpoint_sha256
+    return checkpoint.payload, checkpoint.sha256
 
 
 def _validate_in_loop_score_artifact(
@@ -677,16 +1173,23 @@ def validate_training_outputs(arguments: argparse.Namespace) -> TrainingOutputs:
     if output_dir.name != arguments.run_key or not output_dir.is_dir():
         raise ValueError("training output/run_key mismatch")
     run_manifest_path = output_dir / "run_manifest.json"
+    run_manifest_file_sha256 = _sha256_file(
+        run_manifest_path,
+        "run manifest",
+    )
     run_manifest = _validate_run_manifest(
         _canonical_json_line(run_manifest_path, "run manifest"),
         arguments,
+        run_manifest_file_sha256=run_manifest_file_sha256,
     )
     final_name = run_manifest["final_checkpoint"]
     if not isinstance(final_name, str) or Path(final_name).name != final_name:
         raise ValueError("final checkpoint must be a single filename")
-    checkpoint_hashes = _mapping(
-        run_manifest["checkpoint_hashes"],
-        "checkpoint hashes",
+    checkpoint_hashes, verified_final = _validate_retained_checkpoint_outputs(
+        output_dir,
+        run_manifest,
+        arguments,
+        run_manifest_file_sha256=run_manifest_file_sha256,
     )
     if final_name not in checkpoint_hashes:
         raise ValueError("final checkpoint is missing from checkpoint_hashes")
@@ -695,6 +1198,7 @@ def validate_training_outputs(arguments: argparse.Namespace) -> TrainingOutputs:
         final_checkpoint_path,
         run_manifest,
         arguments,
+        verified=verified_final,
     )
     if checkpoint_hashes[final_name] != final_checkpoint_sha256:
         raise ValueError("checkpoint_hashes final entry mismatch")
@@ -712,7 +1216,7 @@ def validate_training_outputs(arguments: argparse.Namespace) -> TrainingOutputs:
     in_loop_metadata_path = output_dir / "in_loop" / "metadata.json"
     return TrainingOutputs(
         run_manifest_path=run_manifest_path,
-        run_manifest_sha256=_sha256_file(run_manifest_path, "run manifest"),
+        run_manifest_sha256=run_manifest_file_sha256,
         final_checkpoint_path=final_checkpoint_path,
         final_checkpoint_sha256=final_checkpoint_sha256,
         in_loop_metadata_path=in_loop_metadata_path,

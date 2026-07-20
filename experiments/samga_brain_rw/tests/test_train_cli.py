@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import random
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,407 @@ from samga_brain_rw.trainer import (
 
 def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _fake_checkpoint_bundle(
+    directory: Path,
+    name: str,
+) -> tuple[Path, str]:
+    checkpoint = directory / name
+    checkpoint.write_bytes(f"checkpoint:{name}".encode("utf-8"))
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    sidecar = samga_train.samga_checkpoint_sidecar(checkpoint)
+    sidecar.write_bytes(
+        samga_train.canonical_json_bytes(
+            {
+                "complete": True,
+                "payload_sha256": digest,
+                "payload_type": "samga_brain_rw.epoch_checkpoint",
+                "schema_version": 1,
+                "scope": "train",
+            }
+        )
+        + b"\n"
+    )
+    return checkpoint, digest
+
+
+def test_checkpoint_pruning_verifies_pair_and_fsyncs_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint, digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch001.pt",
+    )
+    sidecar = samga_train.samga_checkpoint_sidecar(checkpoint)
+    fsynced_directories: list[bool] = []
+    real_fsync = samga_train.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        fsynced_directories.append(
+            stat.S_ISDIR(samga_train.os.fstat(descriptor).st_mode)
+        )
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(samga_train.os, "fsync", record_fsync)
+
+    samga_train._prune_checkpoint_bundle(
+        checkpoint,
+        expected_sha256=digest,
+    )
+
+    assert not checkpoint.exists()
+    assert not sidecar.exists()
+    assert fsynced_directories == [True]
+
+
+def test_checkpoint_pruning_streams_checkpoint_but_reads_small_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint, digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch001.pt",
+    )
+    sidecar = samga_train.samga_checkpoint_sidecar(checkpoint)
+    byte_reads: list[str] = []
+    real_read = samga_train._read_prunable_regular
+
+    def reject_checkpoint_byte_read(
+        parent: object,
+        leaf: str,
+        *,
+        context: str,
+    ) -> tuple[bytes, tuple[int, ...]]:
+        if leaf == checkpoint.name:
+            raise AssertionError(
+                "checkpoint payload must use streaming SHA-256"
+            )
+        byte_reads.append(leaf)
+        return real_read(parent, leaf, context=context)
+
+    monkeypatch.setattr(
+        samga_train,
+        "_read_prunable_regular",
+        reject_checkpoint_byte_read,
+    )
+
+    samga_train._prune_checkpoint_bundle(
+        checkpoint,
+        expected_sha256=digest,
+    )
+
+    assert byte_reads == [sidecar.name]
+    assert not checkpoint.exists()
+    assert not sidecar.exists()
+
+
+def test_checkpoint_pruning_rejects_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    target, digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "target.pt",
+    )
+    checkpoint = tmp_path / "checkpoint_epoch001.pt"
+    checkpoint.symlink_to(target)
+    sidecar = samga_train.samga_checkpoint_sidecar(checkpoint)
+    sidecar.write_bytes(
+        samga_train.canonical_json_bytes(
+            {
+                "complete": True,
+                "payload_sha256": digest,
+                "payload_type": "samga_brain_rw.epoch_checkpoint",
+                "schema_version": 1,
+                "scope": "train",
+            }
+        )
+        + b"\n"
+    )
+
+    with pytest.raises((PermissionError, ValueError), match="safe|regular|symlink"):
+        samga_train._prune_checkpoint_bundle(
+            checkpoint,
+            expected_sha256=digest,
+        )
+
+    assert target.is_file()
+    assert checkpoint.is_symlink()
+    assert sidecar.is_file()
+
+
+def test_checkpoint_pruning_uses_randomized_tombstones_before_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint, digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch001.pt",
+    )
+    renamed: list[tuple[str, str]] = []
+    real_rename = samga_train.os.rename
+
+    def record_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        renamed.append((source, destination))
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(samga_train.os, "rename", record_rename)
+
+    samga_train._prune_checkpoint_bundle(
+        checkpoint,
+        expected_sha256=digest,
+    )
+
+    assert {source for source, _ in renamed} == {
+        checkpoint.name,
+        samga_train.samga_checkpoint_sidecar(checkpoint).name,
+    }
+    assert len({destination for _, destination in renamed}) == 2
+    assert all(
+        destination.startswith(".checkpoint_epoch")
+        and ".prune-" in destination
+        for _, destination in renamed
+    )
+    assert not any(tmp_path.glob("*.prune-*"))
+
+
+def test_checkpoint_pruning_restores_tombstones_on_post_rename_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint, digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch001.pt",
+    )
+    sidecar = samga_train.samga_checkpoint_sidecar(checkpoint)
+    real_rename = samga_train.os.rename
+    swapped = False
+
+    def swap_before_checkpoint_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        nonlocal swapped
+        if source == checkpoint.name and not swapped:
+            swapped = True
+            samga_train.os.unlink(source, dir_fd=src_dir_fd)
+            descriptor = samga_train.os.open(
+                source,
+                samga_train.os.O_WRONLY
+                | samga_train.os.O_CREAT
+                | samga_train.os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                samga_train.os.write(descriptor, b"foreign-checkpoint")
+                samga_train.os.fsync(descriptor)
+            finally:
+                samga_train.os.close(descriptor)
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        samga_train.os,
+        "rename",
+        swap_before_checkpoint_rename,
+    )
+
+    with pytest.raises(ValueError, match="identity.*renam|changed.*prun"):
+        samga_train._prune_checkpoint_bundle(
+            checkpoint,
+            expected_sha256=digest,
+        )
+
+    assert swapped
+    assert checkpoint.read_bytes() == b"foreign-checkpoint"
+    assert sidecar.is_file()
+    assert not any(tmp_path.glob("*.prune-*"))
+
+
+def test_transient_checkpoint_retention_keeps_only_latest_bundle(
+    tmp_path: Path,
+) -> None:
+    retention = samga_train._CheckpointRetention()
+    first, first_digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch001.pt",
+    )
+    second, second_digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch002_step00000001.pt",
+    )
+
+    retention.record_published(
+        first,
+        first_digest,
+        retain_for_averaging=False,
+    )
+    retention.record_published(
+        second,
+        second_digest,
+        retain_for_averaging=False,
+    )
+    retention.validate_final(
+        completed=False,
+        final_checkpoint=second,
+    )
+
+    assert not first.exists()
+    assert not samga_train.samga_checkpoint_sidecar(first).exists()
+    assert second.is_file()
+    assert samga_train.samga_checkpoint_sidecar(second).is_file()
+    assert retention.hashes == {second.name: second_digest}
+
+
+def test_full_checkpoint_retention_keeps_exact_epochs_51_through_60(
+    tmp_path: Path,
+) -> None:
+    retention = samga_train._CheckpointRetention()
+    transient, transient_digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch050.pt",
+    )
+    retention.record_published(
+        transient,
+        transient_digest,
+        retain_for_averaging=False,
+    )
+    retained: list[tuple[Path, str]] = []
+    for epoch in range(51, 61):
+        checkpoint, digest = _fake_checkpoint_bundle(
+            tmp_path,
+            f"checkpoint_epoch{epoch:03d}.pt",
+        )
+        retention.record_published(
+            checkpoint,
+            digest,
+            retain_for_averaging=True,
+        )
+        retained.append((checkpoint, digest))
+
+    retention.validate_final(
+        completed=True,
+        final_checkpoint=retained[-1][0],
+    )
+
+    assert not transient.exists()
+    assert not samga_train.samga_checkpoint_sidecar(transient).exists()
+    assert retention.hashes == {
+        checkpoint.name: digest
+        for checkpoint, digest in retained
+    }
+    assert all(
+        checkpoint.is_file()
+        and samga_train.samga_checkpoint_sidecar(checkpoint).is_file()
+        for checkpoint, _ in retained
+    )
+
+
+def test_late_partial_retention_keeps_durable_prefix_and_latest_transient(
+    tmp_path: Path,
+) -> None:
+    retention = samga_train._CheckpointRetention()
+    retained: list[tuple[Path, str]] = []
+    for epoch in (51, 52):
+        checkpoint, digest = _fake_checkpoint_bundle(
+            tmp_path,
+            f"checkpoint_epoch{epoch:03d}.pt",
+        )
+        retention.record_published(
+            checkpoint,
+            digest,
+            retain_for_averaging=True,
+        )
+        retained.append((checkpoint, digest))
+    transient, transient_digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch053_step00000525.pt",
+    )
+
+    retention.record_published(
+        transient,
+        transient_digest,
+        retain_for_averaging=False,
+    )
+    retention.validate_final(
+        completed=False,
+        final_checkpoint=transient,
+    )
+
+    assert retention.hashes == {
+        **{
+            checkpoint.name: digest
+            for checkpoint, digest in retained
+        },
+        transient.name: transient_digest,
+    }
+    assert all(checkpoint.is_file() for checkpoint, _ in retained)
+    assert transient.is_file()
+
+
+def test_late_partial_retention_accepts_exact_durable_epoch_boundary(
+    tmp_path: Path,
+) -> None:
+    retention = samga_train._CheckpointRetention()
+    retained: list[tuple[Path, str]] = []
+    for epoch in (51, 52):
+        checkpoint, digest = _fake_checkpoint_bundle(
+            tmp_path,
+            f"checkpoint_epoch{epoch:03d}.pt",
+        )
+        retention.record_published(
+            checkpoint,
+            digest,
+            retain_for_averaging=True,
+        )
+        retained.append((checkpoint, digest))
+
+    retention.validate_final(
+        completed=False,
+        final_checkpoint=retained[-1][0],
+    )
+
+    assert retention.hashes == {
+        checkpoint.name: digest
+        for checkpoint, digest in retained
+    }
+
+
+def test_durable_checkpoint_retention_requires_contiguous_prefix(
+    tmp_path: Path,
+) -> None:
+    retention = samga_train._CheckpointRetention()
+    checkpoint, digest = _fake_checkpoint_bundle(
+        tmp_path,
+        "checkpoint_epoch052.pt",
+    )
+
+    with pytest.raises(ValueError, match="contiguous|epoch 51"):
+        retention.record_published(
+            checkpoint,
+            digest,
+            retain_for_averaging=True,
+        )
 
 
 def _realistic_adamw_state_dict() -> dict[str, object]:
@@ -293,7 +695,7 @@ def test_resume_environment_is_validated_before_manifest_or_dataset_access(
         lambda path, requested_scope: (
             events.append("resume")
             or samga_train.LoadedSAMGACheckpoint(
-                payload={"environment": mismatched},
+                payload={"epoch": 1, "environment": mismatched},
                 sha256=_h("actual-resume-file"),
             )
         ),
@@ -323,6 +725,90 @@ def test_resume_environment_is_validated_before_manifest_or_dataset_access(
         samga_train.run_training(SimpleNamespace(device="cuda"))
 
     assert events == ["git", "paths", "upstream", "resume"]
+
+
+@pytest.mark.parametrize(
+    ("resume_epoch", "expect_rejected"),
+    ((50, False), (51, True), (60, True)),
+)
+def test_resume_epoch_retention_boundary_is_enforced_before_manifest_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_epoch: int,
+    expect_rejected: bool,
+) -> None:
+    environment = _production_environment_binding()
+    paths = samga_train.TrainingPaths(
+        config=tmp_path / "config.json",
+        manifest=tmp_path / "sub-08_protocol.json",
+        feature_cache=tmp_path / "features.npy",
+        output_dir=tmp_path / "run",
+        stage2_config=None,
+        whitening_artifact=None,
+        resume_checkpoint=tmp_path / f"checkpoint_epoch{resume_epoch:03d}.pt",
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        samga_train,
+        "require_production_runtime",
+        lambda _device: SimpleNamespace(
+            device=torch.device("cuda:0"),
+            environment_binding=environment,
+            contract=PRODUCTION_RUNTIME_CONTRACT,
+            evidence={"accelerator_name": "NVIDIA A40"},
+        ),
+    )
+    monkeypatch.setattr(
+        samga_train,
+        "clean_repository_git_sha",
+        lambda: events.append("git") or "1" * 40,
+    )
+    monkeypatch.setattr(
+        samga_train,
+        "_guard_training_paths",
+        lambda _arguments: events.append("paths") or paths,
+    )
+    monkeypatch.setattr(
+        samga_train,
+        "preflight_upstream_config",
+        lambda _path: events.append("upstream") or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        samga_train,
+        "load_samga_checkpoint",
+        lambda _path, requested_scope: (
+            events.append("resume")
+            or samga_train.LoadedSAMGACheckpoint(
+                payload={
+                    "epoch": resume_epoch,
+                    "environment": environment,
+                },
+                sha256=_h(f"resume-{resume_epoch}"),
+            )
+        ),
+    )
+
+    def stop_at_manifest(*_args: object, **_kwargs: object) -> object:
+        events.append("manifest")
+        raise RuntimeError("manifest sentinel")
+
+    monkeypatch.setattr(
+        samga_train,
+        "load_development_manifest_identity",
+        stop_at_manifest,
+    )
+
+    if expect_rejected:
+        with pytest.raises(
+            ValueError,
+            match=r"resume.*epoch.*(?:51|60)|fresh.*recovery",
+        ):
+            samga_train.run_training(SimpleNamespace(device="cuda", subject=8))
+        assert events == ["git", "paths", "upstream", "resume"]
+    else:
+        with pytest.raises(RuntimeError, match="manifest sentinel"):
+            samga_train.run_training(SimpleNamespace(device="cuda", subject=8))
+        assert events == ["git", "paths", "upstream", "resume", "manifest"]
 
 
 def test_train_main_dispatches_the_production_runtime(

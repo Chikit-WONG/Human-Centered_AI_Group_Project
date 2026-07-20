@@ -366,6 +366,59 @@ def test_averaging_accepts_seed_zero_from_typed_checkpoint_bundle(
     assert torch.equal(averaged["weight"], torch.tensor([58.0, 60.0]))
 
 
+def test_public_epoch_checkpoint_verifier_exposes_complete_identity(
+    tmp_path: Path,
+) -> None:
+    path = _write_checkpoint(
+        tmp_path / "checkpoint_epoch056.pt",
+        epoch=56,
+        candidate_config_id="s2-layernorm-on",
+    )
+
+    verified = checkpoints_module.verify_epoch_checkpoint(path)
+
+    assert isinstance(
+        verified,
+        checkpoints_module.VerifiedEpochCheckpoint,
+    )
+    assert verified.path == path
+    assert verified.epoch == 56
+    assert verified.global_step == 560
+    assert verified.config_id == "s2-layernorm-on"
+    assert verified.run_key == verified.run_manifest["run_key"]
+    assert (
+        verified.candidate_spec_sha256
+        == verified.run_manifest["candidate_spec_sha256"]
+    )
+    assert (
+        verified.input_bundle_sha256
+        == sha256_json(dict(sorted(verified.input_hashes.items())))
+    )
+    assert verified.environment == verified.payload["environment"]
+    assert verified.runtime_state == verified.payload["runtime_state"]
+    assert verified.retention == verified.payload["retention"]
+    assert verified.model_state_dict
+
+
+def test_public_epoch_checkpoint_verifier_rejects_resigned_model_state_drift(
+    tmp_path: Path,
+) -> None:
+    path = _write_checkpoint(
+        tmp_path / "checkpoint_epoch056.pt",
+        epoch=56,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["model_state_dict"]["weight"][0] += 1
+    torch.save(payload, path)
+    sidecar = path.with_suffix(path.suffix + ".meta.json")
+    envelope = json.loads(sidecar.read_text(encoding="utf-8"))
+    envelope["payload_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    sidecar.write_bytes(canonical_json_bytes(envelope) + b"\n")
+
+    with pytest.raises(ValueError, match="model-state hash mismatch"):
+        checkpoints_module.verify_epoch_checkpoint(path)
+
+
 def test_build_averaged_checkpoint_accepts_seed_zero(
     tmp_path: Path,
 ) -> None:
