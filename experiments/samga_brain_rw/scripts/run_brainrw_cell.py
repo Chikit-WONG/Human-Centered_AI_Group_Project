@@ -184,9 +184,7 @@ def parse_arguments(
         "expected_semantic_environment_sha256",
     ):
         if _SHA256_RE.fullmatch(getattr(arguments, name)) is None:
-            parser.error(
-                f"--{name.replace('_', '-')} must be lowercase SHA-256"
-            )
+            parser.error(f"--{name.replace('_', '-')} must be lowercase SHA-256")
     expected_run_key = make_run_key(
         "brainrw-clip-lora",
         arguments.config_id,
@@ -204,10 +202,7 @@ def parse_arguments(
     if arguments.mode == "smoke":
         if arguments.resume != "none":
             parser.error("smoke mode requires --resume none")
-        if (
-            type(arguments.max_train_steps) is not int
-            or arguments.max_train_steps != 1
-        ):
+        if type(arguments.max_train_steps) is not int or arguments.max_train_steps != 1:
             parser.error("smoke mode requires --max-train-steps 1")
     else:
         if arguments.resume != "none":
@@ -248,8 +243,7 @@ def _preflight_inputs(arguments: argparse.Namespace) -> None:
         raise ValueError("project root must be an existing directory")
     expected_config = _project_file(
         arguments,
-        "experiments/samga_brain_rw/configs/"
-        "brainrw_clip_lora_v1.json",
+        "experiments/samga_brain_rw/configs/brainrw_clip_lora_v1.json",
     )
     expected_manifest = _project_file(
         arguments,
@@ -268,13 +262,8 @@ def _preflight_inputs(arguments: argparse.Namespace) -> None:
         project_root / "artifacts/samga_brain_rw",
         project_root / "results/samga_brain_rw",
     )
-    if not any(
-        _is_below(output, root)
-        for root in development_roots
-    ):
-        raise ValueError(
-            "BrainRW output must remain below a development output root"
-        )
+    if not any(_is_below(output, root) for root in development_roots):
+        raise ValueError("BrainRW output must remain below a development output root")
     if not output.parent.is_dir():
         raise ValueError("BrainRW output parent must already exist")
     for relative in (
@@ -337,9 +326,7 @@ def _environment(arguments: argparse.Namespace) -> dict[str, str]:
     environment = os.environ.copy()
     environment.update(
         {
-            "PYTHONPATH": str(
-                _project_file(arguments, "experiments/samga_brain_rw")
-            ),
+            "PYTHONPATH": str(_project_file(arguments, "experiments/samga_brain_rw")),
             "HF_DATASETS_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HF_HUB_OFFLINE": "1",
@@ -377,9 +364,7 @@ def _train_command(arguments: argparse.Namespace) -> list[str]:
         str(arguments.output_dir),
     ]
     if arguments.mode == "smoke":
-        command.extend(
-            ["--max-train-steps", str(arguments.max_train_steps)]
-        )
+        command.extend(["--max-train-steps", str(arguments.max_train_steps)])
     return command
 
 
@@ -392,8 +377,7 @@ def _score_command(
         str(
             _project_file(
                 arguments,
-                "experiments/samga_brain_rw/scripts/"
-                "emit_brainrw_scores.py",
+                "experiments/samga_brain_rw/scripts/emit_brainrw_scores.py",
             )
         ),
         "--scope",
@@ -425,9 +409,7 @@ def _complete_command(
         ),
         "complete-env",
         "--output-hashes",
-        canonical_json_bytes(dict(sorted(output_hashes.items()))).decode(
-            "utf-8"
-        ),
+        canonical_json_bytes(dict(sorted(output_hashes.items()))).decode("utf-8"),
     ]
 
 
@@ -532,9 +514,7 @@ def _validate_run_manifest(
         "protocol_sha256": manifest.protocol_sha256,
         "input_bundle_sha256": arguments.expected_input_bundle_sha256,
         "checkpoint_sha256": checkpoint.sha256,
-        "semantic_environment_sha256": (
-            arguments.expected_semantic_environment_sha256
-        ),
+        "semantic_environment_sha256": (arguments.expected_semantic_environment_sha256),
     }
     for field, expected_value in expected.items():
         if value[field] != expected_value:
@@ -561,17 +541,11 @@ def _validate_run_manifest(
     }
     for field in mirrored:
         if value[field] != checkpoint_payload[field]:
-            raise ValueError(
-                f"BrainRW run manifest/checkpoint {field} mismatch"
-            )
+            raise ValueError(f"BrainRW run manifest/checkpoint {field} mismatch")
     if value["completed_steps"] != checkpoint_payload["global_step"]:
-        raise ValueError(
-            "BrainRW run manifest/checkpoint completed steps mismatch"
-        )
+        raise ValueError("BrainRW run manifest/checkpoint completed steps mismatch")
     if value["training_complete"] != checkpoint_payload["training_complete"]:
-        raise ValueError(
-            "BrainRW run manifest/checkpoint completion flag mismatch"
-        )
+        raise ValueError("BrainRW run manifest/checkpoint completion flag mismatch")
     if config.sha256 != value["config_sha256"]:
         raise ValueError("BrainRW run manifest verified config mismatch")
     _validate_locked_schedule(
@@ -600,9 +574,7 @@ def _validate_locked_schedule(
     if training.get("batch_size") != 512:
         raise ValueError("BrainRW locked recipe requires batch size 512")
     if manifest.train_row_count != 12_540:
-        raise ValueError(
-            "BrainRW locked recipe requires 12540 training rows"
-        )
+        raise ValueError("BrainRW locked recipe requires 12540 training rows")
     expected_steps = 25 * ((12_540 + 512 - 1) // 512)
     if expected_steps != 625:
         raise AssertionError("BrainRW locked step derivation is invalid")
@@ -613,50 +585,32 @@ def _validate_locked_schedule(
         or payload.get("effective_batch_size") != 512
         or run_manifest.get("effective_batch_size") != 512
     ):
-        raise ValueError(
-            "BrainRW output differs from the locked 625-step recipe"
-        )
+        raise ValueError("BrainRW output differs from the locked 625-step recipe")
     if (
         "resumed_from_sha256" not in payload
         or payload["resumed_from_sha256"] is not None
         or "resumed_from_sha256" not in run_manifest
         or run_manifest["resumed_from_sha256"] is not None
     ):
-        raise ValueError(
-            "BrainRW locked recipe requires null resume parent provenance"
-        )
+        raise ValueError("BrainRW locked recipe requires null resume parent provenance")
     if arguments.mode == "smoke":
         expected_completed = 1
         expected_training_complete = False
-        if (
-            arguments.resume != "none"
-            or arguments.max_train_steps != 1
-        ):
-            raise ValueError(
-                "BrainRW smoke proof requires one fresh training step"
-            )
+        if arguments.resume != "none" or arguments.max_train_steps != 1:
+            raise ValueError("BrainRW smoke proof requires one fresh training step")
     else:
         expected_completed = expected_steps
         expected_training_complete = True
-        if (
-            arguments.resume != "none"
-            or arguments.max_train_steps is not None
-        ):
-            raise ValueError(
-                "BrainRW full proof requires one fresh complete run"
-            )
+        if arguments.resume != "none" or arguments.max_train_steps is not None:
+            raise ValueError("BrainRW full proof requires one fresh complete run")
     if (
         payload.get("global_step") != expected_completed
         or payload.get("steps") != expected_completed
         or run_manifest.get("completed_steps") != expected_completed
-        or payload.get("training_complete")
-        is not expected_training_complete
-        or run_manifest.get("training_complete")
-        is not expected_training_complete
+        or payload.get("training_complete") is not expected_training_complete
+        or run_manifest.get("training_complete") is not expected_training_complete
     ):
-        raise ValueError(
-            "BrainRW completed steps differ from the locked recipe"
-        )
+        raise ValueError("BrainRW completed steps differ from the locked recipe")
 
 
 def _brainrw_source_records(
@@ -712,23 +666,17 @@ def _validate_score_identity(
         if artifact.metadata[field] != expected_value:
             raise ValueError(f"BrainRW score {field} mismatch")
         if artifact.provenance[field] != expected_value:
-            raise ValueError(
-                f"BrainRW score provenance {field} mismatch"
-            )
-    if artifact.metadata["source_records"] != expected_source_records:
-        raise ValueError(
-            "BrainRW score source records differ from the manifest"
-        )
-    if artifact.metadata["ordered_ids"] != [
+            raise ValueError(f"BrainRW score provenance {field} mismatch")
+    if list(artifact.metadata["source_records"]) != expected_source_records:
+        raise ValueError("BrainRW score source records differ from the manifest")
+    if list(artifact.metadata["ordered_ids"]) != [
         *ordered_ids,
         *ordered_ids,
     ]:
         raise ValueError("BrainRW score ordered IDs differ from the manifest")
     if expected_stage == BRAINRW_TERMINAL_STAGE:
         runtime = {
-            "training_semantic_environment": checkpoint_payload[
-                "semantic_environment"
-            ],
+            "training_semantic_environment": checkpoint_payload["semantic_environment"],
             "training_semantic_environment_sha256": checkpoint_payload[
                 "semantic_environment_sha256"
             ],
@@ -738,28 +686,21 @@ def _validate_score_identity(
             "evaluation_semantic_environment_sha256": checkpoint_payload[
                 "semantic_environment_sha256"
             ],
-            "evaluation_runtime_contract": checkpoint_payload[
-                "runtime_contract"
-            ],
+            "evaluation_runtime_contract": checkpoint_payload["runtime_contract"],
             "evaluation_runtime_contract_sha256": checkpoint_payload[
                 "runtime_contract_sha256"
             ],
-            "evaluation_runtime_evidence": checkpoint_payload[
-                "runtime_evidence"
-            ],
+            "evaluation_runtime_evidence": checkpoint_payload["runtime_evidence"],
             "evaluation_runtime_evidence_sha256": checkpoint_payload[
                 "runtime_evidence_sha256"
             ],
         }
         for field, expected_value in runtime.items():
             if artifact.metadata[field] != expected_value:
-                raise ValueError(
-                    f"BrainRW score runtime binding {field} mismatch"
-                )
+                raise ValueError(f"BrainRW score runtime binding {field} mismatch")
             if artifact.provenance[field] != expected_value:
                 raise ValueError(
-                    "BrainRW score provenance runtime binding "
-                    f"{field} mismatch"
+                    f"BrainRW score provenance runtime binding {field} mismatch"
                 )
     else:
         progress = {
@@ -769,13 +710,9 @@ def _validate_score_identity(
         }
         for field, expected_value in progress.items():
             if artifact.metadata[field] != expected_value:
-                raise ValueError(
-                    f"BrainRW smoke progress {field} mismatch"
-                )
+                raise ValueError(f"BrainRW smoke progress {field} mismatch")
             if artifact.provenance[field] != expected_value:
-                raise ValueError(
-                    f"BrainRW smoke provenance {field} mismatch"
-                )
+                raise ValueError(f"BrainRW smoke provenance {field} mismatch")
 
 
 def _normalized_path_text(path: Path) -> str:
@@ -799,15 +736,11 @@ def _make_validated_proof(
         outputs.checkpoint_sha256 != checkpoint.sha256
         or outputs.run_manifest_sha256 != run_manifest_sha256
     ):
-        raise ValueError(
-            "BrainRW proof hashes differ from the validated artifacts"
-        )
+        raise ValueError("BrainRW proof hashes differ from the validated artifacts")
     payload = checkpoint.payload
     ordered_ids = tuple(manifest.val_dev_ordered_ids)
     query_ids_sha256 = ordered_ids_sha256(ordered_ids)
-    source_records_sha256 = sha256_json(
-        _brainrw_source_records(manifest)
-    )
+    source_records_sha256 = sha256_json(_brainrw_source_records(manifest))
     identity = MappingProxyType(
         {
             "mode": arguments.mode,
@@ -822,19 +755,13 @@ def _make_validated_proof(
             "manifest_sha256": manifest.manifest_sha256,
             "protocol_sha256": manifest.protocol_sha256,
             "records_sha256": manifest.records_sha256,
-            "source_manifest_sha256": (
-                manifest.source_manifest_sha256
-            ),
-            "source_payload_sha256": (
-                manifest.source_payload_sha256
-            ),
+            "source_manifest_sha256": (manifest.source_manifest_sha256),
+            "source_payload_sha256": (manifest.source_payload_sha256),
             "train_role_sha256": manifest.train_role_sha256,
             "val_dev_role_sha256": manifest.val_dev_role_sha256,
             "train_row_count": manifest.train_row_count,
             "val_dev_row_count": manifest.val_dev_row_count,
-            "input_bundle_sha256": (
-                arguments.expected_input_bundle_sha256
-            ),
+            "input_bundle_sha256": (arguments.expected_input_bundle_sha256),
             "semantic_environment_sha256": (
                 arguments.expected_semantic_environment_sha256
             ),
@@ -868,9 +795,7 @@ def _make_validated_proof(
         source_manifest_sha256=manifest.source_manifest_sha256,
         source_payload_sha256=manifest.source_payload_sha256,
         source_records_sha256=source_records_sha256,
-        alignment_sha256=ordered_ids_sha256(
-            [*ordered_ids, *ordered_ids]
-        ),
+        alignment_sha256=ordered_ids_sha256([*ordered_ids, *ordered_ids]),
         query_ids_sha256=query_ids_sha256,
         gallery_ids_sha256=query_ids_sha256,
         sealed_argv=sealed_argv,
@@ -892,33 +817,23 @@ def _validate_proof_arguments(
         "config_sha256": arguments.expected_config_sha256,
         "clip_path": _normalized_path_text(arguments.clip_path),
         "manifest_path": _normalized_path_text(arguments.manifest),
-        "input_bundle_sha256": (
-            arguments.expected_input_bundle_sha256
-        ),
-        "semantic_environment_sha256": (
-            arguments.expected_semantic_environment_sha256
-        ),
+        "input_bundle_sha256": (arguments.expected_input_bundle_sha256),
+        "semantic_environment_sha256": (arguments.expected_semantic_environment_sha256),
         "output_dir": _normalized_path_text(arguments.output_dir),
     }
     for field, expected_value in expected.items():
         if proof.identity.get(field) != expected_value:
-            raise ValueError(
-                f"BrainRW proof {field} differs from runner arguments"
-            )
+            raise ValueError(f"BrainRW proof {field} differs from runner arguments")
     if (
         "resumed_from_sha256" not in proof.identity
         or proof.identity["resumed_from_sha256"] is not None
     ):
-        raise ValueError(
-            "BrainRW proof must bind null resume parent provenance"
-        )
+        raise ValueError("BrainRW proof must bind null resume parent provenance")
     if (
-        proof.outputs.checkpoint_sha256
-        != proof.identity.get("checkpoint_sha256")
+        proof.outputs.checkpoint_sha256 != proof.identity.get("checkpoint_sha256")
         or proof.outputs.run_manifest_sha256
         != proof.identity.get("run_manifest_sha256")
-        or proof.run_manifest_sha256
-        != proof.identity.get("run_manifest_sha256")
+        or proof.run_manifest_sha256 != proof.identity.get("run_manifest_sha256")
     ):
         raise ValueError("BrainRW proof output identity is inconsistent")
     direct = {
@@ -931,33 +846,21 @@ def _validate_proof_arguments(
         "split_role": "val-dev",
         "protocol_sha256": proof.manifest.protocol_sha256,
         "manifest_sha256": proof.manifest.manifest_sha256,
-        "source_manifest_sha256": (
-            proof.manifest.source_manifest_sha256
-        ),
-        "source_payload_sha256": (
-            proof.manifest.source_payload_sha256
-        ),
-        "source_records_sha256": sha256_json(
-            _brainrw_source_records(proof.manifest)
-        ),
+        "source_manifest_sha256": (proof.manifest.source_manifest_sha256),
+        "source_payload_sha256": (proof.manifest.source_payload_sha256),
+        "source_records_sha256": sha256_json(_brainrw_source_records(proof.manifest)),
         "alignment_sha256": ordered_ids_sha256(
             [
                 *proof.manifest.val_dev_ordered_ids,
                 *proof.manifest.val_dev_ordered_ids,
             ]
         ),
-        "query_ids_sha256": (
-            proof.manifest.val_dev_ordered_ids_sha256
-        ),
-        "gallery_ids_sha256": (
-            proof.manifest.val_dev_ordered_ids_sha256
-        ),
+        "query_ids_sha256": (proof.manifest.val_dev_ordered_ids_sha256),
+        "gallery_ids_sha256": (proof.manifest.val_dev_ordered_ids_sha256),
     }
     for field_name, expected_value in direct.items():
         if getattr(proof, field_name) != expected_value:
-            raise ValueError(
-                f"BrainRW proof {field_name} binding mismatch"
-            )
+            raise ValueError(f"BrainRW proof {field_name} binding mismatch")
 
 
 def _validate_brainrw_training_once(
@@ -996,9 +899,7 @@ def _validate_brainrw_training_once(
     if checkpoint.payload["semantic_environment_sha256"] != (
         arguments.expected_semantic_environment_sha256
     ):
-        raise ValueError(
-            "BrainRW checkpoint semantic environment differs from job map"
-        )
+        raise ValueError("BrainRW checkpoint semantic environment differs from job map")
     if checkpoint.payload["input_bundle_sha256"] != (
         arguments.expected_input_bundle_sha256
     ):
@@ -1027,10 +928,8 @@ def _validate_brainrw_training_once(
     if arguments.mode == "smoke":
         if (
             checkpoint.payload["training_complete"] is not False
-            or checkpoint.payload["global_step"]
-            != arguments.max_train_steps
-            or checkpoint.payload["global_step"]
-            >= checkpoint.payload["planned_steps"]
+            or checkpoint.payload["global_step"] != arguments.max_train_steps
+            or checkpoint.payload["global_step"] >= checkpoint.payload["planned_steps"]
             or run_manifest["training_smoke_score_directory"]
             != "training_smoke/in_loop"
         ):
@@ -1056,8 +955,7 @@ def _validate_brainrw_training_once(
     else:
         if (
             checkpoint.payload["training_complete"] is not True
-            or checkpoint.payload["global_step"]
-            != checkpoint.payload["planned_steps"]
+            or checkpoint.payload["global_step"] != checkpoint.payload["planned_steps"]
             or run_manifest["training_smoke_score_directory"] is not None
         ):
             raise ValueError("BrainRW full output is not terminal")
@@ -1102,9 +1000,7 @@ def _validate_brainrw_proof_outputs(
     outputs = proof.outputs
     if arguments.mode == "smoke":
         if not isinstance(proof.score_artifact, ScoreArtifact):
-            raise TypeError(
-                "BrainRW smoke proof requires a typed ScoreArtifact"
-            )
+            raise TypeError("BrainRW smoke proof requires a typed ScoreArtifact")
         return replace(
             proof,
             completion_output_hashes=MappingProxyType(
@@ -1123,9 +1019,7 @@ def _validate_brainrw_proof_outputs(
         expected_stage=BRAINRW_TERMINAL_STAGE,
     )
     if not isinstance(score, ScoreArtifact):
-        raise TypeError(
-            "BrainRW terminal proof requires a typed ScoreArtifact"
-        )
+        raise TypeError("BrainRW terminal proof requires a typed ScoreArtifact")
     final_outputs = replace(
         outputs,
         score_directory=score.directory,
@@ -1149,11 +1043,7 @@ def validate_brainrw_outputs(
 ) -> BrainRWOutputs:
     """Capture once when needed, then validate through the frozen proof."""
 
-    selected = (
-        _validate_brainrw_training_once(arguments)
-        if proof is None
-        else proof
-    )
+    selected = _validate_brainrw_training_once(arguments) if proof is None else proof
     return _validate_brainrw_outputs_from_proof(
         arguments,
         selected,
@@ -1176,32 +1066,24 @@ def validate_brainrw_map_config(
     try:
         arguments = parse_arguments(command[2:])
     except SystemExit as exc:
-        raise ValueError(
-            "sealed BrainRW runner argument parsing failed"
-        ) from exc
+        raise ValueError("sealed BrainRW runner argument parsing failed") from exc
     expected_runner = (
         br.reject_development_path(arguments.project_root, "project root")
         / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
     )
     if Path(command[1]) != expected_runner:
-        raise ValueError(
-            "sealed BrainRW runner path differs from project-root binding"
-        )
+        raise ValueError("sealed BrainRW runner path differs from project-root binding")
     config = br.verify_brainrw_config(
         arguments.config,
         arguments.clip_path,
     )
     if (
-        Path(config.path)
-        != Path(_normalized_path_text(arguments.config))
-        or Path(config.clip_path)
-        != Path(_normalized_path_text(arguments.clip_path))
+        Path(config.path) != Path(_normalized_path_text(arguments.config))
+        or Path(config.clip_path) != Path(_normalized_path_text(arguments.clip_path))
         or config.payload.get("config_id") != arguments.config_id
         or config.sha256 != arguments.expected_config_sha256
     ):
-        raise ValueError(
-            "sealed BrainRW config/CLIP identity drifted from the job map"
-        )
+        raise ValueError("sealed BrainRW config/CLIP identity drifted from the job map")
     return config
 
 
@@ -1239,13 +1121,10 @@ def _parse_sealed_brainrw_command(
     ):
         br.reject_development_path(getattr(arguments, field), context)
     expected_runner = (
-        project_root
-        / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
+        project_root / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
     )
     if Path(command[1]) != expected_runner:
-        raise ValueError(
-            "sealed BrainRW runner path differs from project-root binding"
-        )
+        raise ValueError("sealed BrainRW runner path differs from project-root binding")
     return arguments
 
 
@@ -1266,9 +1145,7 @@ def validate_brainrw_command_proof(
     )
     validated = _validate_brainrw_proof_outputs(arguments, proof)
     if not isinstance(validated, ValidatedBrainRWRunProof):
-        raise TypeError(
-            "BrainRW command validation did not return a typed run proof"
-        )
+        raise TypeError("BrainRW command validation did not return a typed run proof")
     if not isinstance(validated.config, br.BrainRWConfigIdentity):
         raise TypeError("BrainRW command proof lacks a typed config")
     if not isinstance(validated.manifest, br.ManifestIdentity):
@@ -1279,9 +1156,7 @@ def validate_brainrw_command_proof(
     ):
         raise TypeError("BrainRW command proof lacks a typed checkpoint")
     if not isinstance(validated.score_artifact, ScoreArtifact):
-        raise TypeError(
-            "BrainRW command proof lacks a typed ScoreArtifact"
-        )
+        raise TypeError("BrainRW command proof lacks a typed ScoreArtifact")
     if validated.sealed_argv != tuple(argv):
         raise ValueError("BrainRW command proof sealed argv mismatch")
     expected_names = (
@@ -1299,16 +1174,12 @@ def validate_brainrw_command_proof(
         }
     )
     if set(validated.completion_output_hashes) != expected_names:
-        raise ValueError(
-            "BrainRW proof completion output names mismatch"
-        )
+        raise ValueError("BrainRW proof completion output names mismatch")
     if dict(validated.completion_output_hashes) != _completion_hashes(
         validated.outputs,
         arguments.mode,
     ):
-        raise ValueError(
-            "BrainRW proof completion hashes differ from typed outputs"
-        )
+        raise ValueError("BrainRW proof completion hashes differ from typed outputs")
     return validated
 
 
@@ -1334,9 +1205,7 @@ def _completion_hashes(outputs: BrainRWOutputs, mode: str) -> dict[str, str]:
     if mode == "smoke":
         if outputs.in_loop_metadata_sha256 is None:
             raise ValueError("BrainRW smoke output lacks in-loop metadata")
-        hashes["in_loop_metadata_sha256"] = (
-            outputs.in_loop_metadata_sha256
-        )
+        hashes["in_loop_metadata_sha256"] = outputs.in_loop_metadata_sha256
     else:
         if (
             outputs.score_payload_sha256 is None

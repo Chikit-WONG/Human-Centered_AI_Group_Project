@@ -115,8 +115,7 @@ _SEALED_COMPONENTS = frozenset(
     }
 )
 _FORMAL_TEST_RECORD_SHA256 = (
-    "02d7e33b3fe8e5a571f8db232ca5fa86"
-    "abb0c16981876ec84feae7ba64636f1a"
+    "02d7e33b3fe8e5a571f8db232ca5fa86abb0c16981876ec84feae7ba64636f1a"
 )
 _EVALUATION_DIRECTORIES = (
     "saved_checkpoint",
@@ -127,16 +126,12 @@ _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _FULL_RETAINED_CHECKPOINT_NAMES = tuple(
-    f"checkpoint_epoch{epoch:03d}.pt"
-    for epoch in range(51, 61)
+    f"checkpoint_epoch{epoch:03d}.pt" for epoch in range(51, 61)
 )
 _LEGACY_ALL_CHECKPOINT_NAMES = tuple(
-    f"checkpoint_epoch{epoch:03d}.pt"
-    for epoch in range(1, 61)
+    f"checkpoint_epoch{epoch:03d}.pt" for epoch in range(1, 61)
 )
-_LEGACY_STAGE0_ALL_CHECKPOINTS_GIT_SHA = (
-    "aed25e2e5756cc1f08a859d385ffb116364fa2f9"
-)
+_LEGACY_STAGE0_ALL_CHECKPOINTS_GIT_SHA = "aed25e2e5756cc1f08a859d385ffb116364fa2f9"
 _LEGACY_STAGE0_RUN_MANIFEST_FILE_SHA256 = {
     (
         "stage0__internvit_baseline_v1__sub-01__seed-42__"
@@ -295,10 +290,7 @@ def parse_arguments(
     if arguments.output_dir.name != arguments.run_key:
         parser.error("--output-dir basename must equal --run-key")
     if arguments.mode == "smoke":
-        if (
-            type(arguments.max_train_steps) is not int
-            or arguments.max_train_steps <= 0
-        ):
+        if type(arguments.max_train_steps) is not int or arguments.max_train_steps <= 0:
             parser.error("smoke mode requires positive --max-train-steps")
         if arguments.resume != "none":
             parser.error("smoke mode requires --resume none")
@@ -318,9 +310,7 @@ def parse_arguments(
             parser.error("Stage 2 requires --stage2-config and --candidate-id")
         if arguments.candidate_id != arguments.config_id:
             parser.error("--candidate-id must equal --config-id")
-        if (arguments.adapter_rank is None) != (
-            arguments.adapter_lr_ratio is None
-        ):
+        if (arguments.adapter_rank is None) != (arguments.adapter_lr_ratio is None):
             parser.error("adapter rank and LR ratio must be supplied together")
     return arguments
 
@@ -418,9 +408,7 @@ def _canonical_json_line(path: Path, context: str) -> dict[str, object]:
 
 
 def _mapping(value: object, context: str) -> dict[str, object]:
-    if not isinstance(value, Mapping) or any(
-        not isinstance(key, str) for key in value
-    ):
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{context} must be a string-keyed mapping")
     return dict(value)
 
@@ -438,9 +426,7 @@ def _is_allowed_legacy_stage0_manifest(
 ) -> bool:
     if run_manifest_file_sha256 is None:
         return False
-    actual_file_sha256 = hashlib.sha256(
-        canonical_json_bytes(value) + b"\n"
-    ).hexdigest()
+    actual_file_sha256 = hashlib.sha256(canonical_json_bytes(value) + b"\n").hexdigest()
     expected_file_sha256 = _LEGACY_STAGE0_RUN_MANIFEST_FILE_SHA256.get(
         arguments.run_key
     )
@@ -451,10 +437,8 @@ def _is_allowed_legacy_stage0_manifest(
         and arguments.stage == 0
         and arguments.config_id == "internvit_baseline_v1"
         and value.get("schema_version") == 1
-        and value.get("payload_type")
-        == "samga_brain_rw.development_run"
-        and value.get("git_sha")
-        == _LEGACY_STAGE0_ALL_CHECKPOINTS_GIT_SHA
+        and value.get("payload_type") == "samga_brain_rw.development_run"
+        and value.get("git_sha") == _LEGACY_STAGE0_ALL_CHECKPOINTS_GIT_SHA
         and value.get("run_key") == arguments.run_key
     )
 
@@ -481,12 +465,9 @@ def _validate_checkpoint_retention_manifest(
         for name, digest in raw_hashes.items()
     }
     if final_name not in hashes:
-        raise ValueError(
-            "final checkpoint retention name is absent from hashes"
-        )
+        raise ValueError("final checkpoint retention name is absent from hashes")
     if any(
-        Path(name).name != name
-        or _CHECKPOINT_NAME_RE.fullmatch(name) is None
+        Path(name).name != name or _CHECKPOINT_NAME_RE.fullmatch(name) is None
         for name in hashes
     ):
         raise ValueError("checkpoint retention contains an invalid name")
@@ -510,19 +491,13 @@ def _validate_checkpoint_retention_manifest(
             or final_name != _FULL_RETAINED_CHECKPOINT_NAMES[-1]
         ):
             raise ValueError(
-                "full checkpoint retention must contain exact epochs 51 "
-                "through 60"
+                "full checkpoint retention must contain exact epochs 51 through 60"
             )
     else:
         durable_names = tuple(
-            name
-            for name in _FULL_RETAINED_CHECKPOINT_NAMES
-            if name in hashes
+            name for name in _FULL_RETAINED_CHECKPOINT_NAMES if name in hashes
         )
-        if (
-            durable_names
-            != _FULL_RETAINED_CHECKPOINT_NAMES[: len(durable_names)]
-        ):
+        if durable_names != _FULL_RETAINED_CHECKPOINT_NAMES[: len(durable_names)]:
             raise ValueError(
                 "smoke durable checkpoint retention must be a contiguous "
                 "prefix beginning at epoch 51"
@@ -538,14 +513,12 @@ def _validate_checkpoint_retention_manifest(
             assert match is not None
             if int(match.group("epoch")) > 51:
                 raise ValueError(
-                    "smoke checkpoint retention is missing its durable "
-                    "prefix"
+                    "smoke checkpoint retention is missing its durable prefix"
                 )
         elif not transient_names:
             if final_name != durable_names[-1]:
                 raise ValueError(
-                    "smoke checkpoint retention boundary final checkpoint "
-                    "mismatch"
+                    "smoke checkpoint retention boundary final checkpoint mismatch"
                 )
         elif len(transient_names) == 1:
             transient_name = next(iter(transient_names))
@@ -564,8 +537,7 @@ def _validate_checkpoint_retention_manifest(
                 )
         else:
             raise ValueError(
-                "smoke checkpoint retention may contain at most one "
-                "transient"
+                "smoke checkpoint retention may contain at most one transient"
             )
     final_sha256 = _sha256(
         value.get("final_checkpoint_sha256"),
@@ -587,9 +559,7 @@ def _validate_runtime_manifest_metadata(
         "run manifest runtime_contract",
     )
     if runtime_contract != environment["runtime_contract"]:
-        raise ValueError(
-            "run manifest runtime_contract differs from environment"
-        )
+        raise ValueError("run manifest runtime_contract differs from environment")
     runtime_contract_sha256 = _sha256(
         value["runtime_contract_sha256"],
         "run manifest runtime_contract_sha256",
@@ -600,10 +570,7 @@ def _validate_runtime_manifest_metadata(
         value["semantic_environment_sha256"],
         "run manifest semantic_environment_sha256",
     )
-    if (
-        semantic_environment_sha256
-        != environment["semantic_environment_sha256"]
-    ):
+    if semantic_environment_sha256 != environment["semantic_environment_sha256"]:
         raise ValueError("run manifest semantic environment hash mismatch")
 
     evidence = _mapping(
@@ -616,21 +583,14 @@ def _validate_runtime_manifest_metadata(
         )
     if evidence["cuda_available"] is not True:
         raise ValueError("run manifest runtime evidence requires CUDA")
-    if (
-        type(evidence["device_count"]) is not int
-        or evidence["device_count"] < 1
-    ):
-        raise ValueError(
-            "run manifest runtime evidence device_count must be positive"
-        )
+    if type(evidence["device_count"]) is not int or evidence["device_count"] < 1:
+        raise ValueError("run manifest runtime evidence device_count must be positive")
     for key in _RUNTIME_EVIDENCE_KEYS - {
         "cuda_available",
         "device_count",
     }:
         if evidence[key] != runtime_contract[key]:
-            raise ValueError(
-                f"run manifest runtime evidence {key} mismatch"
-            )
+            raise ValueError(f"run manifest runtime evidence {key} mismatch")
 
 
 def _validate_run_manifest(
@@ -782,10 +742,9 @@ def _sha256_regular_at(
             )
         except OSError as exc:
             raise ValueError(f"{context} changed during read") from exc
-        if (
-            _fd_identity(before) != _fd_identity(after)
-            or _fd_identity(after) != _fd_identity(named_after)
-        ):
+        if _fd_identity(before) != _fd_identity(after) or _fd_identity(
+            after
+        ) != _fd_identity(named_after):
             raise ValueError(f"{context} changed while read")
         return digest.hexdigest()
     finally:
@@ -803,10 +762,7 @@ def _canonical_json_document(
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{context} is invalid JSON") from exc
-    if (
-        not isinstance(value, dict)
-        or canonical_json_bytes(value) + b"\n" != raw
-    ):
+    if not isinstance(value, dict) or canonical_json_bytes(value) + b"\n" != raw:
         raise ValueError(f"{context} is not canonical JSON")
     return value
 
@@ -820,9 +776,7 @@ def _crossbind_verified_checkpoint(
     run_manifest: Mapping[str, object],
     arguments: argparse.Namespace,
 ) -> None:
-    normalized_path = Path(
-        os.path.abspath(os.path.normpath(os.fspath(path)))
-    )
+    normalized_path = Path(os.path.abspath(os.path.normpath(os.fspath(path))))
     if verified.path != normalized_path:
         raise ValueError(f"retained checkpoint {name} path mismatch")
     if verified.sha256 != expected_sha256:
@@ -847,32 +801,19 @@ def _crossbind_verified_checkpoint(
     }
     for field, expected in expected_identity.items():
         if getattr(verified, field) != expected:
-            raise ValueError(
-                f"retained checkpoint {name} {field} mismatch"
-            )
+            raise ValueError(f"retained checkpoint {name} {field} mismatch")
     if expected_epoch >= 51 and verified.optimizer_stage != "stage2":
-        raise ValueError(
-            f"retained checkpoint {name} optimizer stage mismatch"
-        )
+        raise ValueError(f"retained checkpoint {name} optimizer stage mismatch")
     if (
         validate_environment_binding(verified.environment)
         != run_manifest["environment"]
     ):
-        raise ValueError(
-            f"retained checkpoint {name} environment mismatch"
-        )
-    expected_manifest = {
-        key: run_manifest[key]
-        for key in _RUN_MANIFEST_BASE_KEYS
-    }
+        raise ValueError(f"retained checkpoint {name} environment mismatch")
+    expected_manifest = {key: run_manifest[key] for key in _RUN_MANIFEST_BASE_KEYS}
     if dict(verified.run_manifest) != expected_manifest:
-        raise ValueError(
-            f"retained checkpoint {name} run_key/run manifest mismatch"
-        )
+        raise ValueError(f"retained checkpoint {name} run_key/run manifest mismatch")
     candidate_expected = {
-        "candidate_spec_sha256": run_manifest[
-            "candidate_spec_sha256"
-        ],
+        "candidate_spec_sha256": run_manifest["candidate_spec_sha256"],
         "config_id": arguments.config_id,
         "data_order_sha256": run_manifest["data_order_sha256"],
         "input_bundle_sha256": arguments.expected_input_bundle_sha256,
@@ -881,41 +822,28 @@ def _crossbind_verified_checkpoint(
     }
     for field, expected in candidate_expected.items():
         if verified.candidate_spec.get(field) != expected:
-            raise ValueError(
-                f"retained checkpoint {name} candidate {field} mismatch"
-            )
+            raise ValueError(f"retained checkpoint {name} candidate {field} mismatch")
     epoch_complete = verified.runtime_state.get("epoch_complete")
     if type(epoch_complete) is not bool:
-        raise ValueError(
-            f"retained checkpoint {name} epoch_complete mismatch"
-        )
+        raise ValueError(f"retained checkpoint {name} epoch_complete mismatch")
     expected_epoch_complete = match.group("partial") is None
     if epoch_complete is not expected_epoch_complete:
-        raise ValueError(
-            f"retained checkpoint {name} epoch_complete/filename mismatch"
-        )
-    if verified.runtime_state.get(
-        "resume_source_checkpoint_sha256"
-    ) != run_manifest["resume_source_checkpoint_sha256"]:
-        raise ValueError(
-            f"retained checkpoint {name} resume source mismatch"
-        )
+        raise ValueError(f"retained checkpoint {name} epoch_complete/filename mismatch")
+    if (
+        verified.runtime_state.get("resume_source_checkpoint_sha256")
+        != run_manifest["resume_source_checkpoint_sha256"]
+    ):
+        raise ValueError(f"retained checkpoint {name} resume source mismatch")
     retention = verified.retention
     if name in _FULL_RETAINED_CHECKPOINT_NAMES:
         if (
-            retention.get("policy")
-            != "retain_exact_epochs_51_through_60"
-            or retention.get("required_epochs")
-            != list(range(51, 61))
+            retention.get("policy") != "retain_exact_epochs_51_through_60"
+            or retention.get("required_epochs") != list(range(51, 61))
             or retention.get("retain_for_averaging") is not True
         ):
-            raise ValueError(
-                f"retained checkpoint {name} epoch/retention mismatch"
-            )
+            raise ValueError(f"retained checkpoint {name} epoch/retention mismatch")
     elif retention.get("retain_for_averaging") is not False:
-        raise ValueError(
-            f"transient checkpoint {name} retention mismatch"
-        )
+        raise ValueError(f"transient checkpoint {name} retention mismatch")
 
 
 def _validate_retained_checkpoint_outputs(
@@ -944,15 +872,11 @@ def _validate_retained_checkpoint_outputs(
             os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_DIRECTORY,
         )
     except OSError as exc:
-        raise ValueError(
-            "checkpoint retention output cannot be opened safely"
-        ) from exc
+        raise ValueError("checkpoint retention output cannot be opened safely") from exc
     try:
         before = os.fstat(directory_fd)
         if not stat.S_ISDIR(before.st_mode):
-            raise ValueError(
-                "checkpoint retention output must be a directory"
-            )
+            raise ValueError("checkpoint retention output must be a directory")
         try:
             path_before = os.stat(output, follow_symlinks=False)
             names = os.listdir(directory_fd)
@@ -961,13 +885,9 @@ def _validate_retained_checkpoint_outputs(
                 "checkpoint retention output cannot be inspected safely"
             ) from exc
         if _fd_identity(path_before) != _fd_identity(before):
-            raise ValueError(
-                "checkpoint retention output path identity mismatch"
-            )
+            raise ValueError("checkpoint retention output path identity mismatch")
         observed_names = {
-            name
-            for name in names
-            if name.lstrip(".").startswith("checkpoint_epoch")
+            name for name in names if name.lstrip(".").startswith("checkpoint_epoch")
         }
         if observed_names != expected_names:
             raise ValueError(
@@ -985,9 +905,7 @@ def _validate_retained_checkpoint_outputs(
                     )
                     != expected_sha256
                 ):
-                    raise ValueError(
-                        f"retained checkpoint {name} hash mismatch"
-                    )
+                    raise ValueError(f"retained checkpoint {name} hash mismatch")
             else:
                 verified = verify_epoch_checkpoint(output / name)
                 _crossbind_verified_checkpoint(
@@ -1016,8 +934,7 @@ def _validate_retained_checkpoint_outputs(
                 or sidecar.get("payload_sha256") != expected_sha256
             ):
                 raise ValueError(
-                    f"retained checkpoint sidecar {sidecar_name} "
-                    "binding mismatch"
+                    f"retained checkpoint sidecar {sidecar_name} binding mismatch"
                 )
         after = os.fstat(directory_fd)
         try:
@@ -1026,13 +943,10 @@ def _validate_retained_checkpoint_outputs(
             raise ValueError(
                 "checkpoint retention output changed during validation"
             ) from exc
-        if (
-            _fd_identity(before) != _fd_identity(after)
-            or _fd_identity(after) != _fd_identity(path_after)
-        ):
-            raise ValueError(
-                "checkpoint retention output changed during validation"
-            )
+        if _fd_identity(before) != _fd_identity(after) or _fd_identity(
+            after
+        ) != _fd_identity(path_after):
+            raise ValueError("checkpoint retention output changed during validation")
     finally:
         os.close(directory_fd)
     if final_verified is None:
@@ -1066,9 +980,7 @@ def _validate_checkpoint(
     if arguments.mode == "smoke":
         expected_complete = "_step" not in path.name
         if epoch_complete is not expected_complete:
-            raise ValueError(
-                "smoke checkpoint completion differs from filename"
-            )
+            raise ValueError("smoke checkpoint completion differs from filename")
     elif checkpoint.epoch != 60 or not epoch_complete:
         raise ValueError("full checkpoint must be epoch-60 complete")
     return checkpoint.payload, checkpoint.sha256
@@ -1108,32 +1020,23 @@ def _validate_in_loop_score_artifact(
 
     if arguments.mode == "smoke":
         if metadata.get("training_complete") is not False:
-            raise ValueError(
-                "smoke in-loop score training_complete must be false"
-            )
+            raise ValueError("smoke in-loop score training_complete must be false")
         global_step = metadata.get("global_step")
         if (
             type(global_step) is not int
             or global_step != run_manifest["global_step"]
             or global_step != arguments.max_train_steps
         ):
-            raise ValueError(
-                "smoke in-loop score global_step mismatch"
-            )
+            raise ValueError("smoke in-loop score global_step mismatch")
         planned_steps = metadata.get("planned_steps")
-        if (
-            type(planned_steps) is not int
-            or planned_steps <= global_step
-        ):
+        if type(planned_steps) is not int or planned_steps <= global_step:
             raise ValueError(
                 "smoke in-loop score planned_steps must exceed global_step"
             )
 
     source_records = metadata.get("source_records")
     if not isinstance(source_records, (list, tuple)) or len(source_records) != 1:
-        raise ValueError(
-            "in-loop score must bind exactly one source record"
-        )
+        raise ValueError("in-loop score must bind exactly one source record")
     source = _mapping(
         source_records[0],
         "in-loop score source record",
@@ -1160,8 +1063,7 @@ def _validate_in_loop_score_artifact(
             and source.get(source_key) != input_hashes[input_key]
         ):
             raise ValueError(
-                "in-loop score source record "
-                f"{source_key} input hash mismatch"
+                f"in-loop score source record {source_key} input hash mismatch"
             )
     derived_input_bindings = {
         "source_payload_byte_count": "source_payload_byte_count_sha256",
@@ -1173,17 +1075,13 @@ def _validate_in_loop_score_artifact(
             and sha256_json(source.get(source_key)) != input_hashes[input_key]
         ):
             raise ValueError(
-                "in-loop score source record "
-                f"{source_key} input hash mismatch"
+                f"in-loop score source record {source_key} input hash mismatch"
             )
     if (
         "input_bundle_sha256" in source
-        and source["input_bundle_sha256"]
-        != arguments.expected_input_bundle_sha256
+        and source["input_bundle_sha256"] != arguments.expected_input_bundle_sha256
     ):
-        raise ValueError(
-            "in-loop score source record input_bundle_sha256 mismatch"
-        )
+        raise ValueError("in-loop score source record input_bundle_sha256 mismatch")
 
 
 def _parse_sealed_training_command(
@@ -1196,31 +1094,24 @@ def _parse_sealed_training_command(
         or len(argv) < 3
         or any(not isinstance(value, str) or not value for value in argv)
     ):
-        raise ValueError(
-            "sealed training runner argv must be a string sequence"
-        )
+        raise ValueError("sealed training runner argv must be a string sequence")
     command = list(argv)
     if command[0] != "python":
         raise ValueError("sealed training runner argv prefix mismatch")
     try:
         arguments = parse_arguments(command[2:])
     except SystemExit as exc:
-        raise ValueError(
-            "sealed training runner argument parsing failed"
-        ) from exc
+        raise ValueError("sealed training runner argument parsing failed") from exc
     if expected_mode not in (None, "smoke", "full"):
         raise ValueError("expected_mode must be smoke, full, or None")
     if expected_mode is not None and arguments.mode != expected_mode:
-        raise ValueError(
-            "sealed training runner mode differs from expected_mode"
-        )
+        raise ValueError("sealed training runner mode differs from expected_mode")
     project_root = _development_path(
         arguments.project_root,
         "sealed training command project root",
     )
     expected_runner = (
-        project_root
-        / "experiments/samga_brain_rw/scripts/run_training_cell.py"
+        project_root / "experiments/samga_brain_rw/scripts/run_training_cell.py"
     )
     if Path(command[1]) != expected_runner:
         raise ValueError(
@@ -1270,21 +1161,13 @@ def validate_training_command_proof(
     if arguments.mode == "full":
         proof = _validate_full_training_proof(arguments, proof)
     if not isinstance(proof, ValidatedTrainingRunProof):
-        raise TypeError(
-            "training command validation did not return a typed run proof"
-        )
+        raise TypeError("training command validation did not return a typed run proof")
     if not isinstance(proof.checkpoint, VerifiedEpochCheckpoint):
-        raise TypeError(
-            "training command proof lacks a typed checkpoint"
-        )
+        raise TypeError("training command proof lacks a typed checkpoint")
     if not isinstance(proof.in_loop_score, ScoreArtifact):
-        raise TypeError(
-            "training command proof lacks a typed in-loop ScoreArtifact"
-        )
+        raise TypeError("training command proof lacks a typed in-loop ScoreArtifact")
     if not isinstance(proof.terminal_score, ScoreArtifact):
-        raise TypeError(
-            "training command proof lacks a typed terminal ScoreArtifact"
-        )
+        raise TypeError("training command proof lacks a typed terminal ScoreArtifact")
     expected_hash_names = (
         {
             "final_checkpoint_sha256",
@@ -1299,20 +1182,14 @@ def validate_training_command_proof(
         }
     )
     if set(proof.completion_output_hashes) != expected_hash_names:
-        raise ValueError(
-            "training proof completion output names mismatch"
-        )
+        raise ValueError("training proof completion output names mismatch")
     expected_common = {
-        "final_checkpoint_sha256": (
-            proof.outputs.final_checkpoint_sha256
-        ),
+        "final_checkpoint_sha256": (proof.outputs.final_checkpoint_sha256),
         "run_manifest_sha256": proof.outputs.run_manifest_sha256,
     }
     for name, expected_value in expected_common.items():
         if proof.completion_output_hashes.get(name) != expected_value:
-            raise ValueError(
-                f"training proof completion {name} mismatch"
-            )
+            raise ValueError(f"training proof completion {name} mismatch")
     for name, digest in proof.completion_output_hashes.items():
         _sha256(digest, f"training proof completion {name}")
     return proof
@@ -1348,9 +1225,7 @@ def _capture_training_run_proof(
         run_manifest_path,
         "run manifest",
     )
-    run_manifest_file_sha256 = hashlib.sha256(
-        run_manifest_bytes
-    ).hexdigest()
+    run_manifest_file_sha256 = hashlib.sha256(run_manifest_bytes).hexdigest()
     run_manifest = _validate_run_manifest(
         run_manifest_document,
         arguments,
@@ -1389,14 +1264,10 @@ def _capture_training_run_proof(
     )
     in_loop_metadata_path = output_dir / "in_loop" / "metadata.json"
     if isinstance(in_loop_score, ScoreArtifact):
-        in_loop_metadata_sha256 = (
-            in_loop_score.verified.envelope_sha256
-        )
+        in_loop_metadata_sha256 = in_loop_score.verified.envelope_sha256
     else:
         if verify_static_config:
-            raise TypeError(
-                "training proof requires a typed in-loop ScoreArtifact"
-            )
+            raise TypeError("training proof requires a typed in-loop ScoreArtifact")
         in_loop_metadata_sha256 = _sha256_file(
             in_loop_metadata_path,
             "in-loop metadata",
@@ -1414,9 +1285,7 @@ def _capture_training_run_proof(
         checkpoint_payload.get("candidate_spec"),
         "checkpoint candidate_spec",
     )
-    static_config_value = candidate_spec.get(
-        "baseline_config_sha256"
-    )
+    static_config_value = candidate_spec.get("baseline_config_sha256")
     if static_config_value is None and not verify_static_config:
         static_config_sha256 = arguments.expected_config_sha256
     else:
@@ -1431,36 +1300,23 @@ def _capture_training_run_proof(
         )
         static_config = SemanticConfig.from_path(config_path)
         if static_config.sha256 != static_config_sha256:
-            raise ValueError(
-                "static config semantic hash differs from the checkpoint"
-            )
+            raise ValueError("static config semantic hash differs from the checkpoint")
         if arguments.resume != "none":
-            raise ValueError(
-                "public training proof requires null resume provenance"
-            )
+            raise ValueError("public training proof requires null resume provenance")
         if (
             run_manifest["resume_source_checkpoint_sha256"] is not None
-            or verified_final.runtime_state.get(
-                "resume_source_checkpoint_sha256"
-            )
+            or verified_final.runtime_state.get("resume_source_checkpoint_sha256")
             is not None
         ):
-            raise ValueError(
-                "public training proof requires null resume parent"
-            )
+            raise ValueError("public training proof requires null resume parent")
 
     metadata = _mapping(
         getattr(in_loop_score, "metadata", None),
         "in-loop score metadata",
     )
     source_records = metadata.get("source_records")
-    if (
-        not isinstance(source_records, (list, tuple))
-        or len(source_records) != 1
-    ):
-        raise ValueError(
-            "training proof requires exactly one val-dev source record"
-        )
+    if not isinstance(source_records, (list, tuple)) or len(source_records) != 1:
+        raise ValueError("training proof requires exactly one val-dev source record")
     source = _mapping(
         source_records[0],
         "training proof source record",
@@ -1473,9 +1329,7 @@ def _capture_training_run_proof(
         "source_payload_sha256",
     }
     if verify_static_config and not required_source_fields.issubset(source):
-        raise ValueError(
-            "training proof source record lacks required provenance"
-        )
+        raise ValueError("training proof source record lacks required provenance")
 
     query_ids = tuple(getattr(in_loop_score, "query_ids", ()))
     gallery_ids = tuple(getattr(in_loop_score, "gallery_ids", ()))
@@ -1485,9 +1339,7 @@ def _capture_training_run_proof(
         or any(not isinstance(value, str) or not value for value in query_ids)
         or any(not isinstance(value, str) or not value for value in gallery_ids)
     ):
-        raise ValueError(
-            "training proof requires typed ordered query/gallery IDs"
-        )
+        raise ValueError("training proof requires typed ordered query/gallery IDs")
     query_hash = metadata.get("query_ids_sha256")
     gallery_hash = metadata.get("gallery_ids_sha256")
     if query_hash is None:
@@ -1503,13 +1355,9 @@ def _capture_training_run_proof(
         ordered_ids_sha256(query_ids) != query_ids_sha256
         or ordered_ids_sha256(gallery_ids) != gallery_ids_sha256
     ):
-        raise ValueError(
-            "training proof ordered-ID hashes do not match the score"
-        )
+        raise ValueError("training proof ordered-ID hashes do not match the score")
     normalized_source_records = [
-        dict(record)
-        for record in source_records
-        if isinstance(record, Mapping)
+        dict(record) for record in source_records if isinstance(record, Mapping)
     ]
     source_records_sha256 = sha256_json(normalized_source_records)
     if (
@@ -1519,18 +1367,14 @@ def _capture_training_run_proof(
         )
         != source_records_sha256
     ):
-        raise ValueError(
-            "training proof source record hash mismatch"
-        )
+        raise ValueError("training proof source record hash mismatch")
     completion_hashes = {
         "final_checkpoint_sha256": outputs.final_checkpoint_sha256,
         "run_manifest_sha256": outputs.run_manifest_sha256,
     }
     terminal_score: ScoreArtifact | None = None
     if arguments.mode == "smoke":
-        completion_hashes["in_loop_metadata_sha256"] = (
-            outputs.in_loop_metadata_sha256
-        )
+        completion_hashes["in_loop_metadata_sha256"] = outputs.in_loop_metadata_sha256
         if isinstance(in_loop_score, ScoreArtifact):
             terminal_score = in_loop_score
     return ValidatedTrainingRunProof(
@@ -1579,9 +1423,7 @@ def _capture_training_run_proof(
             "source payload",
         ),
         source_records_sha256=source_records_sha256,
-        alignment_sha256=ordered_ids_sha256(
-            [*query_ids, *gallery_ids]
-        ),
+        alignment_sha256=ordered_ids_sha256([*query_ids, *gallery_ids]),
         query_ids_sha256=query_ids_sha256,
         gallery_ids_sha256=gallery_ids_sha256,
         git_sha=str(run_manifest["git_sha"]),
@@ -1607,10 +1449,7 @@ def _capture_training_run_proof(
 def _freeze_json(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType(
-            {
-                str(key): _freeze_json(child)
-                for key, child in value.items()
-            }
+            {str(key): _freeze_json(child) for key, child in value.items()}
         )
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(child) for child in value)
@@ -1619,10 +1458,7 @@ def _freeze_json(value: object) -> object:
 
 def _thaw_json(value: object) -> object:
     if isinstance(value, Mapping):
-        return {
-            str(key): _thaw_json(child)
-            for key, child in value.items()
-        }
+        return {str(key): _thaw_json(child) for key, child in value.items()}
     if isinstance(value, (list, tuple)):
         return [_thaw_json(child) for child in value]
     return value
@@ -1635,13 +1471,9 @@ def _validate_terminal_score_against_proof(
     proof: ValidatedTrainingRunProof,
 ) -> None:
     if not isinstance(score, ScoreArtifact):
-        raise TypeError(
-            "SAMGA terminal proof requires a typed ScoreArtifact"
-        )
+        raise TypeError("SAMGA terminal proof requires a typed ScoreArtifact")
     if not isinstance(proof.in_loop_score, ScoreArtifact):
-        raise TypeError(
-            "SAMGA proof requires a typed in-loop ScoreArtifact"
-        )
+        raise TypeError("SAMGA proof requires a typed in-loop ScoreArtifact")
     _validate_in_loop_score_artifact(
         score,
         run_manifest=proof.run_manifest,
@@ -1651,18 +1483,13 @@ def _validate_terminal_score_against_proof(
     )
     if (
         tuple(score.query_ids) != tuple(proof.in_loop_score.query_ids)
-        or tuple(score.gallery_ids)
-        != tuple(proof.in_loop_score.gallery_ids)
+        or tuple(score.gallery_ids) != tuple(proof.in_loop_score.gallery_ids)
         or score.query_ids_sha256 != proof.query_ids_sha256
         or score.gallery_ids_sha256 != proof.gallery_ids_sha256
-        or ordered_ids_sha256(
-            [*score.query_ids, *score.gallery_ids]
-        )
+        or ordered_ids_sha256([*score.query_ids, *score.gallery_ids])
         != proof.alignment_sha256
     ):
-        raise ValueError(
-            "terminal score ordered IDs differ from the training proof"
-        )
+        raise ValueError("terminal score ordered IDs differ from the training proof")
     metadata = _mapping(score.metadata, "terminal score metadata")
     provenance = _mapping(
         score.provenance,
@@ -1673,16 +1500,11 @@ def _validate_terminal_score_against_proof(
     if (
         not isinstance(source_records, (list, tuple))
         or not isinstance(plain_source_records, list)
-        or sha256_json(plain_source_records)
-        != proof.source_records_sha256
-        or metadata.get("source_records_sha256")
-        != proof.source_records_sha256
-        or provenance.get("source_records_sha256")
-        != proof.source_records_sha256
+        or sha256_json(plain_source_records) != proof.source_records_sha256
+        or metadata.get("source_records_sha256") != proof.source_records_sha256
+        or provenance.get("source_records_sha256") != proof.source_records_sha256
     ):
-        raise ValueError(
-            "terminal score source records differ from the training proof"
-        )
+        raise ValueError("terminal score source records differ from the training proof")
     expected = {
         "checkpoint_sha256": proof.checkpoint.sha256,
         "config_sha256": proof.resolved_config_sha256,
@@ -1701,13 +1523,9 @@ def _validate_terminal_score_against_proof(
             metadata.get(field_name) != expected_value
             or provenance.get(field_name) != expected_value
         ):
-            raise ValueError(
-                f"terminal score {field_name} differs from proof"
-            )
+            raise ValueError(f"terminal score {field_name} differs from proof")
     if dict(score.provenance) != dict(proof.in_loop_score.provenance):
-        raise ValueError(
-            "terminal score provenance differs from in-loop proof"
-        )
+        raise ValueError("terminal score provenance differs from in-loop proof")
 
 
 def _retrieval_metrics_payload(score: ScoreArtifact) -> dict[str, object]:
@@ -1813,8 +1631,7 @@ def _validate_parity_report_against_artifacts(
         raise ValueError("baseline parity report schema mismatch")
     if (
         report["schema_version"] != 1
-        or report["report_type"]
-        != "samga_brain_rw.baseline_parity"
+        or report["report_type"] != "samga_brain_rw.baseline_parity"
         or report["scope"] != "val-dev"
         or report["passed"] is not True
         or report["run_directory"] != str(output)
@@ -1826,13 +1643,20 @@ def _validate_parity_report_against_artifacts(
         report["run_directory_identity"],
         "baseline parity run directory identity",
     )
-    if reported_run_identity != {
-        "device": run_stat.st_dev,
-        "inode": run_stat.st_ino,
-    }:
-        raise ValueError(
-            "baseline parity run directory identity mismatch"
-        )
+    if (
+        set(reported_run_identity) != {"device", "inode"}
+        or type(reported_run_identity["device"]) is not int
+        or reported_run_identity["device"] < 0
+        or type(reported_run_identity["inode"]) is not int
+        or reported_run_identity["inode"] < 0
+        # st_dev is a mount-namespace-local number on the cluster, so the
+        # same shared directory can have a different value on another node.
+        # The canonical path plus filesystem inode remains the serialized
+        # cross-node identity; the local (st_dev, st_ino, mode) tuple below
+        # still pins the directory against swaps during this validation.
+        or reported_run_identity["inode"] != run_stat.st_ino
+    ):
+        raise ValueError("baseline parity run directory identity mismatch")
     artifact_reports = _mapping(
         report["artifacts"],
         "baseline parity artifacts",
@@ -1843,29 +1667,18 @@ def _validate_parity_report_against_artifacts(
     for role, directory_name in role_directories:
         score = artifacts[role]
         if not isinstance(score, ScoreArtifact):
-            raise TypeError(
-                f"baseline parity {role} is not a typed ScoreArtifact"
-            )
+            raise TypeError(f"baseline parity {role} is not a typed ScoreArtifact")
         score.verified.revalidate()
         score.verified.revalidate_envelope()
         expected_directory = output / directory_name
-        if (
-            score.directory != expected_directory
-            or score.scope != "val-dev"
-        ):
-            raise ValueError(
-                f"baseline parity {role} directory/scope mismatch"
-            )
+        if score.directory != expected_directory or score.scope != "val-dev":
+            raise ValueError(f"baseline parity {role} directory/scope mismatch")
         if (
             not bool(np.all(np.isfinite(score.similarity)))
-            or score.query_ids_sha256
-            != ordered_ids_sha256(score.query_ids)
-            or score.gallery_ids_sha256
-            != ordered_ids_sha256(score.gallery_ids)
+            or score.query_ids_sha256 != ordered_ids_sha256(score.query_ids)
+            or score.gallery_ids_sha256 != ordered_ids_sha256(score.gallery_ids)
         ):
-            raise ValueError(
-                f"baseline parity {role} score/ID identity mismatch"
-            )
+            raise ValueError(f"baseline parity {role} score/ID identity mismatch")
         files = {
             "metadata.json": _parity_file_descriptor(
                 expected_directory / "metadata.json",
@@ -1874,9 +1687,7 @@ def _validate_parity_report_against_artifacts(
             ),
             "predictions.csv": _parity_file_descriptor(
                 expected_directory / "predictions.csv",
-                expected_sha256=str(
-                    score.metadata["predictions_sha256"]
-                ),
+                expected_sha256=str(score.metadata["predictions_sha256"]),
                 context=f"baseline parity {role} predictions",
             ),
             "similarity.npy": _parity_file_descriptor(
@@ -1901,18 +1712,14 @@ def _validate_parity_report_against_artifacts(
             "provenance": _thaw_json(score.provenance),
             "query_ids_sha256": score.query_ids_sha256,
             "similarity_dtype": str(score.similarity.dtype),
-            "similarity_shape": [
-                int(value) for value in score.similarity.shape
-            ],
+            "similarity_shape": [int(value) for value in score.similarity.shape],
         }
         actual_report = _mapping(
             artifact_reports[role],
             f"baseline parity {role} report",
         )
         if actual_report != expected_report:
-            raise ValueError(
-                f"baseline parity {role} artifact report mismatch"
-            )
+            raise ValueError(f"baseline parity {role} artifact report mismatch")
 
     comparisons = report["comparisons"]
     if not isinstance(comparisons, list) or len(comparisons) != 6:
@@ -1931,13 +1738,10 @@ def _validate_parity_report_against_artifacts(
         left = artifacts[left_role]
         right = artifacts[right_role]
         ids_identical = (
-            left.query_ids == right.query_ids
-            and left.gallery_ids == right.gallery_ids
+            left.query_ids == right.query_ids and left.gallery_ids == right.gallery_ids
         )
         metrics_identical = left.metrics == right.metrics
-        predictions_identical = (
-            left.metrics.predictions == right.metrics.predictions
-        )
+        predictions_identical = left.metrics.predictions == right.metrics.predictions
         provenance_identical = left.provenance == right.provenance
         maximum = _maximum_absolute_score_difference(left, right)
         recomputed_maxima.append(maximum)
@@ -1948,9 +1752,7 @@ def _validate_parity_report_against_artifacts(
             and provenance_identical
             and maximum <= 1e-6
         ):
-            raise ValueError(
-                "baseline parity actual artifact comparison failed"
-            )
+            raise ValueError("baseline parity actual artifact comparison failed")
         expected_comparison = {
             "left": left_role,
             "max_absolute_score_difference": maximum,
@@ -1962,9 +1764,7 @@ def _validate_parity_report_against_artifacts(
             "within_tolerance": True,
         }
         if actual != expected_comparison:
-            raise ValueError(
-                "baseline parity comparison identity/value mismatch"
-            )
+            raise ValueError("baseline parity comparison identity/value mismatch")
 
     summary = _mapping(report["summary"], "baseline parity summary")
     expected_summary = {
@@ -2013,12 +1813,12 @@ def _validate_full_training_proof(
     artifacts = {
         "in_loop": proof.in_loop_score,
         **{
-        role: ScoreArtifact.load(
-            proof.output_dir / directory,
-            {"val-dev"},
-        )
-        for role, directory in role_directories
-        if role != "in_loop"
+            role: ScoreArtifact.load(
+                proof.output_dir / directory,
+                {"val-dev"},
+            )
+            for role, directory in role_directories
+            if role != "in_loop"
         },
     }
     terminal = artifacts["saved_checkpoint"]
@@ -2040,9 +1840,7 @@ def _validate_full_training_proof(
     parity_sha256 = hashlib.sha256(parity_bytes).hexdigest()
     completion_hashes = MappingProxyType(
         {
-            "final_checkpoint_sha256": (
-                proof.outputs.final_checkpoint_sha256
-            ),
+            "final_checkpoint_sha256": (proof.outputs.final_checkpoint_sha256),
             "parity_sha256": parity_sha256,
             "run_manifest_sha256": proof.outputs.run_manifest_sha256,
         }
@@ -2084,9 +1882,7 @@ def _environment(arguments: argparse.Namespace) -> dict[str, str]:
     environment = os.environ.copy()
     environment.update(
         {
-            "PYTHONPATH": str(
-                _project_file(arguments, "experiments/samga_brain_rw")
-            ),
+            "PYTHONPATH": str(_project_file(arguments, "experiments/samga_brain_rw")),
             "HF_DATASETS_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HF_HUB_OFFLINE": "1",
@@ -2148,9 +1944,7 @@ def _train_command(arguments: argparse.Namespace) -> list[str]:
                 ]
             )
     if arguments.mode == "smoke":
-        command.extend(
-            ["--max-train-steps", str(arguments.max_train_steps)]
-        )
+        command.extend(["--max-train-steps", str(arguments.max_train_steps)])
     return command
 
 
@@ -2290,9 +2084,7 @@ def run_cell(
         "run_manifest_sha256": outputs.run_manifest_sha256,
     }
     if arguments.mode == "smoke":
-        completion_hashes["in_loop_metadata_sha256"] = (
-            outputs.in_loop_metadata_sha256
-        )
+        completion_hashes["in_loop_metadata_sha256"] = outputs.in_loop_metadata_sha256
     else:
         for directory in _EVALUATION_DIRECTORIES:
             subprocess_runner(

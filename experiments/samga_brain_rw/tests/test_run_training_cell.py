@@ -138,10 +138,7 @@ def test_runner_accepts_only_the_canonical_hashed_run_key_grammar(
     assert "__inputs-" in canonical
     assert runner_module.parse_arguments(argv).run_key == canonical
 
-    legacy = (
-        f"stage2__s2-layernorm-on__sub-01__seed-42__"
-        f"{_h('config')}__{_h('input')}"
-    )
+    legacy = f"stage2__s2-layernorm-on__sub-01__seed-42__{_h('config')}__{_h('input')}"
     legacy_argv = list(argv)
     legacy_argv[run_key_position] = legacy
     legacy_argv[output_position] = str(tmp_path / legacy)
@@ -157,13 +154,9 @@ def test_smoke_requires_positive_max_steps_and_full_forbids_it(
     with pytest.raises(SystemExit):
         runner_module.parse_arguments(_argv(tmp_path, mode="smoke"))
     with pytest.raises(SystemExit):
-        runner_module.parse_arguments(
-            _argv(tmp_path, mode="smoke", max_train_steps=0)
-        )
+        runner_module.parse_arguments(_argv(tmp_path, mode="smoke", max_train_steps=0))
     with pytest.raises(SystemExit):
-        runner_module.parse_arguments(
-            _argv(tmp_path, mode="full", max_train_steps=1)
-        )
+        runner_module.parse_arguments(_argv(tmp_path, mode="full", max_train_steps=1))
 
     smoke = runner_module.parse_arguments(
         _argv(tmp_path, mode="smoke", max_train_steps=1)
@@ -242,9 +235,7 @@ def test_commands_force_explicit_cuda_after_namespace_tampering(
     tmp_path: Path,
     experiment_root: Path,
 ) -> None:
-    arguments = runner_module.parse_arguments(
-        _argv(tmp_path, mode="full")
-    )
+    arguments = runner_module.parse_arguments(_argv(tmp_path, mode="full"))
     arguments.project_root = experiment_root.parents[1]
     arguments.device = "cpu"
     outputs = _training_outputs(runner_module, tmp_path)
@@ -402,17 +393,13 @@ def _real_run_summary(
     smoke = arguments.mode == "smoke"
     global_step = arguments.max_train_steps if smoke else 60
     checkpoint_name = (
-        "checkpoint_epoch001_step00000001.pt"
-        if smoke
-        else "checkpoint_epoch060.pt"
+        "checkpoint_epoch001_step00000001.pt" if smoke else "checkpoint_epoch060.pt"
     )
     checkpoint_hashes = (
         {checkpoint_name: _h(f"checkpoint:{arguments.mode}")}
         if smoke
         else {
-            f"checkpoint_epoch{epoch:03d}.pt": _h(
-                f"checkpoint:full:{epoch}"
-            )
+            f"checkpoint_epoch{epoch:03d}.pt": _h(f"checkpoint:full:{epoch}")
             for epoch in range(51, 61)
         }
     )
@@ -426,9 +413,7 @@ def _real_run_summary(
         "checkpoint_hashes": checkpoint_hashes,
         "in_loop_score_directory": "in_loop",
         "max_train_steps": arguments.max_train_steps,
-        "resume_source_checkpoint_sha256": (
-            resume_source_checkpoint_sha256
-        ),
+        "resume_source_checkpoint_sha256": (resume_source_checkpoint_sha256),
         **samga_train._runtime_manifest_metadata(_production_runtime()),
         "top1_rate": 0.1,
         "top5_rate": 0.5,
@@ -439,9 +424,7 @@ def _legacy_stage0_run_summary(
     arguments: object,
 ) -> dict[str, object]:
     summary = _real_run_summary(arguments)
-    summary["git_sha"] = (
-        "aed25e2e5756cc1f08a859d385ffb116364fa2f9"
-    )
+    summary["git_sha"] = "aed25e2e5756cc1f08a859d385ffb116364fa2f9"
     body = {
         key: summary[key]
         for key in _RUN_MANIFEST_BASE_KEYS_FOR_TEST
@@ -449,9 +432,7 @@ def _legacy_stage0_run_summary(
     }
     summary["run_manifest_sha256"] = sha256_json(body)
     summary["checkpoint_hashes"] = {
-        f"checkpoint_epoch{epoch:03d}.pt": _h(
-            f"legacy-checkpoint:{epoch}"
-        )
+        f"checkpoint_epoch{epoch:03d}.pt": _h(f"legacy-checkpoint:{epoch}")
         for epoch in range(1, 61)
     }
     summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
@@ -492,10 +473,7 @@ def test_runner_accepts_exact_real_smoke_and_full_run_summary_shapes(
 
     for arguments in (smoke, full):
         summary = _real_run_summary(arguments)
-        assert (
-            runner_module._validate_run_manifest(summary, arguments)
-            == summary
-        )
+        assert runner_module._validate_run_manifest(summary, arguments) == summary
 
 
 def test_run_manifest_accepts_only_exact_sealed_stage0_legacy_retention(
@@ -503,9 +481,7 @@ def test_run_manifest_accepts_only_exact_sealed_stage0_legacy_retention(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    arguments = runner_module.parse_arguments(
-        _argv(tmp_path, mode="full", stage=0)
-    )
+    arguments = runner_module.parse_arguments(_argv(tmp_path, mode="full", stage=0))
     legacy = _legacy_stage0_run_summary(arguments)
     legacy_file_sha256 = hashlib.sha256(
         canonical_json_bytes(legacy) + b"\n"
@@ -637,9 +613,7 @@ def test_smoke_manifest_rejects_gapped_late_partial_durable_retention(
         final_name: _h("late-partial-53-step-525"),
     }
     summary["final_checkpoint"] = final_name
-    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][
-        final_name
-    ]
+    summary["final_checkpoint_sha256"] = summary["checkpoint_hashes"][final_name]
 
     with pytest.raises(ValueError, match="contiguous|prefix|retention"):
         runner_module._validate_checkpoint_retention_manifest(
@@ -685,8 +659,7 @@ def _verified_checkpoint_fixture(
     assert match is not None
     epoch = int(match.group("epoch"))
     nested_manifest = {
-        key: summary[key]
-        for key in runner_module._RUN_MANIFEST_BASE_KEYS
+        key: summary[key] for key in runner_module._RUN_MANIFEST_BASE_KEYS
     }
     effective_run_key = run_key or arguments.run_key
     nested_manifest["run_key"] = effective_run_key
@@ -700,9 +673,7 @@ def _verified_checkpoint_fixture(
     }
     runtime_state = {
         "epoch_complete": match.group("partial") is None,
-        "resume_source_checkpoint_sha256": summary[
-            "resume_source_checkpoint_sha256"
-        ],
+        "resume_source_checkpoint_sha256": summary["resume_source_checkpoint_sha256"],
     }
     retention_value = retention or {
         "policy": "retain_exact_epochs_51_through_60",
@@ -712,9 +683,7 @@ def _verified_checkpoint_fixture(
         ),
     }
     checkpoint_payload = payload if payload is not None else {}
-    candidate_value = dict(
-        checkpoint_payload.get("candidate_spec", {})
-    )
+    candidate_value = dict(checkpoint_payload.get("candidate_spec", {}))
     for key, value in candidate_spec.items():
         candidate_value.setdefault(key, value)
     checkpoint_payload["candidate_spec"] = candidate_value
@@ -773,10 +742,7 @@ def test_smoke_output_validator_accepts_late_partial_durable_prefix(
     ]
     if with_transient:
         names.append("checkpoint_epoch053_step00000525.pt")
-    hashes = {
-        name: _write_validator_checkpoint_bundle(output, name)
-        for name in names
-    }
+    hashes = {name: _write_validator_checkpoint_bundle(output, name) for name in names}
     summary["checkpoint_hashes"] = hashes
     summary["final_checkpoint"] = names[-1]
     summary["final_checkpoint_sha256"] = hashes[names[-1]]
@@ -791,12 +757,10 @@ def test_smoke_output_validator_accepts_late_partial_durable_prefix(
         ),
     )
 
-    observed_hashes, final = (
-        runner_module._validate_retained_checkpoint_outputs(
-            output,
-            summary,
-            arguments,
-        )
+    observed_hashes, final = runner_module._validate_retained_checkpoint_outputs(
+        output,
+        summary,
+        arguments,
     )
 
     assert observed_hashes == hashes
@@ -1111,10 +1075,13 @@ def test_runner_accepts_only_null_or_sha_resume_source(
         arguments,
         resume_source_checkpoint_sha256=resume_source,
     )
-    assert runner_module._validate_run_manifest(
-        summary,
-        arguments,
-    )["resume_source_checkpoint_sha256"] == resume_source
+    assert (
+        runner_module._validate_run_manifest(
+            summary,
+            arguments,
+        )["resume_source_checkpoint_sha256"]
+        == resume_source
+    )
 
 
 def _input_hashes() -> dict[str, object]:
@@ -1123,9 +1090,7 @@ def _input_hashes() -> dict[str, object]:
         "records_sha256": _h("records"),
         "source_manifest_sha256": _h("source-manifest"),
         "source_payload_byte_count_sha256": sha256_json(123),
-        "source_payload_path_sha256": sha256_json(
-            "/development/sub-01/train.pt"
-        ),
+        "source_payload_path_sha256": sha256_json("/development/sub-01/train.pt"),
         "source_payload_sha256": _h("source-payload"),
         "val_dev_role_sha256": _h("val-dev-role"),
     }
@@ -1152,14 +1117,10 @@ def _partial_score_artifact(
                 "role": "val-dev",
                 "role_payload_sha256": input_hashes["val_dev_role_sha256"],
                 "run_key": arguments.run_key,
-                "source_manifest_sha256": input_hashes[
-                    "source_manifest_sha256"
-                ],
+                "source_manifest_sha256": input_hashes["source_manifest_sha256"],
                 "source_payload_byte_count": 123,
                 "source_payload_path": "/development/sub-01/train.pt",
-                "source_payload_sha256": input_hashes[
-                    "source_payload_sha256"
-                ],
+                "source_payload_sha256": input_hashes["source_payload_sha256"],
             }
         ],
         "split_role": "val-dev",
@@ -1181,9 +1142,7 @@ def test_checkpoint_identity_validator_runs_before_subset_crossbinding(
     )
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"transport-valid-checkpoint")
-    checkpoint_sha256 = hashlib.sha256(
-        checkpoint.read_bytes()
-    ).hexdigest()
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     run_manifest = _real_run_summary(arguments)
     run_manifest["final_checkpoint_sha256"] = checkpoint_sha256
     calls: list[Path] = []
@@ -1343,12 +1302,14 @@ def test_training_output_validation_binds_partial_checkpoint_and_run_identity(
 
     validated = runner_module.validate_training_outputs(arguments)
     assert validated.final_checkpoint_sha256 == checkpoint_sha
-    assert validated.run_manifest_sha256 == hashlib.sha256(
-        manifest_path.read_bytes()
-    ).hexdigest()
-    assert validated.in_loop_metadata_sha256 == hashlib.sha256(
-        metadata.read_bytes()
-    ).hexdigest()
+    assert (
+        validated.run_manifest_sha256
+        == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    )
+    assert (
+        validated.in_loop_metadata_sha256
+        == hashlib.sha256(metadata.read_bytes()).hexdigest()
+    )
     assert verifier_calls == [checkpoint]
 
     checkpoint_payload["runtime_state"] = {"epoch_complete": True}
@@ -1373,17 +1334,17 @@ def test_training_command_output_adapter_parses_sealed_argv_and_translates_exit(
     )
     sealed = [
         "python",
-        str(
-            tmp_path
-            / "experiments/samga_brain_rw/scripts/run_training_cell.py"
-        ),
+        str(tmp_path / "experiments/samga_brain_rw/scripts/run_training_cell.py"),
         *_argv(tmp_path, mode="smoke", max_train_steps=1),
     ]
 
-    assert runner_module.validate_training_command_outputs(
-        sealed,
-        expected_mode="smoke",
-    ) == outputs
+    assert (
+        runner_module.validate_training_command_outputs(
+            sealed,
+            expected_mode="smoke",
+        )
+        == outputs
+    )
     with pytest.raises(ValueError, match="mode"):
         runner_module.validate_training_command_outputs(
             sealed,
@@ -1434,17 +1395,15 @@ def test_public_training_command_proof_is_one_frozen_full_capture_by_default(
         checkpoint=training_proof.checkpoint,
         in_loop_score=training_proof.in_loop_score,
         terminal_score=SimpleNamespace(label="typed-terminal-score"),
-            completion_output_hashes=MappingProxyType(
-                {
-                    "final_checkpoint_sha256": (
-                        training_proof.outputs.final_checkpoint_sha256
-                    ),
-                    "parity_sha256": _h("parity"),
-                    "run_manifest_sha256": (
-                        training_proof.outputs.run_manifest_sha256
-                    ),
-                }
-            ),
+        completion_output_hashes=MappingProxyType(
+            {
+                "final_checkpoint_sha256": (
+                    training_proof.outputs.final_checkpoint_sha256
+                ),
+                "parity_sha256": _h("parity"),
+                "run_manifest_sha256": (training_proof.outputs.run_manifest_sha256),
+            }
+        ),
     )
     captures: list[object] = []
     monkeypatch.setattr(
@@ -1463,8 +1422,7 @@ def test_public_training_command_proof_is_one_frozen_full_capture_by_default(
         "_validate_full_training_proof",
         lambda actual, proof: (
             final_proof
-            if actual.run_key == arguments.run_key
-            and proof is training_proof
+            if actual.run_key == arguments.run_key and proof is training_proof
             else pytest.fail("full proof switched its training capture")
         ),
         raising=False,
@@ -1487,10 +1445,7 @@ def test_public_training_command_proof_is_one_frozen_full_capture_by_default(
     )
     command = [
         "python",
-        str(
-            tmp_path
-            / "experiments/samga_brain_rw/scripts/run_training_cell.py"
-        ),
+        str(tmp_path / "experiments/samga_brain_rw/scripts/run_training_cell.py"),
         *_argv(tmp_path, mode="full"),
     ]
 
@@ -1523,10 +1478,7 @@ def test_public_training_command_proof_rejects_restricted_scope_before_capture(
 ) -> None:
     command = [
         "python",
-        str(
-            tmp_path
-            / "experiments/samga_brain_rw/scripts/run_training_cell.py"
-        ),
+        str(tmp_path / "experiments/samga_brain_rw/scripts/run_training_cell.py"),
         *_argv(tmp_path, mode="full"),
     ]
     command[command.index("--manifest") + 1] = str(
@@ -1621,10 +1573,7 @@ def _real_parity_fixture(
         "stage": "stage0",
         "subject": 1,
     }
-    matrices = {
-        role: base.copy()
-        for role in _PARITY_ROLES
-    }
+    matrices = {role: base.copy() for role in _PARITY_ROLES}
     matrices["saved_checkpoint"][0, 0] += np.float32(2e-7)
     matrices["repeat_emission"][1, 1] -= np.float32(3e-7)
     matrices["reload_evaluation"][0, 4] += np.float32(4e-7)
@@ -1660,6 +1609,25 @@ def test_full_parity_validator_recomputes_all_four_typed_bundles(
         experiment_root,
         tmp_path,
     )
+
+    runner_module._validate_parity_report_against_artifacts(
+        report,
+        output_dir=run_directory,
+        artifacts=artifacts,
+    )
+
+
+def test_full_parity_validator_accepts_cross_node_device_remapping(
+    runner_module: ModuleType,
+    experiment_root: Path,
+    tmp_path: Path,
+) -> None:
+    run_directory, report, artifacts = _real_parity_fixture(
+        experiment_root,
+        tmp_path,
+    )
+    report = copy.deepcopy(report)
+    report["run_directory_identity"]["device"] += 1
 
     runner_module._validate_parity_report_against_artifacts(
         report,
@@ -1706,9 +1674,7 @@ def test_full_parity_validator_rejects_root_swap_after_validation(
     def swap_before_summary_hash(value: object) -> str:
         nonlocal swapped
         if isinstance(value, dict) and "checkpoint_sha256" in value:
-            old_directory = run_directory.with_name(
-                f"{run_directory.name}.replaced"
-            )
+            old_directory = run_directory.with_name(f"{run_directory.name}.replaced")
             run_directory.rename(old_directory)
             run_directory.mkdir()
             swapped = True
@@ -1757,19 +1723,15 @@ def test_full_parity_validator_rejects_forged_report_or_artifact(
     elif mutation == "directory_identity":
         forged["run_directory_identity"]["inode"] += 1
     elif mutation == "file_hash":
-        forged["artifacts"]["repeat_emission"]["files"][
-            "similarity.npy"
-        ]["sha256"] = _h("forged-payload")
+        forged["artifacts"]["repeat_emission"]["files"]["similarity.npy"]["sha256"] = (
+            _h("forged-payload")
+        )
     elif mutation == "pair_identity":
         forged["comparisons"][0]["right"] = "reload_evaluation"
     elif mutation == "pair_nan":
-        forged["comparisons"][0][
-            "max_absolute_score_difference"
-        ] = float("nan")
+        forged["comparisons"][0]["max_absolute_score_difference"] = float("nan")
     elif mutation == "pair_negative":
-        forged["comparisons"][0][
-            "max_absolute_score_difference"
-        ] = -1.0
+        forged["comparisons"][0]["max_absolute_score_difference"] = -1.0
     elif mutation == "matrix_after_report":
         changed = artifacts["repeat_emission"].similarity.copy()
         changed[0, 0] += np.float32(2e-4)
@@ -1826,9 +1788,7 @@ def test_full_proof_loads_exact_four_score_roles_once(
     output = tmp_path / "full-proof"
     output.mkdir()
     parity = {"fixture": True}
-    (output / "baseline_parity.json").write_bytes(
-        canonical_json_bytes(parity) + b"\n"
-    )
+    (output / "baseline_parity.json").write_bytes(canonical_json_bytes(parity) + b"\n")
     proof = FakeProof(
         output_dir=output,
         outputs=SimpleNamespace(
@@ -1929,10 +1889,7 @@ def test_training_output_validation_rejects_score_identity_mismatch(
         input_hashes,
     )
     metadata = dict(artifact.metadata)
-    records = [
-        dict(record)
-        for record in metadata["source_records"]
-    ]
+    records = [dict(record) for record in metadata["source_records"]]
     if field == "source_run_key":
         records[0]["run_key"] = replacement
     elif field == "source_manifest_sha256":

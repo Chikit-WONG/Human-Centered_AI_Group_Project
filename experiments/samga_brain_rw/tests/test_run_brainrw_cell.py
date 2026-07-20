@@ -72,14 +72,12 @@ def _argv(
         "none",
         "--config",
         str(
-            project_root
-            / "experiments/samga_brain_rw/configs/"
+            project_root / "experiments/samga_brain_rw/configs/"
             "brainrw_clip_lora_v1.json"
         ),
         "--manifest",
         str(
-            project_root
-            / "artifacts/samga_brain_rw/protocol/manifests/"
+            project_root / "artifacts/samga_brain_rw/protocol/manifests/"
             f"sub-{subject:02d}_protocol.json"
         ),
         "--clip-path",
@@ -142,9 +140,7 @@ def test_cli_requires_fresh_full_and_exact_one_step_smoke(
         runner_module.parse_arguments(resumed_full)
 
     two_step_smoke = _argv(tmp_path, mode="smoke")
-    two_step_smoke[
-        two_step_smoke.index("--max-train-steps") + 1
-    ] = "2"
+    two_step_smoke[two_step_smoke.index("--max-train-steps") + 1] = "2"
     with pytest.raises(SystemExit):
         runner_module.parse_arguments(two_step_smoke)
 
@@ -233,9 +229,7 @@ def test_locked_schedule_rejects_self_consistent_624_step_output(
     ("mutation", "match"),
     (
         (
-            lambda config, manifest: config.payload["training"].update(
-                {"epochs": 24}
-            ),
+            lambda config, manifest: config.payload["training"].update({"epochs": 24}),
             "epoch|25|recipe",
         ),
         (
@@ -319,20 +313,12 @@ def test_runner_executes_only_development_commands_then_completes(
             if mode == "smoke"
             else None
         ),
-        in_loop_metadata_sha256=(
-            _h("in-loop") if mode == "smoke" else None
-        ),
+        in_loop_metadata_sha256=(_h("in-loop") if mode == "smoke" else None),
         score_directory=(
-            arguments.output_dir / "val_dev_scores"
-            if mode == "full"
-            else None
+            arguments.output_dir / "val_dev_scores" if mode == "full" else None
         ),
-        score_payload_sha256=(
-            _h("score-payload") if mode == "full" else None
-        ),
-        score_envelope_sha256=(
-            _h("score-envelope") if mode == "full" else None
-        ),
+        score_payload_sha256=(_h("score-payload") if mode == "full" else None),
+        score_envelope_sha256=(_h("score-envelope") if mode == "full" else None),
     )
     proof = SimpleNamespace(outputs=outputs)
     monkeypatch.setattr(
@@ -370,17 +356,13 @@ def test_runner_executes_only_development_commands_then_completes(
     )
     assert "--scope" in commands[0]
     assert commands[0][commands[0].index("--scope") + 1] == "train"
-    assert commands[0][commands[0].index("--validation-scope") + 1] == (
-        "val-dev"
-    )
+    assert commands[0][commands[0].index("--validation-scope") + 1] == ("val-dev")
     flattened = "\n".join(item for command in commands for item in command)
     assert "val-confirm" not in flattened
     assert "formal-test" not in flattened
 
     completion = commands[-1]
-    assert completion[1].endswith(
-        "experiments/samga_brain_rw/scripts/build_job_map.py"
-    )
+    assert completion[1].endswith("experiments/samga_brain_rw/scripts/build_job_map.py")
     assert "complete-env" in completion
     encoded = completion[completion.index("--output-hashes") + 1]
     expected_names = (
@@ -469,9 +451,7 @@ def test_full_runner_validates_training_once_and_threads_one_proof(
     assert (
         runner_module.run_cell(
             arguments,
-            subprocess_runner=lambda command, **_kwargs: commands.append(
-                list(command)
-            ),
+            subprocess_runner=lambda command, **_kwargs: commands.append(list(command)),
         )
         == 0
     )
@@ -513,13 +493,9 @@ def test_full_runner_rejects_a_b_switch_before_completion(
     monkeypatch.setattr(
         runner_module.ScoreArtifact,
         "load",
-        lambda path, **_kwargs: (
-            score_loads.append(Path(path)) or artifact_b
-        ),
+        lambda path, **_kwargs: (score_loads.append(Path(path)) or artifact_b),
     )
-    real_from_proof = (
-        runner_module._validate_brainrw_outputs_from_proof
-    )
+    real_from_proof = runner_module._validate_brainrw_outputs_from_proof
     proof_validations: list[object] = []
 
     def validate_from_proof(
@@ -646,8 +622,7 @@ def test_public_brainrw_command_proof_is_frozen_single_capture_and_full_by_defau
         "_validate_brainrw_proof_outputs",
         lambda actual, proof: (
             final_proof
-            if actual.run_key == arguments.run_key
-            and proof is training_proof
+            if actual.run_key == arguments.run_key and proof is training_proof
             else pytest.fail("command proof switched its frozen capture")
         ),
     )
@@ -687,15 +662,9 @@ def test_public_brainrw_command_proof_is_frozen_single_capture_and_full_by_defau
     assert proof.split_role == "val-dev"
     assert proof.protocol_sha256 == proof.manifest.protocol_sha256
     assert proof.manifest_sha256 == proof.manifest.manifest_sha256
-    assert proof.source_manifest_sha256 == (
-        proof.manifest.source_manifest_sha256
-    )
-    assert proof.source_payload_sha256 == (
-        proof.manifest.source_payload_sha256
-    )
-    assert proof.query_ids_sha256 == (
-        proof.manifest.val_dev_ordered_ids_sha256
-    )
+    assert proof.source_manifest_sha256 == (proof.manifest.source_manifest_sha256)
+    assert proof.source_payload_sha256 == (proof.manifest.source_payload_sha256)
+    assert proof.query_ids_sha256 == (proof.manifest.val_dev_ordered_ids_sha256)
     assert proof.gallery_ids_sha256 == proof.query_ids_sha256
     assert proof.alignment_sha256 == ordered_ids_sha256(
         [
@@ -741,9 +710,7 @@ def test_public_brainrw_command_proof_rejects_restricted_scope_before_capture(
     monkeypatch.setattr(
         runner_module,
         "_validate_brainrw_training_once",
-        lambda _arguments: pytest.fail(
-            "restricted scope reached artifact capture"
-        ),
+        lambda _arguments: pytest.fail("restricted scope reached artifact capture"),
     )
 
     with pytest.raises(PermissionError, match="scope|development|sealed"):
@@ -829,9 +796,7 @@ def _score_binding(
         "runtime_contract": {"device_type": "cuda"},
         "runtime_contract_sha256": sha256_json({"device_type": "cuda"}),
         "runtime_evidence": {"accelerator_name": "NVIDIA A40"},
-        "runtime_evidence_sha256": sha256_json(
-            {"accelerator_name": "NVIDIA A40"}
-        ),
+        "runtime_evidence_sha256": sha256_json({"accelerator_name": "NVIDIA A40"}),
         "global_step": 625,
         "planned_steps": 625,
         "training_complete": True,
@@ -853,27 +818,19 @@ def _score_binding(
         }
     ]
     runtime = {
-        "training_semantic_environment": checkpoint_payload[
-            "semantic_environment"
-        ],
+        "training_semantic_environment": checkpoint_payload["semantic_environment"],
         "training_semantic_environment_sha256": checkpoint_payload[
             "semantic_environment_sha256"
         ],
-        "evaluation_semantic_environment": checkpoint_payload[
-            "semantic_environment"
-        ],
+        "evaluation_semantic_environment": checkpoint_payload["semantic_environment"],
         "evaluation_semantic_environment_sha256": checkpoint_payload[
             "semantic_environment_sha256"
         ],
-        "evaluation_runtime_contract": checkpoint_payload[
-            "runtime_contract"
-        ],
+        "evaluation_runtime_contract": checkpoint_payload["runtime_contract"],
         "evaluation_runtime_contract_sha256": checkpoint_payload[
             "runtime_contract_sha256"
         ],
-        "evaluation_runtime_evidence": checkpoint_payload[
-            "runtime_evidence"
-        ],
+        "evaluation_runtime_evidence": checkpoint_payload["runtime_evidence"],
         "evaluation_runtime_evidence_sha256": checkpoint_payload[
             "runtime_evidence_sha256"
         ],
@@ -935,16 +892,12 @@ def _validated_proof_binding(
     checkpoint.payload["resumed_from_sha256"] = None
     config = SimpleNamespace(
         path=arguments.config,
-        payload=MappingProxyType(
-            {"config_id": arguments.config_id}
-        ),
+        payload=MappingProxyType({"config_id": arguments.config_id}),
         sha256=arguments.expected_config_sha256,
         clip_path=arguments.clip_path,
     )
     run_manifest_bytes = b'{"generation":"a"}\n'
-    run_manifest_sha256 = hashlib.sha256(
-        run_manifest_bytes
-    ).hexdigest()
+    run_manifest_sha256 = hashlib.sha256(run_manifest_bytes).hexdigest()
     outputs = runner_module.BrainRWOutputs(
         run_manifest_path=arguments.output_dir / "run_manifest.json",
         run_manifest_sha256=run_manifest_sha256,
@@ -1000,6 +953,28 @@ def test_score_identity_binds_manifest_checkpoint_ids_and_runtime(
             )
 
 
+def test_score_identity_accepts_loaded_score_frozen_json_containers(
+    runner_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    artifact, checkpoint, manifest, arguments = _score_binding(
+        runner_module,
+        tmp_path,
+    )
+    artifact.metadata["source_records"] = tuple(
+        MappingProxyType(dict(record)) for record in artifact.metadata["source_records"]
+    )
+    artifact.metadata["ordered_ids"] = tuple(artifact.metadata["ordered_ids"])
+
+    runner_module._validate_score_identity(
+        artifact,
+        arguments=arguments,
+        checkpoint=checkpoint,
+        manifest=manifest,
+        expected_stage="brainrw-clip-lora",
+    )
+
+
 def test_score_identity_rejects_source_or_ordered_id_cross_binding(
     runner_module: ModuleType,
     tmp_path: Path,
@@ -1008,9 +983,7 @@ def test_score_identity_rejects_source_or_ordered_id_cross_binding(
         runner_module,
         tmp_path,
     )
-    artifact.metadata["source_records"][0]["manifest_sha256"] = _h(
-        "other-manifest"
-    )
+    artifact.metadata["source_records"][0]["manifest_sha256"] = _h("other-manifest")
     artifact.metadata["source_records_sha256"] = sha256_json(
         artifact.metadata["source_records"]
     )
