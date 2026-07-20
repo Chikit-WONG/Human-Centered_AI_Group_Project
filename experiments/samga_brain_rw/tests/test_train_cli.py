@@ -32,6 +32,17 @@ def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
+def _realistic_adamw_state_dict() -> dict[str, object]:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model(torch.ones(1, 3)).sum().backward()
+    optimizer.step()
+    state = optimizer.state_dict()
+    assert state["state"]
+    assert all(type(key) is int and key >= 0 for key in state["state"])
+    return state
+
+
 def _production_environment_binding() -> dict[str, object]:
     return build_environment_binding(
         PINNED_SEMANTIC_ENVIRONMENT,
@@ -415,6 +426,40 @@ def test_development_path_guard_rejects_sealed_names(
 ) -> None:
     with pytest.raises(ValueError, match="sealed|test|formal|confirm"):
         samga_train.require_development_path(tmp_path / path, "probe")
+
+
+def test_checkpoint_metadata_guard_accepts_realistic_optimizer_state() -> None:
+    samga_train._reject_sealed_checkpoint_metadata(
+        {"optimizer_state_dict": _realistic_adamw_state_dict()}
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"runtime_state": {0: {}}},
+        {"optimizer_state_dict": {"state": {-1: {}}}},
+        {"optimizer_state_dict": {"state": {True: {}}}},
+    ],
+)
+def test_checkpoint_metadata_guard_rejects_noncanonical_integer_keys(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="keys must be strings"):
+        samga_train._reject_sealed_checkpoint_metadata(payload)
+
+
+def test_checkpoint_metadata_guard_scans_values_below_optimizer_parameter_ids() -> (
+    None
+):
+    optimizer_state = _realistic_adamw_state_dict()
+    parameter_id = next(iter(optimizer_state["state"]))
+    optimizer_state["state"][parameter_id]["source"] = "formal-test"
+
+    with pytest.raises(PermissionError, match="sealed"):
+        samga_train._reject_sealed_checkpoint_metadata(
+            {"optimizer_state_dict": optimizer_state}
+        )
 
 
 def test_stage_schedule_is_exact() -> None:

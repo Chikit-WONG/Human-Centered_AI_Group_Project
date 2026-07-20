@@ -465,19 +465,27 @@ def _reject_sealed_checkpoint_metadata(
 ) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            if not isinstance(key, str):
-                raise ValueError(f"{context} keys must be strings")
-            token = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
-            if token in _SEALED_COMPONENTS or re.fullmatch(
-                r"sub_?\d+_test(?:_.*)?",
-                token,
+            if (
+                context == "checkpoint.optimizer_state_dict.state"
+                and type(key) is int
+                and key >= 0
             ):
-                raise PermissionError(
-                    f"{context} contains sealed test/formal/confirm metadata"
-                )
+                child_context = f"{context}[{key}]"
+            elif isinstance(key, str):
+                token = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+                if token in _SEALED_COMPONENTS or re.fullmatch(
+                    r"sub_?\d+_test(?:_.*)?",
+                    token,
+                ):
+                    raise PermissionError(
+                        f"{context} contains sealed test/formal/confirm metadata"
+                    )
+                child_context = f"{context}.{key}"
+            else:
+                raise ValueError(f"{context} keys must be strings")
             _reject_sealed_checkpoint_metadata(
                 child,
-                context=f"{context}.{key}",
+                context=child_context,
             )
         return
     if isinstance(value, (list, tuple)):

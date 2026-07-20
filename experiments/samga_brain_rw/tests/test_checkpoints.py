@@ -33,6 +33,17 @@ def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
+def _realistic_adamw_state_dict() -> dict[str, object]:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model(torch.ones(1, 3)).sum().backward()
+    optimizer.step()
+    state = optimizer.state_dict()
+    assert state["state"]
+    assert all(type(key) is int and key >= 0 for key in state["state"])
+    return state
+
+
 def _write_checkpoint(
     path: Path,
     *,
@@ -303,6 +314,40 @@ def test_exact_candidate_registry_is_locked() -> None:
             (51, 52, 53, 54, 55, 56, 57, 58, 59, 60),
         ),
     }
+
+
+def test_averaging_metadata_guard_accepts_realistic_optimizer_state() -> None:
+    checkpoints_module._reject_sealed_checkpoint_metadata(
+        {"optimizer_state_dict": _realistic_adamw_state_dict()}
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"runtime_state": {0: {}}},
+        {"optimizer_state_dict": {"state": {-1: {}}}},
+        {"optimizer_state_dict": {"state": {True: {}}}},
+    ],
+)
+def test_averaging_metadata_guard_rejects_noncanonical_integer_keys(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="keys must be strings"):
+        checkpoints_module._reject_sealed_checkpoint_metadata(payload)
+
+
+def test_averaging_metadata_guard_scans_values_below_optimizer_parameter_ids() -> (
+    None
+):
+    optimizer_state = _realistic_adamw_state_dict()
+    parameter_id = next(iter(optimizer_state["state"]))
+    optimizer_state["state"][parameter_id]["source"] = "formal-test"
+
+    with pytest.raises(PermissionError, match="sealed"):
+        checkpoints_module._reject_sealed_checkpoint_metadata(
+            {"optimizer_state_dict": optimizer_state}
+        )
 
 
 def test_averaging_rejects_checkpoint_without_typed_sidecar(
