@@ -4,10 +4,13 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import sys
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from types import MappingProxyType, ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 import train as samga_train
@@ -18,6 +21,7 @@ from samga_brain_rw.runtime_contract import (
     PRODUCTION_RUNTIME_CONTRACT,
     build_environment_binding,
 )
+from samga_brain_rw.scores import ScoreArtifact
 
 
 def _h(label: str) -> str:
@@ -1403,6 +1407,482 @@ def test_training_command_output_adapter_parses_sealed_argv_and_translates_exit(
                 *sealed[2:],
             ]
         )
+
+
+def test_public_training_command_proof_is_one_frozen_full_capture_by_default(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    @dataclass(frozen=True)
+    class FakeProof:
+        outputs: object
+        checkpoint: object
+        in_loop_score: object
+        terminal_score: object | None = None
+        completion_output_hashes: object = MappingProxyType({})
+        sealed_argv: tuple[str, ...] = ()
+
+    arguments = runner_module.parse_arguments(_argv(tmp_path, mode="full"))
+    training_proof = FakeProof(
+        outputs=_training_outputs(runner_module, tmp_path),
+        checkpoint=SimpleNamespace(label="typed-checkpoint"),
+        in_loop_score=SimpleNamespace(label="typed-in-loop-score"),
+    )
+    final_proof = FakeProof(
+        outputs=training_proof.outputs,
+        checkpoint=training_proof.checkpoint,
+        in_loop_score=training_proof.in_loop_score,
+        terminal_score=SimpleNamespace(label="typed-terminal-score"),
+            completion_output_hashes=MappingProxyType(
+                {
+                    "final_checkpoint_sha256": (
+                        training_proof.outputs.final_checkpoint_sha256
+                    ),
+                    "parity_sha256": _h("parity"),
+                    "run_manifest_sha256": (
+                        training_proof.outputs.run_manifest_sha256
+                    ),
+                }
+            ),
+    )
+    captures: list[object] = []
+    monkeypatch.setattr(
+        runner_module,
+        "_capture_training_run_proof",
+        lambda actual, **kwargs: (
+            captures.append(actual) or training_proof
+            if kwargs.get("verify_static_config") is True
+            and tuple(kwargs.get("sealed_argv", ())) == tuple(command)
+            else pytest.fail("public proof did not request static config proof")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_full_training_proof",
+        lambda actual, proof: (
+            final_proof
+            if actual.run_key == arguments.run_key
+            and proof is training_proof
+            else pytest.fail("full proof switched its training capture")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "ValidatedTrainingRunProof",
+        FakeProof,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "ScoreArtifact",
+        SimpleNamespace,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "VerifiedEpochCheckpoint",
+        SimpleNamespace,
+    )
+    command = [
+        "python",
+        str(
+            tmp_path
+            / "experiments/samga_brain_rw/scripts/run_training_cell.py"
+        ),
+        *_argv(tmp_path, mode="full"),
+    ]
+
+    proof = runner_module.validate_training_command_proof(command)
+
+    assert proof is final_proof
+    assert captures == [arguments]
+    invalid_checkpoint_proof = dataclass_replace(
+        final_proof,
+        checkpoint=object(),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_full_training_proof",
+        lambda _actual, _proof: invalid_checkpoint_proof,
+    )
+    with pytest.raises(TypeError, match="checkpoint|typed"):
+        runner_module.validate_training_command_proof(command)
+    with pytest.raises(ValueError, match="mode"):
+        runner_module.validate_training_command_proof(
+            command,
+            expected_mode="smoke",
+        )
+
+
+def test_public_training_command_proof_rejects_restricted_scope_before_capture(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    command = [
+        "python",
+        str(
+            tmp_path
+            / "experiments/samga_brain_rw/scripts/run_training_cell.py"
+        ),
+        *_argv(tmp_path, mode="full"),
+    ]
+    command[command.index("--manifest") + 1] = str(
+        tmp_path / "formal-test" / "sub-01_protocol.json"
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_capture_training_run_proof",
+        lambda *_args, **_kwargs: pytest.fail(
+            "restricted scope reached training artifact capture"
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(PermissionError, match="scope|development|formal"):
+        runner_module.validate_training_command_proof(command)
+
+
+def test_training_proof_thaws_frozen_score_source_records_for_canonical_hashing(
+    runner_module: ModuleType,
+) -> None:
+    frozen = (
+        MappingProxyType(
+            {
+                "role": "val-dev",
+                "nested": MappingProxyType({"count": 200}),
+            }
+        ),
+    )
+
+    assert runner_module._thaw_json(frozen) == [
+        {"nested": {"count": 200}, "role": "val-dev"}
+    ]
+    assert sha256_json(runner_module._thaw_json(frozen)) == sha256_json(
+        [{"nested": {"count": 200}, "role": "val-dev"}]
+    )
+
+
+_PARITY_ROLES = {
+    "in_loop": "in_loop",
+    "saved_checkpoint": "saved_checkpoint",
+    "repeat_emission": "repeat_emission",
+    "reload_evaluation": "reload_evaluation",
+}
+
+
+def _load_parity_module(experiment_root: Path) -> ModuleType:
+    path = experiment_root / "scripts" / "check_baseline_parity.py"
+    spec = importlib.util.spec_from_file_location(
+        "run_training_cell_parity_fixture",
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot import {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _real_parity_fixture(
+    experiment_root: Path,
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object], dict[str, ScoreArtifact]]:
+    run_directory = (tmp_path / "typed-parity-run").resolve()
+    query_ids = ["query-b", "query-a"]
+    gallery_ids = [
+        "query-a",
+        "zeta",
+        "query-b",
+        "alpha",
+        "other-1",
+        "other-2",
+    ]
+    base = np.array(
+        [
+            [0.1, 0.9, 0.8, 0.9, 0.0, -1.0],
+            [1.0, 0.2, 0.1, 0.3, 0.4, 0.5],
+        ],
+        dtype=np.float32,
+    )
+    metadata = {
+        "checkpoint_sha256": _h("parity-checkpoint"),
+        "config_sha256": _h("parity-config"),
+        "git_sha": "a" * 40,
+        "protocol_sha256": _h("parity-protocol"),
+        "seed": 42,
+        "source_records": [
+            {"record_id": "query-b"},
+            {"record_id": "query-a"},
+        ],
+        "split_role": "val-dev",
+        "stage": "stage0",
+        "subject": 1,
+    }
+    matrices = {
+        role: base.copy()
+        for role in _PARITY_ROLES
+    }
+    matrices["saved_checkpoint"][0, 0] += np.float32(2e-7)
+    matrices["repeat_emission"][1, 1] -= np.float32(3e-7)
+    matrices["reload_evaluation"][0, 4] += np.float32(4e-7)
+    for role, directory in _PARITY_ROLES.items():
+        ScoreArtifact.save(
+            run_directory / directory,
+            matrices[role],
+            query_ids,
+            gallery_ids,
+            metadata,
+        )
+    parity_module = _load_parity_module(experiment_root)
+    report = parity_module.build_baseline_parity_report(
+        run_directory,
+        scope="val-dev",
+    )
+    artifacts = {
+        role: ScoreArtifact.load(
+            run_directory / directory,
+            {"val-dev"},
+        )
+        for role, directory in _PARITY_ROLES.items()
+    }
+    return run_directory, report, artifacts
+
+
+def test_full_parity_validator_recomputes_all_four_typed_bundles(
+    runner_module: ModuleType,
+    experiment_root: Path,
+    tmp_path: Path,
+) -> None:
+    run_directory, report, artifacts = _real_parity_fixture(
+        experiment_root,
+        tmp_path,
+    )
+
+    runner_module._validate_parity_report_against_artifacts(
+        report,
+        output_dir=run_directory,
+        artifacts=artifacts,
+    )
+
+
+def test_full_parity_validator_rejects_same_byte_payload_replacement(
+    runner_module: ModuleType,
+    experiment_root: Path,
+    tmp_path: Path,
+) -> None:
+    run_directory, report, artifacts = _real_parity_fixture(
+        experiment_root,
+        tmp_path,
+    )
+    payload = run_directory / "repeat_emission" / "similarity.npy"
+    replacement = payload.with_name("similarity.replacement.npy")
+    replacement.write_bytes(payload.read_bytes())
+    os.replace(replacement, payload)
+
+    with pytest.raises(ValueError, match="identity|changed|parity"):
+        runner_module._validate_parity_report_against_artifacts(
+            report,
+            output_dir=run_directory,
+            artifacts=artifacts,
+        )
+
+
+def test_full_parity_validator_rejects_root_swap_after_validation(
+    runner_module: ModuleType,
+    experiment_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory, report, artifacts = _real_parity_fixture(
+        experiment_root,
+        tmp_path,
+    )
+    original_sha256_json = runner_module.sha256_json
+    swapped = False
+
+    def swap_before_summary_hash(value: object) -> str:
+        nonlocal swapped
+        if isinstance(value, dict) and "checkpoint_sha256" in value:
+            old_directory = run_directory.with_name(
+                f"{run_directory.name}.replaced"
+            )
+            run_directory.rename(old_directory)
+            run_directory.mkdir()
+            swapped = True
+        return original_sha256_json(value)
+
+    monkeypatch.setattr(
+        runner_module,
+        "sha256_json",
+        swap_before_summary_hash,
+    )
+
+    with pytest.raises(ValueError, match="directory.*identity|changed"):
+        runner_module._validate_parity_report_against_artifacts(
+            report,
+            output_dir=run_directory,
+            artifacts=artifacts,
+        )
+    assert swapped is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "root_extra",
+        "directory_identity",
+        "file_hash",
+        "pair_identity",
+        "pair_nan",
+        "pair_negative",
+        "matrix_after_report",
+    ),
+)
+def test_full_parity_validator_rejects_forged_report_or_artifact(
+    runner_module: ModuleType,
+    experiment_root: Path,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    run_directory, report, artifacts = _real_parity_fixture(
+        experiment_root,
+        tmp_path,
+    )
+    forged = copy.deepcopy(report)
+    if mutation == "root_extra":
+        forged["trusted"] = True
+    elif mutation == "directory_identity":
+        forged["run_directory_identity"]["inode"] += 1
+    elif mutation == "file_hash":
+        forged["artifacts"]["repeat_emission"]["files"][
+            "similarity.npy"
+        ]["sha256"] = _h("forged-payload")
+    elif mutation == "pair_identity":
+        forged["comparisons"][0]["right"] = "reload_evaluation"
+    elif mutation == "pair_nan":
+        forged["comparisons"][0][
+            "max_absolute_score_difference"
+        ] = float("nan")
+    elif mutation == "pair_negative":
+        forged["comparisons"][0][
+            "max_absolute_score_difference"
+        ] = -1.0
+    elif mutation == "matrix_after_report":
+        changed = artifacts["repeat_emission"].similarity.copy()
+        changed[0, 0] += np.float32(2e-4)
+        artifacts["repeat_emission"] = dataclass_replace(
+            artifacts["repeat_emission"],
+            similarity=changed,
+        )
+    else:  # pragma: no cover - parametrization invariant
+        raise AssertionError(mutation)
+
+    with pytest.raises(
+        (TypeError, ValueError),
+        match="parity|comparison|identity|hash|score|schema|finite",
+    ):
+        runner_module._validate_parity_report_against_artifacts(
+            forged,
+            output_dir=run_directory,
+            artifacts=artifacts,
+        )
+
+
+def test_full_proof_loads_exact_four_score_roles_once(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    @dataclass(frozen=True)
+    class FakeProof:
+        output_dir: Path
+        outputs: object
+        in_loop_score: object
+        completion_output_hashes: object = MappingProxyType({})
+        terminal_score: object | None = None
+        parity_artifacts: object = MappingProxyType({})
+        parity_report: object | None = None
+        parity_report_bytes: bytes | None = None
+        parity_sha256: str | None = None
+
+    class FakeScore:
+        loaded: list[Path] = []
+
+        def __init__(self, role: str) -> None:
+            self.role = role
+
+        @classmethod
+        def load(
+            cls,
+            directory: Path,
+            _scopes: set[str],
+        ) -> "FakeScore":
+            cls.loaded.append(Path(directory))
+            return cls(Path(directory).name)
+
+    output = tmp_path / "full-proof"
+    output.mkdir()
+    parity = {"fixture": True}
+    (output / "baseline_parity.json").write_bytes(
+        canonical_json_bytes(parity) + b"\n"
+    )
+    proof = FakeProof(
+        output_dir=output,
+        outputs=SimpleNamespace(
+            final_checkpoint_sha256=_h("checkpoint"),
+            run_manifest_sha256=_h("manifest"),
+        ),
+        in_loop_score=FakeScore("in_loop"),
+    )
+    arguments = SimpleNamespace(mode="full")
+    observed: list[dict[str, FakeScore]] = []
+    monkeypatch.setattr(
+        runner_module,
+        "ValidatedTrainingRunProof",
+        FakeProof,
+    )
+    monkeypatch.setattr(runner_module, "ScoreArtifact", FakeScore)
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_terminal_score_against_proof",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_parity_report_against_artifacts",
+        lambda _report, *, output_dir, artifacts: (
+            observed.append(dict(artifacts))
+            if output_dir == output
+            else pytest.fail("full proof changed output directory")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_parity_report_against_score",
+        lambda *_args, **_kwargs: pytest.fail(
+            "full proof trusted only saved_checkpoint"
+        ),
+        raising=False,
+    )
+
+    validated = runner_module._validate_full_training_proof(
+        arguments,
+        proof,
+    )
+
+    expected_paths = [
+        output / directory
+        for role, directory in _PARITY_ROLES.items()
+        if role != "in_loop"
+    ]
+    assert FakeScore.loaded == expected_paths
+    assert set(observed[0]) == set(_PARITY_ROLES)
+    assert dict(validated.parity_artifacts) == observed[0]
+    assert validated.terminal_score is observed[0]["saved_checkpoint"]
 
 
 @pytest.mark.parametrize(

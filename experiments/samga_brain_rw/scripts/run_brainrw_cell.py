@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -75,6 +75,14 @@ _RUN_MANIFEST_KEYS = frozenset(
         "resumed_from_sha256",
     }
 )
+_BRAINRW_SCHEDULE = {
+    "batch_size": 512,
+    "batches_per_epoch": 25,
+    "epochs": 25,
+    "planned_steps": 625,
+    "train_row_count": 12_540,
+}
+BRAINRW_SCHEDULE_SHA256 = sha256_json(_BRAINRW_SCHEDULE)
 
 
 @dataclass(frozen=True)
@@ -93,7 +101,7 @@ class BrainRWOutputs:
 
 
 @dataclass(frozen=True)
-class _ValidatedBrainRWProof:
+class ValidatedBrainRWRunProof:
     """One immutable training proof reused by scoring and completion."""
 
     config: br.BrainRWConfigIdentity
@@ -104,6 +112,31 @@ class _ValidatedBrainRWProof:
     run_manifest_sha256: str
     identity: Mapping[str, object]
     outputs: BrainRWOutputs
+    run_key: str
+    static_config_sha256: str
+    resolved_config_sha256: str
+    schedule_sha256: str
+    epochs: int
+    scope: str
+    split_role: str
+    protocol_sha256: str
+    manifest_sha256: str
+    source_manifest_sha256: str
+    source_payload_sha256: str
+    source_records_sha256: str
+    alignment_sha256: str
+    query_ids_sha256: str
+    gallery_ids_sha256: str
+    sealed_argv: tuple[str, ...] = ()
+    completion_output_hashes: Mapping[str, str] = dataclass_field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    score_artifact: ScoreArtifact | None = None
+
+
+# Backward-compatible internal spelling for callers/tests written before the
+# proof became part of the read-only composition API.
+_ValidatedBrainRWProof = ValidatedBrainRWRunProof
 
 
 SubprocessRunner = Callable[..., Any]
@@ -626,6 +659,23 @@ def _validate_locked_schedule(
         )
 
 
+def _brainrw_source_records(
+    manifest: br.ManifestIdentity,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "manifest_sha256": manifest.manifest_sha256,
+            "records_sha256": manifest.records_sha256,
+            "role": "val-dev",
+            "role_payload_sha256": manifest.val_dev_role_sha256,
+            "source_manifest_sha256": manifest.source_manifest_sha256,
+            "source_payload_byte_count": manifest.source_payload_byte_count,
+            "source_payload_path": str(manifest.source_payload_path),
+            "source_payload_sha256": manifest.source_payload_sha256,
+        }
+    ]
+
+
 def _validate_score_identity(
     artifact: ScoreArtifact,
     *,
@@ -643,18 +693,7 @@ def _validate_score_identity(
         raise ValueError("BrainRW score query IDs differ from the manifest")
     if tuple(artifact.gallery_ids) != ordered_ids:
         raise ValueError("BrainRW score gallery IDs differ from the manifest")
-    expected_source_records = [
-        {
-            "manifest_sha256": manifest.manifest_sha256,
-            "records_sha256": manifest.records_sha256,
-            "role": "val-dev",
-            "role_payload_sha256": manifest.val_dev_role_sha256,
-            "source_manifest_sha256": manifest.source_manifest_sha256,
-            "source_payload_byte_count": manifest.source_payload_byte_count,
-            "source_payload_path": str(manifest.source_payload_path),
-            "source_payload_sha256": manifest.source_payload_sha256,
-        }
-    ]
+    expected_source_records = _brainrw_source_records(manifest)
     source_records_sha256 = sha256_json(expected_source_records)
     expected = {
         "checkpoint_sha256": checkpoint.sha256,
@@ -752,7 +791,9 @@ def _make_validated_proof(
     run_manifest: Mapping[str, object],
     run_manifest_bytes: bytes,
     outputs: BrainRWOutputs,
-) -> _ValidatedBrainRWProof:
+    score_artifact: ScoreArtifact | None = None,
+    sealed_argv: tuple[str, ...] = (),
+) -> ValidatedBrainRWRunProof:
     run_manifest_sha256 = _sha256_bytes(run_manifest_bytes)
     if (
         outputs.checkpoint_sha256 != checkpoint.sha256
@@ -762,6 +803,11 @@ def _make_validated_proof(
             "BrainRW proof hashes differ from the validated artifacts"
         )
     payload = checkpoint.payload
+    ordered_ids = tuple(manifest.val_dev_ordered_ids)
+    query_ids_sha256 = ordered_ids_sha256(ordered_ids)
+    source_records_sha256 = sha256_json(
+        _brainrw_source_records(manifest)
+    )
     identity = MappingProxyType(
         {
             "mode": arguments.mode,
@@ -801,7 +847,7 @@ def _make_validated_proof(
             "output_dir": _normalized_path_text(arguments.output_dir),
         }
     )
-    return _ValidatedBrainRWProof(
+    return ValidatedBrainRWRunProof(
         config=config,
         manifest=manifest,
         checkpoint=checkpoint,
@@ -810,12 +856,31 @@ def _make_validated_proof(
         run_manifest_sha256=run_manifest_sha256,
         identity=identity,
         outputs=outputs,
+        run_key=arguments.run_key,
+        static_config_sha256=config.sha256,
+        resolved_config_sha256=config.sha256,
+        schedule_sha256=BRAINRW_SCHEDULE_SHA256,
+        epochs=25,
+        scope="val-dev",
+        split_role="val-dev",
+        protocol_sha256=manifest.protocol_sha256,
+        manifest_sha256=manifest.manifest_sha256,
+        source_manifest_sha256=manifest.source_manifest_sha256,
+        source_payload_sha256=manifest.source_payload_sha256,
+        source_records_sha256=source_records_sha256,
+        alignment_sha256=ordered_ids_sha256(
+            [*ordered_ids, *ordered_ids]
+        ),
+        query_ids_sha256=query_ids_sha256,
+        gallery_ids_sha256=query_ids_sha256,
+        sealed_argv=sealed_argv,
+        score_artifact=score_artifact,
     )
 
 
 def _validate_proof_arguments(
     arguments: argparse.Namespace,
-    proof: _ValidatedBrainRWProof,
+    proof: ValidatedBrainRWRunProof,
 ) -> None:
     expected = {
         "mode": arguments.mode,
@@ -856,11 +921,50 @@ def _validate_proof_arguments(
         != proof.identity.get("run_manifest_sha256")
     ):
         raise ValueError("BrainRW proof output identity is inconsistent")
+    direct = {
+        "run_key": arguments.run_key,
+        "static_config_sha256": arguments.expected_config_sha256,
+        "resolved_config_sha256": arguments.expected_config_sha256,
+        "schedule_sha256": BRAINRW_SCHEDULE_SHA256,
+        "epochs": 25,
+        "scope": "val-dev",
+        "split_role": "val-dev",
+        "protocol_sha256": proof.manifest.protocol_sha256,
+        "manifest_sha256": proof.manifest.manifest_sha256,
+        "source_manifest_sha256": (
+            proof.manifest.source_manifest_sha256
+        ),
+        "source_payload_sha256": (
+            proof.manifest.source_payload_sha256
+        ),
+        "source_records_sha256": sha256_json(
+            _brainrw_source_records(proof.manifest)
+        ),
+        "alignment_sha256": ordered_ids_sha256(
+            [
+                *proof.manifest.val_dev_ordered_ids,
+                *proof.manifest.val_dev_ordered_ids,
+            ]
+        ),
+        "query_ids_sha256": (
+            proof.manifest.val_dev_ordered_ids_sha256
+        ),
+        "gallery_ids_sha256": (
+            proof.manifest.val_dev_ordered_ids_sha256
+        ),
+    }
+    for field_name, expected_value in direct.items():
+        if getattr(proof, field_name) != expected_value:
+            raise ValueError(
+                f"BrainRW proof {field_name} binding mismatch"
+            )
 
 
 def _validate_brainrw_training_once(
     arguments: argparse.Namespace,
-) -> _ValidatedBrainRWProof:
+    *,
+    sealed_argv: tuple[str, ...] = (),
+) -> ValidatedBrainRWRunProof:
     """Load and validate each training-side artifact exactly once."""
 
     output = br.reject_development_path(
@@ -919,6 +1023,7 @@ def _validate_brainrw_training_once(
         checkpoint_path=checkpoint_path,
         checkpoint_sha256=checkpoint.sha256,
     )
+    score_artifact: ScoreArtifact | None = None
     if arguments.mode == "smoke":
         if (
             checkpoint.payload["training_complete"] is not False
@@ -941,6 +1046,7 @@ def _validate_brainrw_training_once(
             manifest=manifest,
             expected_stage=TRAINING_SMOKE_STAGE,
         )
+        score_artifact = score
         metadata_path = score.directory / "metadata.json"
         outputs = replace(
             common,
@@ -964,6 +1070,8 @@ def _validate_brainrw_training_once(
         run_manifest=run_manifest,
         run_manifest_bytes=run_manifest_bytes,
         outputs=outputs,
+        score_artifact=score_artifact,
+        sealed_argv=sealed_argv,
     )
 
 
@@ -977,14 +1085,32 @@ def validate_brainrw_training_outputs(
 
 def _validate_brainrw_outputs_from_proof(
     arguments: argparse.Namespace,
-    proof: _ValidatedBrainRWProof,
+    proof: ValidatedBrainRWRunProof,
 ) -> BrainRWOutputs:
     """Validate scores against exactly one frozen training proof."""
+
+    return _validate_brainrw_proof_outputs(arguments, proof).outputs
+
+
+def _validate_brainrw_proof_outputs(
+    arguments: argparse.Namespace,
+    proof: ValidatedBrainRWRunProof,
+) -> ValidatedBrainRWRunProof:
+    """Attach a terminal score to one already captured training proof."""
 
     _validate_proof_arguments(arguments, proof)
     outputs = proof.outputs
     if arguments.mode == "smoke":
-        return outputs
+        if not isinstance(proof.score_artifact, ScoreArtifact):
+            raise TypeError(
+                "BrainRW smoke proof requires a typed ScoreArtifact"
+            )
+        return replace(
+            proof,
+            completion_output_hashes=MappingProxyType(
+                _completion_hashes(outputs, arguments.mode)
+            ),
+        )
     score = ScoreArtifact.load(
         arguments.output_dir / "val_dev_scores",
         allowed_scopes={"val-dev"},
@@ -996,18 +1122,30 @@ def _validate_brainrw_outputs_from_proof(
         manifest=proof.manifest,
         expected_stage=BRAINRW_TERMINAL_STAGE,
     )
-    return replace(
+    if not isinstance(score, ScoreArtifact):
+        raise TypeError(
+            "BrainRW terminal proof requires a typed ScoreArtifact"
+        )
+    final_outputs = replace(
         outputs,
         score_directory=score.directory,
         score_payload_sha256=score.verified.payload_sha256,
         score_envelope_sha256=score.verified.envelope_sha256,
+    )
+    return replace(
+        proof,
+        outputs=final_outputs,
+        completion_output_hashes=MappingProxyType(
+            _completion_hashes(final_outputs, arguments.mode)
+        ),
+        score_artifact=score,
     )
 
 
 def validate_brainrw_outputs(
     arguments: argparse.Namespace,
     *,
-    proof: _ValidatedBrainRWProof | None = None,
+    proof: ValidatedBrainRWRunProof | None = None,
 ) -> BrainRWOutputs:
     """Capture once when needed, then validate through the frozen proof."""
 
@@ -1067,13 +1205,11 @@ def validate_brainrw_map_config(
     return config
 
 
-def validate_brainrw_command_outputs(
+def _parse_sealed_brainrw_command(
     argv: Sequence[str],
     *,
-    expected_mode: str | None = None,
-) -> BrainRWOutputs:
-    """Reparse one sealed BrainRW runner command and verify its outputs."""
-
+    expected_mode: str | None,
+) -> argparse.Namespace:
     if (
         isinstance(argv, (str, bytes, bytearray))
         or len(argv) < 3
@@ -1091,14 +1227,102 @@ def validate_brainrw_command_outputs(
         raise ValueError("expected_mode must be smoke, full, or None")
     if expected_mode is not None and arguments.mode != expected_mode:
         raise ValueError("sealed BrainRW runner mode differs from expected mode")
+    project_root = br.reject_development_path(
+        arguments.project_root,
+        "project root",
+    )
+    for field, context in (
+        ("config", "BrainRW command config"),
+        ("manifest", "BrainRW command manifest"),
+        ("clip_path", "BrainRW command CLIP path"),
+        ("output_dir", "BrainRW command output"),
+    ):
+        br.reject_development_path(getattr(arguments, field), context)
     expected_runner = (
-        br.reject_development_path(arguments.project_root, "project root")
+        project_root
         / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
     )
     if Path(command[1]) != expected_runner:
         raise ValueError(
             "sealed BrainRW runner path differs from project-root binding"
         )
+    return arguments
+
+
+def validate_brainrw_command_proof(
+    argv: Sequence[str],
+    *,
+    expected_mode: str = "full",
+) -> ValidatedBrainRWRunProof:
+    """Reparse a sealed command and capture one immutable typed run proof."""
+
+    arguments = _parse_sealed_brainrw_command(
+        argv,
+        expected_mode=expected_mode,
+    )
+    proof = _validate_brainrw_training_once(
+        arguments,
+        sealed_argv=tuple(argv),
+    )
+    validated = _validate_brainrw_proof_outputs(arguments, proof)
+    if not isinstance(validated, ValidatedBrainRWRunProof):
+        raise TypeError(
+            "BrainRW command validation did not return a typed run proof"
+        )
+    if not isinstance(validated.config, br.BrainRWConfigIdentity):
+        raise TypeError("BrainRW command proof lacks a typed config")
+    if not isinstance(validated.manifest, br.ManifestIdentity):
+        raise TypeError("BrainRW command proof lacks a typed manifest")
+    if not isinstance(
+        validated.checkpoint,
+        br.LoadedBrainRWCheckpoint,
+    ):
+        raise TypeError("BrainRW command proof lacks a typed checkpoint")
+    if not isinstance(validated.score_artifact, ScoreArtifact):
+        raise TypeError(
+            "BrainRW command proof lacks a typed ScoreArtifact"
+        )
+    if validated.sealed_argv != tuple(argv):
+        raise ValueError("BrainRW command proof sealed argv mismatch")
+    expected_names = (
+        {
+            "final_checkpoint_sha256",
+            "in_loop_metadata_sha256",
+            "run_manifest_sha256",
+        }
+        if arguments.mode == "smoke"
+        else {
+            "final_checkpoint_sha256",
+            "run_manifest_sha256",
+            "score_envelope_sha256",
+            "score_payload_sha256",
+        }
+    )
+    if set(validated.completion_output_hashes) != expected_names:
+        raise ValueError(
+            "BrainRW proof completion output names mismatch"
+        )
+    if dict(validated.completion_output_hashes) != _completion_hashes(
+        validated.outputs,
+        arguments.mode,
+    ):
+        raise ValueError(
+            "BrainRW proof completion hashes differ from typed outputs"
+        )
+    return validated
+
+
+def validate_brainrw_command_outputs(
+    argv: Sequence[str],
+    *,
+    expected_mode: str | None = None,
+) -> BrainRWOutputs:
+    """Reparse one sealed BrainRW runner command and verify its outputs."""
+
+    arguments = _parse_sealed_brainrw_command(
+        argv,
+        expected_mode=expected_mode,
+    )
     return validate_brainrw_outputs(arguments)
 
 

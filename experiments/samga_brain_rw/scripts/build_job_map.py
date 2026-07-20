@@ -17,9 +17,10 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any
 
 from samga_brain_rw.config import make_run_key
@@ -221,7 +222,21 @@ class JobCompletion:
 
     path: Path
     sha256: str
-    document: dict[str, object]
+    document: Mapping[str, object]
+    output_hashes: Mapping[str, str]
+    _job_map_snapshot: bytes = dataclass_field(
+        repr=False,
+        compare=False,
+    )
+    _array_index: int = dataclass_field(
+        repr=False,
+        compare=False,
+    )
+
+    def revalidate(self) -> None:
+        """Revalidate this snapshot through map/row/current-claim state."""
+
+        _revalidate_job_completion(self)
 
 
 def _require_exact_keys(
@@ -2417,13 +2432,72 @@ def _validate_output_hashes(
     }
 
 
+def _deep_freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _deep_freeze_json(child)
+                for key, child in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_json(child) for child in value)
+    return value
+
+
+def _deep_thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _deep_thaw_json(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_deep_thaw_json(child) for child in value]
+    return value
+
+
+def _make_job_completion(
+    *,
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    path: Path,
+    digest: str,
+    document: Mapping[str, object],
+) -> JobCompletion:
+    checked_payload, checked_row, _, _ = _row_context(payload, row)
+    completion_payload = document.get("payload")
+    if not isinstance(completion_payload, Mapping):
+        raise ValueError("completion payload must be an object")
+    outputs = completion_payload.get("output_hashes")
+    if not isinstance(outputs, Mapping):
+        raise ValueError("completion output_hashes must be an object")
+    validated_outputs = _validate_output_hashes(checked_row, outputs)
+    frozen_document = _deep_freeze_json(document)
+    if not isinstance(frozen_document, Mapping):
+        raise AssertionError("frozen completion document is not a mapping")
+    frozen_outputs = _deep_freeze_json(validated_outputs)
+    if not isinstance(frozen_outputs, Mapping):
+        raise AssertionError("frozen completion outputs are not a mapping")
+    return JobCompletion(
+        path=path,
+        sha256=digest,
+        document=frozen_document,
+        output_hashes=frozen_outputs,
+        _job_map_snapshot=canonical_json_bytes(checked_payload),
+        _array_index=int(checked_row["array_index"]),
+    )
+
+
 def _load_completion(
     payload: Mapping[str, object],
     row: Mapping[str, object],
     *,
     state_fd: int | None,
 ) -> JobCompletion:
-    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    checked_payload, checked_row, map_sha256, row_sha256 = _row_context(
+        payload,
+        row,
+    )
     path = Path(str(checked_row["completion_path"]))
     schema = checked_row["expected_completion_schema"]
     if not isinstance(schema, dict):
@@ -2461,15 +2535,19 @@ def _load_completion(
     if not isinstance(outputs, dict):
         raise ValueError("completion output_hashes must be an object")
     _validate_output_hashes(checked_row, outputs)
-    return JobCompletion(path=path, sha256=digest, document=document)
+    return _make_job_completion(
+        payload=checked_payload,
+        row=checked_row,
+        path=path,
+        digest=digest,
+        document=document,
+    )
 
 
-def completion_output_hashes(
+def _load_job_completion_current(
     payload: Mapping[str, object],
     row: Mapping[str, object],
-) -> dict[str, str] | None:
-    """Return sealed output hashes, or ``None`` only when completion is absent."""
-
+) -> JobCompletion | None:
     _, checked_row, _, _ = _row_context(payload, row)
     path = Path(str(checked_row["completion_path"]))
     if not _path_lexists(path):
@@ -2478,16 +2556,89 @@ def completion_output_hashes(
         _state_dir(checked_row),
         create=False,
     ) as state_fd:
-        completion = _load_completion(
+        return _load_completion(
             payload,
             checked_row,
             state_fd=state_fd,
         )
+
+
+def load_job_completion(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+) -> JobCompletion | None:
+    """Return a fully validated completion, or ``None`` only for absence.
+
+    A present document is accepted only after the map, selected row, immutable
+    claim/recovery chain, current generation, completion schema, and output
+    hashes have all been validated.
+    """
+
+    return _load_job_completion_current(payload, row)
+
+
+def _revalidate_job_completion(completion: JobCompletion) -> None:
+    try:
+        snapshot = json.loads(completion._job_map_snapshot)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "job completion map snapshot is invalid JSON"
+        ) from exc
+    if (
+        not isinstance(snapshot, dict)
+        or canonical_json_bytes(snapshot)
+        != completion._job_map_snapshot
+    ):
+        raise ValueError(
+            "job completion map snapshot is not canonical"
+        )
+    payload = validate_job_map(snapshot)
+    rows = payload["rows"]
+    if (
+        not isinstance(rows, list)
+        or completion._array_index < 0
+        or completion._array_index >= len(rows)
+    ):
+        raise ValueError("job completion row snapshot is invalid")
+    row = rows[completion._array_index]
+    if not isinstance(row, Mapping):
+        raise ValueError("job completion row snapshot is invalid")
+    current = _load_job_completion_current(payload, row)
+    if current is None:
+        raise ValueError("job completion is now absent")
+    expected_document = canonical_json_bytes(
+        _deep_thaw_json(completion.document)
+    )
+    actual_document = canonical_json_bytes(
+        _deep_thaw_json(current.document)
+    )
+    if (
+        current.path != completion.path
+        or current.sha256 != completion.sha256
+        or actual_document != expected_document
+        or dict(current.output_hashes)
+        != dict(completion.output_hashes)
+    ):
+        raise ValueError(
+            "job completion snapshot differs from current validated state"
+        )
+
+
+def completion_output_hashes(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+) -> dict[str, str] | None:
+    """Return sealed output hashes, or ``None`` only when completion is absent."""
+
+    completion = load_job_completion(payload, row)
+    if completion is None:
+        return None
+    _, checked_row, _, _ = _row_context(payload, row)
     completion_payload = completion.document["payload"]
-    if not isinstance(completion_payload, dict):
+    if not isinstance(completion_payload, Mapping):
         raise ValueError("completion payload must be an object")
     output_hashes = completion_payload["output_hashes"]
-    if not isinstance(output_hashes, dict):
+    if not isinstance(output_hashes, Mapping):
         raise ValueError("completion output_hashes must be an object")
     return dict(_validate_output_hashes(checked_row, output_hashes))
 
@@ -2507,7 +2658,10 @@ def should_submit_row(
 ) -> bool:
     """Return whether a row lacks a valid completion and an active first claim."""
 
-    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    _, checked_row, map_sha256, row_sha256 = _row_context(
+        payload,
+        row,
+    )
     base = _state_dir(checked_row)
     with _open_state_directory(base, create=False) as state_fd:
         if _path_lexists(Path(str(checked_row["completion_path"]))):
@@ -2559,7 +2713,10 @@ def claim_job_row(
 ) -> JobClaim:
     """Create the first immutable claim, refusing implicit stale retries."""
 
-    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    _, checked_row, map_sha256, row_sha256 = _row_context(
+        payload,
+        row,
+    )
     base = _state_dir(checked_row)
     with _transition_lock(base) as state_fd:
         if _path_lexists(
@@ -3625,7 +3782,10 @@ def complete_job_row(
 ) -> JobCompletion:
     """Publish one completion, returning the original for an identical retry."""
 
-    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    checked_payload, checked_row, map_sha256, row_sha256 = _row_context(
+        payload,
+        row,
+    )
     if (expected_claim_path is None) != (
         expected_claim_sha256 is None
     ):
@@ -3689,7 +3849,7 @@ def complete_job_row(
             )
             existing_payload = existing.document["payload"]
             if (
-                not isinstance(existing_payload, dict)
+                not isinstance(existing_payload, Mapping)
                 or existing_payload["output_hashes"] != outputs
             ):
                 raise RuntimeError(
@@ -3712,9 +3872,11 @@ def complete_job_row(
             str(schema["payload_type"]),
             completion_payload,
         )
-        return JobCompletion(
+        return _make_job_completion(
+            payload=checked_payload,
+            row=checked_row,
             path=completion_path,
-            sha256=digest,
+            digest=digest,
             document=document,
         )
 

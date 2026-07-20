@@ -2130,6 +2130,45 @@ def test_completion_output_hashes_returns_copy_or_none_and_rejects_tampering(
         jobmap_module.completion_output_hashes(payload, row)
 
 
+def test_load_job_completion_returns_typed_current_claim_proof_or_none(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+
+    assert jobmap_module.load_job_completion(payload, row) is None
+
+    claim = jobmap_module.claim_job_row(payload, row)
+    hashes = _output_hashes(row, "typed-completion-proof")
+    published = jobmap_module.complete_job_row(payload, row, hashes)
+    loaded = jobmap_module.load_job_completion(payload, row)
+
+    assert isinstance(loaded, jobmap_module.JobCompletion)
+    assert loaded == published
+    assert loaded.sha256 == hashlib.sha256(loaded.path.read_bytes()).hexdigest()
+    assert loaded.document["payload"]["claim_sha256"] == claim.sha256
+    assert loaded.document["payload"]["output_hashes"] == hashes
+    assert loaded.output_hashes == hashes
+    assert loaded.revalidate() is None
+    with pytest.raises(TypeError):
+        loaded.document["payload"]["output_hashes"][
+            "final_checkpoint_sha256"
+        ] = _h("mutable-nested-document")
+    with pytest.raises(TypeError):
+        loaded.output_hashes["final_checkpoint_sha256"] = _h(
+            "mutable-output-hashes"
+        )
+
+    document = json.loads(loaded.path.read_text(encoding="utf-8"))
+    document["payload"]["claim_sha256"] = _h("not-current-claim")
+    loaded.path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical|hash|completion|claim"):
+        jobmap_module.load_job_completion(payload, row)
+    with pytest.raises(ValueError, match="canonical|hash|completion|claim"):
+        loaded.revalidate()
+
+
 def test_unverified_recovery_helper_is_internal_only(
     jobmap_module: ModuleType,
 ) -> None:

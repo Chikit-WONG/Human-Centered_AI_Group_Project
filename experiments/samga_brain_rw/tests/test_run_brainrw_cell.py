@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import sys
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import MappingProxyType, ModuleType, SimpleNamespace
 
@@ -588,6 +588,166 @@ def test_command_output_revalidation_reparses_exact_sealed_runner(
             command,
             expected_mode="smoke",
         )
+
+
+def test_public_brainrw_command_proof_is_frozen_single_capture_and_full_by_default(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact, training_proof, arguments = _validated_proof_binding(
+        runner_module,
+        tmp_path,
+    )
+    command = [
+        "python",
+        str(
+            arguments.project_root
+            / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
+        ),
+        *_argv(tmp_path, mode="full"),
+    ]
+    training_proof = replace(
+        training_proof,
+        sealed_argv=tuple(command),
+    )
+    outputs = replace(
+        training_proof.outputs,
+        score_directory=arguments.output_dir / "val_dev_scores",
+        score_payload_sha256=_h("score-payload"),
+        score_envelope_sha256=_h("score-envelope"),
+    )
+    completion_hashes = MappingProxyType(
+        {
+            "final_checkpoint_sha256": outputs.checkpoint_sha256,
+            "run_manifest_sha256": outputs.run_manifest_sha256,
+            "score_envelope_sha256": outputs.score_envelope_sha256,
+            "score_payload_sha256": outputs.score_payload_sha256,
+        }
+    )
+    final_proof = replace(
+        training_proof,
+        outputs=outputs,
+        score_artifact=artifact,
+        completion_output_hashes=completion_hashes,
+    )
+    captures: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_brainrw_training_once",
+        lambda actual, **kwargs: (
+            captures.append(actual) or training_proof
+            if tuple(kwargs.get("sealed_argv", ())) == tuple(command)
+            else pytest.fail("command proof omitted its sealed argv")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_brainrw_proof_outputs",
+        lambda actual, proof: (
+            final_proof
+            if actual.run_key == arguments.run_key
+            and proof is training_proof
+            else pytest.fail("command proof switched its frozen capture")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "ScoreArtifact",
+        SimpleNamespace,
+    )
+    monkeypatch.setattr(
+        runner_module.br,
+        "BrainRWConfigIdentity",
+        SimpleNamespace,
+    )
+    monkeypatch.setattr(
+        runner_module.br,
+        "ManifestIdentity",
+        SimpleNamespace,
+    )
+    monkeypatch.setattr(
+        runner_module.br,
+        "LoadedBrainRWCheckpoint",
+        SimpleNamespace,
+    )
+
+    proof = runner_module.validate_brainrw_command_proof(command)
+
+    assert isinstance(proof, runner_module.ValidatedBrainRWRunProof)
+    assert proof is final_proof
+    assert proof.score_artifact is artifact
+    assert proof.sealed_argv == tuple(command)
+    assert proof.run_key == arguments.run_key
+    assert proof.static_config_sha256 == arguments.expected_config_sha256
+    assert proof.resolved_config_sha256 == arguments.expected_config_sha256
+    assert proof.schedule_sha256 == runner_module.BRAINRW_SCHEDULE_SHA256
+    assert proof.epochs == 25
+    assert proof.scope == "val-dev"
+    assert proof.split_role == "val-dev"
+    assert proof.protocol_sha256 == proof.manifest.protocol_sha256
+    assert proof.manifest_sha256 == proof.manifest.manifest_sha256
+    assert proof.source_manifest_sha256 == (
+        proof.manifest.source_manifest_sha256
+    )
+    assert proof.source_payload_sha256 == (
+        proof.manifest.source_payload_sha256
+    )
+    assert proof.query_ids_sha256 == (
+        proof.manifest.val_dev_ordered_ids_sha256
+    )
+    assert proof.gallery_ids_sha256 == proof.query_ids_sha256
+    assert proof.alignment_sha256 == ordered_ids_sha256(
+        [
+            *proof.manifest.val_dev_ordered_ids,
+            *proof.manifest.val_dev_ordered_ids,
+        ]
+    )
+    assert dict(proof.completion_output_hashes) == dict(completion_hashes)
+    assert captures == [arguments]
+    invalid_checkpoint = replace(final_proof, checkpoint=object())
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_brainrw_proof_outputs",
+        lambda _actual, _proof: invalid_checkpoint,
+    )
+    with pytest.raises(TypeError, match="checkpoint|typed"):
+        runner_module.validate_brainrw_command_proof(command)
+    with pytest.raises(FrozenInstanceError):
+        proof.score_artifact = None
+    with pytest.raises(ValueError, match="mode"):
+        runner_module.validate_brainrw_command_proof(
+            command,
+            expected_mode="smoke",
+        )
+
+
+def test_public_brainrw_command_proof_rejects_restricted_scope_before_capture(
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    command = [
+        "python",
+        str(
+            (tmp_path / "project").resolve()
+            / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
+        ),
+        *_argv(tmp_path, mode="full"),
+    ]
+    command[command.index("--manifest") + 1] = str(
+        (tmp_path / "val-confirm" / "sub-08_protocol.json").resolve()
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_brainrw_training_once",
+        lambda _arguments: pytest.fail(
+            "restricted scope reached artifact capture"
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="scope|development|sealed"):
+        runner_module.validate_brainrw_command_proof(command)
 
 
 def test_map_config_verifier_binds_declared_config_and_clip(
