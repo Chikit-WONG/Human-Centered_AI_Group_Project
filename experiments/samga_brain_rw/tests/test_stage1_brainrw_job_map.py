@@ -177,28 +177,16 @@ def test_pilot_map_is_exact_three_by_two_grid(
 
     assert payload["stage"] == "stage-1-brainrw-pilot"
     assert payload["row_count"] == 6
-    assert {
-        (row["subject"], row["seed"])
-        for row in payload["rows"]
-    } == {
-        (subject, seed)
-        for subject in (1, 5, 8)
-        for seed in (42, 43)
+    assert {(row["subject"], row["seed"]) for row in payload["rows"]} == {
+        (subject, seed) for subject in (1, 5, 8) for seed in (42, 43)
     }
-    sub08 = [
-        row for row in payload["rows"] if row["subject"] == 8
-    ]
+    sub08 = [row for row in payload["rows"] if row["subject"] == 8]
     assert {row["input_bundle_sha256"] for row in sub08} == {
         sub08[0]["input_bundle_sha256"]
     }
     assert {
-        row["argv"][row["argv"].index("--manifest") + 1]
-        for row in sub08
-    } == {
-        sub08[0]["argv"][
-            sub08[0]["argv"].index("--manifest") + 1
-        ]
-    }
+        row["argv"][row["argv"].index("--manifest") + 1] for row in sub08
+    } == {sub08[0]["argv"][sub08[0]["argv"].index("--manifest") + 1]}
     for row in payload["rows"]:
         assert row["partition"] == "i64m1tga40u"
         assert row["time"] == "02:00:00"
@@ -214,6 +202,116 @@ def test_pilot_map_is_exact_three_by_two_grid(
                 "score_payload_sha256",
             ],
         }
+
+
+@pytest.mark.parametrize(
+    "pilot_partition",
+    (
+        "i64m1tga40u",
+        "i64m1tga40ue",
+        "emergency_gpua40",
+    ),
+)
+def test_pilot_builder_accepts_exact_partition_escalation_allowlist(
+    builder_module: ModuleType,
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pilot_partition: str,
+) -> None:
+    project_root = (tmp_path / "project").resolve()
+    project_root.mkdir()
+    _install_fake_identities(builder_module, project_root, monkeypatch)
+
+    rows = builder_module.build_stage1_brainrw_rows(
+        project_root=project_root,
+        phase="pilot",
+        semantic_environment_sha256=_h("environment"),
+        pilot_partition=pilot_partition,
+    )
+    payload = jobmap_module.build_job_map(rows)
+
+    assert {row["partition"] for row in payload["rows"]} == {pilot_partition}
+    assert {row["time"] for row in payload["rows"]} == {"02:00:00"}
+
+
+@pytest.mark.parametrize("pilot_partition", ("debug", "unknown"))
+def test_pilot_builder_rejects_non_escalation_partition(
+    builder_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pilot_partition: str,
+) -> None:
+    project_root = (tmp_path / "project").resolve()
+    project_root.mkdir()
+    _install_fake_identities(builder_module, project_root, monkeypatch)
+
+    with pytest.raises(ValueError, match="pilot partition|partition.*pilot"):
+        builder_module.build_stage1_brainrw_rows(
+            project_root=project_root,
+            phase="pilot",
+            semantic_environment_sha256=_h("environment"),
+            pilot_partition=pilot_partition,
+        )
+
+
+@pytest.mark.parametrize(
+    "pilot_partition",
+    (
+        "i64m1tga40u",
+        "i64m1tga40ue",
+        "emergency_gpua40",
+        "debug",
+    ),
+)
+def test_smoke_builder_rejects_every_pilot_partition_override(
+    builder_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pilot_partition: str,
+) -> None:
+    project_root = (tmp_path / "project").resolve()
+    project_root.mkdir()
+    _install_fake_identities(builder_module, project_root, monkeypatch)
+
+    with pytest.raises(ValueError, match="smoke|override|pilot partition"):
+        builder_module.build_stage1_brainrw_rows(
+            project_root=project_root,
+            phase="smoke",
+            semantic_environment_sha256=_h("environment"),
+            pilot_partition=pilot_partition,
+        )
+
+
+@pytest.mark.parametrize(
+    "pilot_partition",
+    (
+        "i64m1tga40u",
+        "i64m1tga40ue",
+        "emergency_gpua40",
+    ),
+)
+def test_builder_cli_exposes_only_sealed_pilot_partitions(
+    builder_module: ModuleType,
+    tmp_path: Path,
+    pilot_partition: str,
+) -> None:
+    arguments = builder_module._parser().parse_args(
+        [
+            "--phase",
+            "pilot",
+            "--project-root",
+            str(tmp_path),
+            "--semantic-environment-sha256",
+            _h("environment"),
+            "--pilot-partition",
+            pilot_partition,
+            "--output",
+            str(tmp_path / "map.json"),
+        ]
+    )
+
+    assert arguments.pilot_partition == pilot_partition
 
 
 @pytest.mark.parametrize("phase", ("full", "confirmation", "formal-test"))
@@ -269,9 +367,7 @@ def test_builder_rejects_verified_clip_path_drift_from_config(
         "verify_brainrw_config",
         lambda _config, actual_clip: SimpleNamespace(
             path=config_path,
-            payload=MappingProxyType(
-                {"config_id": "brainrw_clip_lora_v1"}
-            ),
+            payload=MappingProxyType({"config_id": "brainrw_clip_lora_v1"}),
             sha256=_h("config"),
             clip_path=(tmp_path / "models" / "different").resolve(),
         )

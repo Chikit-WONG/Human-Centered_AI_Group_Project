@@ -130,17 +130,20 @@ _GENERATION_RE = re.compile(r"^generation-(\d{6})$")
 _DEVELOPMENT_STAGE_RE = re.compile(
     r"^stage-(?P<stage>[02])-(?P<phase>smoke|pilot|full)$"
 )
-_BRAINRW_STAGE_RE = re.compile(
-    r"^stage-1-brainrw-(?P<phase>smoke|pilot)$"
-)
+_BRAINRW_STAGE_RE = re.compile(r"^stage-1-brainrw-(?P<phase>smoke|pilot)$")
 _BRAINRW_TOPOLOGIES = {
     "stage-1-brainrw-smoke": ((8, 42),),
     "stage-1-brainrw-pilot": tuple(
-        (subject, seed)
-        for subject in (1, 5, 8)
-        for seed in (42, 43)
+        (subject, seed) for subject in (1, 5, 8) for seed in (42, 43)
     ),
 }
+_BRAINRW_PILOT_PARTITIONS = frozenset(
+    {
+        "i64m1tga40u",
+        "i64m1tga40ue",
+        "emergency_gpua40",
+    }
+)
 _SLURM_ARRAY_JOB_RE = re.compile(
     r"^(?P<array_job_id>[1-9][0-9]*)_(?P<array_task_id>0|[1-9][0-9]*)$"
 )
@@ -248,7 +251,9 @@ def _require_exact_keys(
     if actual != expected:
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
-        raise ValueError(f"{label} keys mismatch: missing={missing}, extra={extra}")
+        raise ValueError(
+            f"{label} keys mismatch: missing={missing}, extra={extra}"
+        )
 
 
 def _require_sha256(value: object, label: str) -> str:
@@ -330,7 +335,9 @@ def _validate_log_path(value: object, label: str, suffix: str) -> str:
     try:
         path.relative_to(LOG_ROOT)
     except ValueError as exc:
-        raise ValueError(f"{label} must remain below logs/samga_brain_rw") from exc
+        raise ValueError(
+            f"{label} must remain below logs/samga_brain_rw"
+        ) from exc
     if path.suffix != suffix:
         raise ValueError(f"{label} must end in {suffix}")
     return text
@@ -342,14 +349,8 @@ def _validate_canonical_absolute_path(
 ) -> Path:
     text = _require_nonempty_string(value, label)
     pure = PurePosixPath(text)
-    if (
-        not pure.is_absolute()
-        or ".." in pure.parts
-        or pure.as_posix() != text
-    ):
-        raise ValueError(
-            f"{label} must be an absolute normalized path"
-        )
+    if not pure.is_absolute() or ".." in pure.parts or pure.as_posix() != text:
+        raise ValueError(f"{label} must be an absolute normalized path")
     path = Path(text)
     try:
         resolved = path.resolve(strict=False)
@@ -380,9 +381,7 @@ def _validate_training_runner_argv(
         raise ValueError("sealed training runner argv is incomplete")
     executable = PurePosixPath(argv[1]).as_posix()
     match = _DEVELOPMENT_STAGE_RE.fullmatch(str(row["stage"]))
-    expected_suffix = (
-        "experiments/samga_brain_rw/scripts/run_training_cell.py"
-    )
+    expected_suffix = "experiments/samga_brain_rw/scripts/run_training_cell.py"
     if not executable.endswith(expected_suffix):
         if match is not None:
             raise ValueError(
@@ -395,7 +394,9 @@ def _validate_training_runner_argv(
         )
     flags = [value for value in argv if value.startswith("--")]
     if len(flags) != len(set(flags)):
-        raise ValueError("sealed training runner argv contains a duplicate flag")
+        raise ValueError(
+            "sealed training runner argv contains a duplicate flag"
+        )
     required = (
         "--mode",
         "--stage",
@@ -436,9 +437,7 @@ def _validate_training_runner_argv(
         "--seed": str(row["seed"]),
         "--config-id": str(row["config_id"]),
         "--expected-config-sha256": str(row["config_sha256"]),
-        "--expected-input-bundle-sha256": str(
-            row["input_bundle_sha256"]
-        ),
+        "--expected-input-bundle-sha256": str(row["input_bundle_sha256"]),
         "--run-key": str(row["run_key"]),
         "--device": "cuda",
     }
@@ -448,15 +447,18 @@ def _validate_training_runner_argv(
             raise ValueError(f"sealed argv {label} does not match the row")
     if values["--resume"] == "":
         raise ValueError("sealed argv resume must be explicit")
-    for flag in ("--config", "--manifest", "--feature-cache", "--project-root"):
+    for flag in (
+        "--config",
+        "--manifest",
+        "--feature-cache",
+        "--project-root",
+    ):
         _require_nonempty_string(values[flag], f"argv {flag}")
     project_root = _validate_canonical_absolute_path(
         values["--project-root"],
         "sealed argv project-root",
     )
-    expected_runner = (
-        project_root / expected_suffix
-    ).as_posix()
+    expected_runner = (project_root / expected_suffix).as_posix()
     if executable != expected_runner:
         raise ValueError(
             "unified runner path does not match the declared project-root"
@@ -499,9 +501,7 @@ def _validate_training_runner_argv(
             if not value:
                 raise ValueError(f"sealed argv {flag} must be nonempty")
         if _flag_value(argv, "--candidate-id") != row["config_id"]:
-            raise ValueError(
-                "sealed argv candidate does not match config_id"
-            )
+            raise ValueError("sealed argv candidate does not match config_id")
     else:
         for flag in (
             "--stage2-config",
@@ -552,9 +552,7 @@ def _validate_brainrw_runner_argv(
         raise ValueError("sealed BrainRW runner argv is incomplete")
     executable = PurePosixPath(argv[1]).as_posix()
     match = _BRAINRW_STAGE_RE.fullmatch(str(row["stage"]))
-    expected_suffix = (
-        "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
-    )
+    expected_suffix = "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
     uses_runner = executable.endswith(expected_suffix)
     if match is not None and not uses_runner:
         raise ValueError("Stage 1 BrainRW stage requires the BrainRW runner")
@@ -569,21 +567,17 @@ def _validate_brainrw_runner_argv(
     argument_tokens = argv[2:]
     if (
         len(argument_tokens) % 2 != 0
-        or any(
-            not value.startswith("--")
-            for value in argument_tokens[::2]
-        )
-        or any(
-            value.startswith("--")
-            for value in argument_tokens[1::2]
-        )
+        or any(not value.startswith("--") for value in argument_tokens[::2])
+        or any(value.startswith("--") for value in argument_tokens[1::2])
     ):
         raise ValueError(
             "sealed BrainRW runner argv must contain only flag/value pairs"
         )
     flags = list(argument_tokens[::2])
     if len(flags) != len(set(flags)):
-        raise ValueError("sealed BrainRW runner argv contains a duplicate flag")
+        raise ValueError(
+            "sealed BrainRW runner argv contains a duplicate flag"
+        )
     required = {
         "--mode",
         "--subject",
@@ -609,8 +603,7 @@ def _validate_brainrw_runner_argv(
         missing = sorted(allowed - set(flags))
         extra = sorted(set(flags) - allowed)
         raise ValueError(
-            "sealed BrainRW runner flags mismatch: "
-            f"missing={missing}, extra={extra}"
+            f"sealed BrainRW runner flags mismatch: missing={missing}, extra={extra}"
         )
     values = {flag: _flag_value(argv, flag) for flag in required}
     expected_mode = "smoke" if phase == "smoke" else "full"
@@ -631,9 +624,7 @@ def _validate_brainrw_runner_argv(
         "--resume": "none",
         "--config-id": str(row["config_id"]),
         "--expected-config-sha256": str(row["config_sha256"]),
-        "--expected-input-bundle-sha256": str(
-            row["input_bundle_sha256"]
-        ),
+        "--expected-input-bundle-sha256": str(row["input_bundle_sha256"]),
         "--run-key": str(row["run_key"]),
         "--device": "cuda",
     }
@@ -668,8 +659,7 @@ def _validate_brainrw_runner_argv(
     )
     expected_config = (
         project_root
-        / "experiments/samga_brain_rw/configs/"
-        "brainrw_clip_lora_v1.json"
+        / "experiments/samga_brain_rw/configs/brainrw_clip_lora_v1.json"
     )
     if config_path != expected_config:
         raise ValueError("sealed BrainRW config path is not the locked config")
@@ -699,9 +689,7 @@ def _validate_brainrw_runner_argv(
         "completion_path",
     )
     expected_output_parent = (
-        project_root
-        / "artifacts/samga_brain_rw"
-        / str(row["stage"])
+        project_root / "artifacts/samga_brain_rw" / str(row["stage"])
     )
     if (
         output_dir.parent != expected_output_parent
@@ -722,12 +710,8 @@ def _validate_brainrw_runner_argv(
             "cpus": 8,
             "memory": "64G",
             "time": "00:30:00",
-            "stdout_path": (
-                "logs/samga_brain_rw/stage1_brainrw_%A_%a.out"
-            ),
-            "stderr_path": (
-                "logs/samga_brain_rw/stage1_brainrw_%A_%a.err"
-            ),
+            "stdout_path": ("logs/samga_brain_rw/stage1_brainrw_%A_%a.out"),
+            "stderr_path": ("logs/samga_brain_rw/stage1_brainrw_%A_%a.err"),
         }
         payload_type = "samga_brain_rw.brainrw_smoke_completion"
         required_hashes = [
@@ -736,18 +720,18 @@ def _validate_brainrw_runner_argv(
             "run_manifest_sha256",
         ]
     else:
+        partition = _require_nonempty_string(row["partition"], "partition")
+        if partition not in _BRAINRW_PILOT_PARTITIONS:
+            raise ValueError(
+                "Stage 1 BrainRW pilot resource partition mismatch"
+            )
         expected_resource = {
-            "partition": "i64m1tga40u",
             "gres": "gpu:a40:1",
             "cpus": 8,
             "memory": "64G",
             "time": "02:00:00",
-            "stdout_path": (
-                "logs/samga_brain_rw/stage1_brainrw_%A_%a.out"
-            ),
-            "stderr_path": (
-                "logs/samga_brain_rw/stage1_brainrw_%A_%a.err"
-            ),
+            "stdout_path": ("logs/samga_brain_rw/stage1_brainrw_%A_%a.out"),
+            "stderr_path": ("logs/samga_brain_rw/stage1_brainrw_%A_%a.err"),
         }
         payload_type = "samga_brain_rw.brainrw_full_completion"
         required_hashes = [
@@ -782,10 +766,7 @@ def _validate_brainrw_map_topology(
     expected_cells = _BRAINRW_TOPOLOGIES.get(stage)
     if expected_cells is None:
         return
-    cells = sorted(
-        (int(row["subject"]), int(row["seed"]))
-        for row in rows
-    )
+    cells = sorted((int(row["subject"]), int(row["seed"])) for row in rows)
     if cells != list(expected_cells):
         raise ValueError(
             "Stage 1 BrainRW map topology differs from the sealed cell grid"
@@ -820,17 +801,11 @@ def _validate_brainrw_map_topology(
             values.add(extractor(row, argv))
         if len(values) != 1:
             raise ValueError(
-                "Stage 1 BrainRW map identity is inconsistent for "
-                f"{field}"
+                f"Stage 1 BrainRW map identity is inconsistent for {field}"
             )
     for subject in sorted({int(row["subject"]) for row in rows}):
-        subject_rows = [
-            row for row in rows if int(row["subject"]) == subject
-        ]
-        bundles = {
-            str(row["input_bundle_sha256"])
-            for row in subject_rows
-        }
+        subject_rows = [row for row in rows if int(row["subject"]) == subject]
+        bundles = {str(row["input_bundle_sha256"]) for row in subject_rows}
         manifests = {
             _flag_value(row["argv"], "--manifest")  # type: ignore[arg-type]
             for row in subject_rows
@@ -867,10 +842,7 @@ def brainrw_map_identity(
         _flag_value(row["argv"], "--manifest")  # type: ignore[arg-type]
         for row in sub08
     }
-    bundles = {
-        str(row["input_bundle_sha256"])
-        for row in sub08
-    }
+    bundles = {str(row["input_bundle_sha256"]) for row in sub08}
     if len(manifests) != 1 or len(bundles) != 1:
         raise ValueError(
             "Stage 1 sub08 manifest/input identity is inconsistent"
@@ -967,18 +939,16 @@ def _validate_row(
     if partition == "debug" and seconds > 30 * 60:
         raise ValueError("debug resource jobs must finish within 30 minutes")
 
-    _validate_slurm_log_pattern(
-        row["stdout_path"], "stdout_path", ".out"
-    )
-    _validate_slurm_log_pattern(
-        row["stderr_path"], "stderr_path", ".err"
-    )
+    _validate_slurm_log_pattern(row["stdout_path"], "stdout_path", ".out")
+    _validate_slurm_log_pattern(row["stderr_path"], "stderr_path", ".err")
     completion_path = _validate_canonical_absolute_path(
         row["completion_path"],
         "completion_path",
     )
     if _is_forbidden_path_token(str(completion_path)):
-        raise ValueError("completion_path contains a forbidden test/formal path")
+        raise ValueError(
+            "completion_path contains a forbidden test/formal path"
+        )
     if completion_path.suffix != ".json":
         raise ValueError("completion_path must end in .json")
     _validate_completion_schema(row["expected_completion_schema"])
@@ -1028,15 +998,23 @@ def _json_copy(value: object) -> Any:
     try:
         return json.loads(canonical_json_bytes(value))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("job map must contain only canonical JSON values") from exc
+        raise ValueError(
+            "job map must contain only canonical JSON values"
+        ) from exc
 
 
 def build_job_map(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     """Validate, sort, index, and hash one homogeneous stage/resource map."""
 
-    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence) or not rows:
+    if (
+        isinstance(rows, (str, bytes))
+        or not isinstance(rows, Sequence)
+        or not rows
+    ):
         raise ValueError("job map requires at least one row")
-    validated = [_validate_row(_json_copy(row), expect_index=False) for row in rows]
+    validated = [
+        _validate_row(_json_copy(row), expect_index=False) for row in rows
+    ]
     stages = {str(row["stage"]) for row in validated}
     if len(stages) != 1:
         raise ValueError("job map must contain one homogeneous stage")
@@ -1060,8 +1038,7 @@ def build_job_map(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
 
     ordered = sorted(validated, key=job_row_sort_key)
     indexed = [
-        {"array_index": index, **row}
-        for index, row in enumerate(ordered)
+        {"array_index": index, **row} for index, row in enumerate(ordered)
     ]
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1102,8 +1079,7 @@ def validate_job_map(payload: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("job-map array bounds mismatch")
 
     validated = [
-        _validate_row(_json_copy(row), expect_index=True)
-        for row in rows
+        _validate_row(_json_copy(row), expect_index=True) for row in rows
     ]
     if any(row["stage"] != stage for row in validated):
         raise ValueError("job-map row stage mismatch")
@@ -1129,7 +1105,9 @@ def validate_job_map(payload: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("duplicate completion_path in job map")
 
     claimed = _require_sha256(payload["payload_sha256"], "job-map hash")
-    body = {key: value for key, value in payload.items() if key != "payload_sha256"}
+    body = {
+        key: value for key, value in payload.items() if key != "payload_sha256"
+    }
     if sha256_json(body) != claimed:
         raise ValueError("job-map hash mismatch")
     return dict(payload)
@@ -1151,7 +1129,11 @@ def _reject_constant(value: str) -> None:
 
 
 def _read_regular_file(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -1264,11 +1246,7 @@ def _exclusive_publish_at(
     name: str,
     data: bytes,
 ) -> None:
-    if (
-        not name
-        or name in {".", ".."}
-        or PurePosixPath(name).name != name
-    ):
+    if not name or name in {".", ".."} or PurePosixPath(name).name != name:
         raise ValueError("sealed record name must be one safe path component")
     flags = (
         os.O_WRONLY
@@ -1333,11 +1311,9 @@ def load_job_map(
     """Read and validate a canonical job map and optional expected map hash."""
 
     payload = validate_job_map(_strict_load(Path(path)))
-    if (
-        expected_sha256 is not None
-        and payload["payload_sha256"]
-        != _require_sha256(expected_sha256, "expected job-map hash")
-    ):
+    if expected_sha256 is not None and payload[
+        "payload_sha256"
+    ] != _require_sha256(expected_sha256, "expected job-map hash"):
         raise ValueError("job-map hash does not match the submitted hash")
     return payload
 
@@ -1378,9 +1354,13 @@ def _row_context(
     validated = validate_job_map(payload)
     checked_row = _validate_row(_json_copy(row), expect_index=True)
     index = checked_row["array_index"]
-    if type(index) is not int or index >= validated[  # type: ignore[operator]
-        "row_count"
-    ]:
+    if (
+        type(index) is not int
+        or index
+        >= validated[  # type: ignore[operator]
+            "row_count"
+        ]
+    ):
         raise ValueError("job row index is outside the map")
     sealed_row = validated["rows"][index]  # type: ignore[index]
     if checked_row != sealed_row:
@@ -1397,7 +1377,9 @@ def _output_dir(row: Mapping[str, object]) -> Path:
     completion = Path(str(row["completion_path"]))
     output_dir = completion.parent
     if output_dir == output_dir.parent:
-        raise ValueError("completion output directory cannot be a filesystem root")
+        raise ValueError(
+            "completion output directory cannot be a filesystem root"
+        )
     return output_dir
 
 
@@ -1658,13 +1640,11 @@ def _directory_tree_identity_from_fd(
                         mode = entry.stat(follow_symlinks=False).st_mode
                     except OSError as exc:
                         raise ValueError(
-                            "cannot inspect output tree entry: "
-                            f"{entry_path}"
+                            f"cannot inspect output tree entry: {entry_path}"
                         ) from exc
                     if stat.S_ISLNK(mode):
                         raise ValueError(
-                            "output tree contains a symbolic link: "
-                            f"{entry_path}"
+                            f"output tree contains a symbolic link: {entry_path}"
                         )
                     if stat.S_ISDIR(mode):
                         directories.append(relative)
@@ -1680,8 +1660,7 @@ def _directory_tree_identity_from_fd(
                         continue
                     if not stat.S_ISREG(mode):
                         raise ValueError(
-                            "output tree contains a non-regular entry: "
-                            f"{entry_path}"
+                            f"output tree contains a non-regular entry: {entry_path}"
                         )
                     data = _read_regular_file_at(
                         directory_fd,
@@ -1717,11 +1696,7 @@ def _directory_tree_identity_at(
 
 
 def _quarantine_path(base: Path, generation: int) -> Path:
-    return (
-        base
-        / "quarantine"
-        / f"generation-{generation:06d}-output"
-    )
+    return base / "quarantine" / f"generation-{generation:06d}-output"
 
 
 def _quarantine_output(
@@ -1863,7 +1838,9 @@ def _validate_quarantine(
 def _transition_lock(directory: Path) -> Iterator[int]:
     with _open_state_directory(directory, create=True) as state_fd:
         if state_fd is None:
-            raise RuntimeError("state directory creation returned no descriptor")
+            raise RuntimeError(
+                "state directory creation returned no descriptor"
+            )
         try:
             lock_fd = os.open(
                 ".transition.lock",
@@ -1971,9 +1948,7 @@ def _rename_staged_generation(
 ) -> None:
     final_path = Path(final_name)
     if _entry_lexists_at(state_fd, final_name, final_path):
-        raise ValueError(
-            "state generation already exists or is unsafe"
-        )
+        raise ValueError("state generation already exists or is unsafe")
     try:
         os.rename(
             staging_name,
@@ -2289,9 +2264,7 @@ def _load_recovery_record(
     ):
         raise ValueError("recovery record does not match its previous claim")
     if previous.generation > 1 and attempt is None:
-        raise ValueError(
-            "recovered claim was superseded without an attempt"
-        )
+        raise ValueError("recovered claim was superseded without an attempt")
     _require_sha256(
         recovery["recovery_audit_sha256"],
         "recovery_audit_sha256",
@@ -2338,11 +2311,7 @@ def _load_claim_chain(
             for generation in _generation_numbers(state_fd)
         }
         for generation, generation_fd in generation_fds.items():
-            path = (
-                base
-                / _generation_name(generation)
-                / "claim.json"
-            )
+            path = base / _generation_name(generation) / "claim.json"
             document, digest = _read_record(
                 path,
                 payload_type=CLAIM_TYPE,
@@ -2425,7 +2394,9 @@ def _validate_output_hashes(
         raise ValueError("invalid expected completion schema")
     names = schema["required_output_hashes"]
     if set(output_hashes) != set(names):  # type: ignore[arg-type]
-        raise ValueError("completion output hashes do not match the sealed schema")
+        raise ValueError(
+            "completion output hashes do not match the sealed schema"
+        )
     return {
         str(name): _require_sha256(output_hashes[name], str(name))
         for name in names  # type: ignore[union-attr]
@@ -2448,8 +2419,7 @@ def _deep_freeze_json(value: object) -> object:
 def _deep_thaw_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {
-            str(key): _deep_thaw_json(child)
-            for key, child in value.items()
+            str(key): _deep_thaw_json(child) for key, child in value.items()
         }
     if isinstance(value, (list, tuple)):
         return [_deep_thaw_json(child) for child in value]
@@ -2530,7 +2500,9 @@ def _load_completion(
         or completion_payload["generation"] != current.generation
         or completion_payload["claim_sha256"] != current.sha256
     ):
-        raise ValueError("completion does not match its sealed row/current claim")
+        raise ValueError(
+            "completion does not match its sealed row/current claim"
+        )
     outputs = completion_payload["output_hashes"]
     if not isinstance(outputs, dict):
         raise ValueError("completion output_hashes must be an object")
@@ -2586,12 +2558,9 @@ def _revalidate_job_completion(completion: JobCompletion) -> None:
         ) from exc
     if (
         not isinstance(snapshot, dict)
-        or canonical_json_bytes(snapshot)
-        != completion._job_map_snapshot
+        or canonical_json_bytes(snapshot) != completion._job_map_snapshot
     ):
-        raise ValueError(
-            "job completion map snapshot is not canonical"
-        )
+        raise ValueError("job completion map snapshot is not canonical")
     payload = validate_job_map(snapshot)
     rows = payload["rows"]
     if (
@@ -2609,15 +2578,12 @@ def _revalidate_job_completion(completion: JobCompletion) -> None:
     expected_document = canonical_json_bytes(
         _deep_thaw_json(completion.document)
     )
-    actual_document = canonical_json_bytes(
-        _deep_thaw_json(current.document)
-    )
+    actual_document = canonical_json_bytes(_deep_thaw_json(current.document))
     if (
         current.path != completion.path
         or current.sha256 != completion.sha256
         or actual_document != expected_document
-        or dict(current.output_hashes)
-        != dict(completion.output_hashes)
+        or dict(current.output_hashes) != dict(completion.output_hashes)
     ):
         raise ValueError(
             "job completion snapshot differs from current validated state"
@@ -2692,17 +2658,19 @@ def should_submit_row(
                 base,
                 current.generation,
             ) as generation_fd:
-                should_submit = _load_attempt(
-                    current,
-                    generation_fd=generation_fd,
-                    map_sha256=map_sha256,
-                    row_sha256=row_sha256,
-                    array_index=int(checked_row["array_index"]),
-                ) is None
+                should_submit = (
+                    _load_attempt(
+                        current,
+                        generation_fd=generation_fd,
+                        map_sha256=map_sha256,
+                        row_sha256=row_sha256,
+                        array_index=int(checked_row["array_index"]),
+                    )
+                    is None
+                )
     if should_submit and _path_lexists(_output_dir(checked_row)):
         raise RuntimeError(
-            "unaudited output exists; audited recovery is required "
-            "before submission"
+            "unaudited output exists; audited recovery is required before submission"
         )
     return should_submit
 
@@ -2719,9 +2687,7 @@ def claim_job_row(
     )
     base = _state_dir(checked_row)
     with _transition_lock(base) as state_fd:
-        if _path_lexists(
-            Path(str(checked_row["completion_path"]))
-        ):
+        if _path_lexists(Path(str(checked_row["completion_path"]))):
             _load_completion(
                 payload,
                 checked_row,
@@ -2772,9 +2738,7 @@ def _single_row_argv_value(
         not isinstance(value, str) for value in argv
     ):
         raise ValueError("job row argv must be a list of strings")
-    positions = [
-        index for index, value in enumerate(argv) if value == flag
-    ]
+    positions = [index for index, value in enumerate(argv) if value == flag]
     if len(positions) != 1 or positions[0] + 1 >= len(argv):
         raise ValueError(f"job row must contain {flag} exactly once")
     return argv[positions[0] + 1]
@@ -2790,7 +2754,11 @@ def _verified_submission_project_root(
         resolved = raw.resolve(strict=True)
     except OSError as exc:
         raise ValueError("project root cannot be verified") from exc
-    if resolved != raw or not resolved.is_dir() or not (resolved / ".git").exists():
+    if (
+        resolved != raw
+        or not resolved.is_dir()
+        or not (resolved / ".git").exists()
+    ):
         raise ValueError("project root is not a verified repository root")
     return resolved
 
@@ -2843,7 +2811,9 @@ def _parse_array_indices(
         indices.extend(range(start, end + 1))
     if _compress_array_indices(indices) != specification:
         raise ValueError("SLURM SubmitLine array is not canonical")
-    if required not in indices or any(index not in allowed for index in indices):
+    if required not in indices or any(
+        index not in allowed for index in indices
+    ):
         raise ValueError(
             "SLURM SubmitLine array is outside the sealed job map"
         )
@@ -2872,8 +2842,7 @@ def _expected_submission_command(
     ):
         raise ValueError("job map has invalid immutable array bounds")
     slurm_script = (
-        project_root
-        / "experiments/samga_brain_rw/slurm/pilot_array.slurm"
+        project_root / "experiments/samga_brain_rw/slurm/pilot_array.slurm"
     )
     try:
         verified_script = slurm_script.resolve(strict=True)
@@ -2954,12 +2923,7 @@ def _parse_tres(value: str, label: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for item in value.split(","):
         key, separator, selected = item.partition("=")
-        if (
-            not separator
-            or not key
-            or not selected
-            or key in result
-        ):
+        if not separator or not key or not selected or key in result:
             raise ValueError(f"sacct {label} is not canonical")
         result[key] = selected
     return result
@@ -3111,7 +3075,9 @@ def _state_record_mtime_ns(
             follow_symlinks=False,
         )
     except OSError as exc:
-        raise ValueError(f"cannot inspect sealed state record: {path}") from exc
+        raise ValueError(
+            f"cannot inspect sealed state record: {path}"
+        ) from exc
     if not stat.S_ISREG(identity.st_mode):
         raise ValueError(f"state record is not a sealed regular file: {path}")
     return identity.st_mtime_ns
@@ -3156,8 +3122,7 @@ def _collect_slurm_recovery_audit(
             attempt_payload = attempt[0]["payload"]
             if (
                 not isinstance(attempt_payload, dict)
-                or attempt_payload["scheduler_job_id"]
-                != failed_slurm_job
+                or attempt_payload["scheduler_job_id"] != failed_slurm_job
             ):
                 raise ValueError(
                     "failed SLURM job does not match the consumed attempt"
@@ -3209,10 +3174,14 @@ def _collect_slurm_recovery_audit(
         raise RuntimeError("SLURM job still has a live squeue record")
     second_stdout = _run_scheduler_query(runner, sacct_command)
     if second_stdout != first_stdout:
-        raise RuntimeError("sacct terminal record changed during recovery audit")
+        raise RuntimeError(
+            "sacct terminal record changed during recovery audit"
+        )
     second_record = _parse_sacct_record(second_stdout)
     if second_record != first_record:
-        raise RuntimeError("sacct terminal record changed during recovery audit")
+        raise RuntimeError(
+            "sacct terminal record changed during recovery audit"
+        )
     map_path = Path(job_map_path)
     map_data = _read_regular_file_path_nofollow(map_path)
     map_document = _strict_json_bytes(map_data, map_path)
@@ -3249,9 +3218,13 @@ def _collect_slurm_recovery_audit(
         )
     final_sacct_stdout = _run_scheduler_query(runner, sacct_command)
     if final_sacct_stdout != first_stdout:
-        raise RuntimeError("sacct terminal record changed before audit publication")
+        raise RuntimeError(
+            "sacct terminal record changed before audit publication"
+        )
     if _parse_sacct_record(final_sacct_stdout) != first_record:
-        raise RuntimeError("sacct terminal record changed before audit publication")
+        raise RuntimeError(
+            "sacct terminal record changed before audit publication"
+        )
     audit_payload: dict[str, object] = {
         "binding_mode": (
             "legacy_claim_scheduler_binding"
@@ -3519,9 +3492,7 @@ def _transition_to_recovered_claim_locked(
     }:
         raise ValueError("recovery audit type is not supported")
     base = _state_dir(checked_row)
-    if _path_lexists(
-        Path(str(checked_row["completion_path"]))
-    ):
+    if _path_lexists(Path(str(checked_row["completion_path"]))):
         _load_completion(
             payload,
             checked_row,
@@ -3573,8 +3544,7 @@ def _transition_to_recovered_claim_locked(
             if not isinstance(recovery_payload, dict):
                 raise ValueError("recovery payload must be an object")
             if (
-                recovery_payload["recovery_audit_sha256"]
-                != audit_sha256
+                recovery_payload["recovery_audit_sha256"] != audit_sha256
                 or recovery_payload["recovery_audit_type"]
                 != recovery_audit_type
             ):
@@ -3613,11 +3583,7 @@ def _transition_to_recovered_claim_locked(
         "recovered_from_claim_sha256": previous.sha256,
         "recovery_record_sha256": recovery_sha256,
     }
-    path = (
-        base
-        / f"generation-{next_generation:06d}"
-        / "claim.json"
-    )
+    path = base / f"generation-{next_generation:06d}" / "claim.json"
     document, digest = _create_record(
         path,
         CLAIM_TYPE,
@@ -3670,11 +3636,9 @@ def consume_recovery_attempt(
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
     if scheduler_job_id is not None:
         scheduler_match = _SLURM_ARRAY_JOB_RE.fullmatch(scheduler_job_id)
-        if (
-            scheduler_match is None
-            or int(scheduler_match.group("array_task_id"))
-            != int(checked_row["array_index"])
-        ):
+        if scheduler_match is None or int(
+            scheduler_match.group("array_task_id")
+        ) != int(checked_row["array_index"]):
             raise ValueError(
                 "attempt scheduler job does not match the selected row"
             )
@@ -3744,13 +3708,16 @@ def consume_recovery_attempt(
             base,
             current.generation,
         ) as current_fd:
-            if _load_attempt(
-                current,
-                generation_fd=current_fd,
-                map_sha256=map_sha256,
-                row_sha256=row_sha256,
-                array_index=int(checked_row["array_index"]),
-            ) is not None:
+            if (
+                _load_attempt(
+                    current,
+                    generation_fd=current_fd,
+                    map_sha256=map_sha256,
+                    row_sha256=row_sha256,
+                    array_index=int(checked_row["array_index"]),
+                )
+                is not None
+            ):
                 raise RuntimeError(
                     "recovered claim attempt was already consumed; "
                     "new audited recovery is required"
@@ -3786,16 +3753,12 @@ def complete_job_row(
         payload,
         row,
     )
-    if (expected_claim_path is None) != (
-        expected_claim_sha256 is None
-    ):
+    if (expected_claim_path is None) != (expected_claim_sha256 is None):
         raise ValueError(
             "expected claim path and hash must be provided together"
         )
     checked_expected_claim_path = (
-        Path(expected_claim_path)
-        if expected_claim_path is not None
-        else None
+        Path(expected_claim_path) if expected_claim_path is not None else None
     )
     checked_expected_claim_sha256 = (
         _require_sha256(
@@ -3831,13 +3794,16 @@ def complete_job_row(
                 base,
                 current.generation,
             ) as current_fd:
-                if _load_attempt(
-                    current,
-                    generation_fd=current_fd,
-                    map_sha256=map_sha256,
-                    row_sha256=row_sha256,
-                    array_index=int(checked_row["array_index"]),
-                ) is None:
+                if (
+                    _load_attempt(
+                        current,
+                        generation_fd=current_fd,
+                        map_sha256=map_sha256,
+                        row_sha256=row_sha256,
+                        array_index=int(checked_row["array_index"]),
+                    )
+                    is None
+                ):
                     raise RuntimeError(
                         "recovered claim cannot complete before its attempt"
                     )
@@ -3890,10 +3856,7 @@ def _slurm_job_id_for_attempt(array_index: int) -> str | None:
         raise ValueError("incomplete SLURM array scheduler identity")
     candidate = f"{array_job_id}_{array_task_id}"
     match = _SLURM_ARRAY_JOB_RE.fullmatch(candidate)
-    if (
-        match is None
-        or int(match.group("array_task_id")) != array_index
-    ):
+    if match is None or int(match.group("array_task_id")) != array_index:
         raise ValueError(
             "SLURM scheduler identity does not match the selected row"
         )
@@ -3920,7 +3883,9 @@ def _run_selected_row(args: argparse.Namespace) -> int:
             )
         for path in (args.confirmation_seal, args.cell_claim):
             if not Path(path).is_file():
-                raise ValueError(f"confirmation interface file is missing: {path}")
+                raise ValueError(
+                    f"confirmation interface file is missing: {path}"
+                )
     if completion_is_valid(job_map, row):
         print(f"row {row['array_index']} already complete; skipping")
         return 0
@@ -4006,14 +3971,8 @@ def _require_job_environment(name: str) -> str:
 
 def _job_environment_index(name: str) -> int:
     text = _require_job_environment(name)
-    if (
-        not text.isascii()
-        or not text.isdecimal()
-        or str(int(text)) != text
-    ):
-        raise ValueError(
-            f"{name} must be a canonical non-negative integer"
-        )
+    if not text.isascii() or not text.isdecimal() or str(int(text)) != text:
+        raise ValueError(f"{name} must be a canonical non-negative integer")
     return int(text)
 
 
@@ -4047,7 +4006,9 @@ def complete_job_row_from_environment(
     )
     actual_row_sha256 = sha256_json(row)
     if actual_row_sha256 != expected_row_sha256:
-        raise ValueError("selected row hash does not match SAMGA_JOB_ROW_SHA256")
+        raise ValueError(
+            "selected row hash does not match SAMGA_JOB_ROW_SHA256"
+        )
 
     _, checked_row, map_sha256, row_sha256 = _row_context(job_map, row)
     with _open_state_directory(
@@ -4067,9 +4028,7 @@ def complete_job_row_from_environment(
     if not claims:
         raise ValueError("SAMGA_JOB_CLAIM has no current claim")
     current_claim = claims[-1]
-    submitted_claim_path = Path(
-        _require_job_environment("SAMGA_JOB_CLAIM")
-    )
+    submitted_claim_path = Path(_require_job_environment("SAMGA_JOB_CLAIM"))
     if submitted_claim_path != current_claim.path:
         raise ValueError(
             "SAMGA_JOB_CLAIM claim path does not match the selected row"
@@ -4097,7 +4056,6 @@ def _parser() -> argparse.ArgumentParser:
 
     select = subparsers.add_parser("select", help="print one validated row")
     _add_selection_arguments(select)
-
 
     complete_env = subparsers.add_parser(
         "complete-env",
@@ -4144,7 +4102,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows_document["rows"],
             list,
         ):
-            raise ValueError("rows input must be exactly an object with a rows list")
+            raise ValueError(
+                "rows input must be exactly an object with a rows list"
+            )
         result = write_job_map(rows_document["rows"], args.output)
         print(result["payload_sha256"])
         return 0

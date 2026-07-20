@@ -16,15 +16,19 @@ from samga_brain_rw import brainrw as br
 _CONFIG_RELATIVE = Path(
     "experiments/samga_brain_rw/configs/brainrw_clip_lora_v1.json"
 )
-_MANIFEST_ROOT_RELATIVE = Path(
-    "artifacts/samga_brain_rw/protocol/manifests"
-)
+_MANIFEST_ROOT_RELATIVE = Path("artifacts/samga_brain_rw/protocol/manifests")
 _RUNNER_RELATIVE = Path(
     "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
 )
 _CONFIG_ID = "brainrw_clip_lora_v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHASES = frozenset({"smoke", "pilot"})
+_PILOT_PARTITIONS = (
+    "i64m1tga40u",
+    "i64m1tga40ue",
+    "emergency_gpua40",
+)
+_DEFAULT_PILOT_PARTITION = _PILOT_PARTITIONS[0]
 _SMOKE_HASHES = [
     "final_checkpoint_sha256",
     "in_loop_metadata_sha256",
@@ -62,19 +66,32 @@ def _completion_schema(phase: str) -> dict[str, object]:
     }
 
 
-def _resource(phase: str) -> dict[str, object]:
+def _resource(
+    phase: str,
+    pilot_partition: str | None,
+) -> dict[str, object]:
+    if phase == "smoke":
+        if pilot_partition is not None:
+            raise ValueError("smoke forbids a pilot partition override")
+        partition = "debug"
+    else:
+        partition = (
+            _DEFAULT_PILOT_PARTITION
+            if pilot_partition is None
+            else pilot_partition
+        )
+        if partition not in _PILOT_PARTITIONS:
+            raise ValueError(
+                "pilot partition is outside the sealed escalation allowlist"
+            )
     return {
-        "partition": "debug" if phase == "smoke" else "i64m1tga40u",
+        "partition": partition,
         "gres": "gpu:a40:1",
         "cpus": 8,
         "memory": "64G",
         "time": "00:30:00" if phase == "smoke" else "02:00:00",
-        "stdout_path": (
-            "logs/samga_brain_rw/stage1_brainrw_%A_%a.out"
-        ),
-        "stderr_path": (
-            "logs/samga_brain_rw/stage1_brainrw_%A_%a.err"
-        ),
+        "stdout_path": ("logs/samga_brain_rw/stage1_brainrw_%A_%a.out"),
+        "stderr_path": ("logs/samga_brain_rw/stage1_brainrw_%A_%a.err"),
     }
 
 
@@ -142,6 +159,7 @@ def build_stage1_brainrw_rows(
     project_root: Path,
     phase: str,
     semantic_environment_sha256: str,
+    pilot_partition: str | None = None,
 ) -> list[dict[str, object]]:
     """Return the exact sealed raw rows for one Stage 1 BrainRW phase."""
 
@@ -154,6 +172,7 @@ def build_stage1_brainrw_rows(
         raise ValueError(
             "semantic environment must be a lowercase SHA-256 digest"
         )
+    resource = _resource(phase, pilot_partition)
     root = _absolute_normalized(project_root, "project root")
     if not root.is_dir():
         raise ValueError("project root must be an existing directory")
@@ -164,9 +183,7 @@ def build_stage1_brainrw_rows(
         declared_clip_path,
     )
     if Path(config.clip_path) != declared_clip_path:
-        raise ValueError(
-            "verified CLIP path drifted from the semantic config"
-        )
+        raise ValueError("verified CLIP path drifted from the semantic config")
     config_id = _config_id(config)
     config_sha256 = str(config.sha256)
     if _SHA256_RE.fullmatch(config_sha256) is None:
@@ -176,19 +193,14 @@ def build_stage1_brainrw_rows(
         ((8, 42),)
         if phase == "smoke"
         else tuple(
-            (subject, seed)
-            for subject in (1, 5, 8)
-            for seed in (42, 43)
+            (subject, seed) for subject in (1, 5, 8) for seed in (42, 43)
         )
     )
     mode = "smoke" if phase == "smoke" else "full"
-    resource = _resource(phase)
     rows: list[dict[str, object]] = []
     for subject, seed in cells:
         manifest_path = (
-            root
-            / _MANIFEST_ROOT_RELATIVE
-            / f"sub-{subject:02d}_protocol.json"
+            root / _MANIFEST_ROOT_RELATIVE / f"sub-{subject:02d}_protocol.json"
         )
         manifest = br.load_development_manifest_identity(
             manifest_path,
@@ -201,12 +213,7 @@ def build_stage1_brainrw_rows(
             seed,
             semantic_environment_sha256,
         )
-        output_dir = (
-            root
-            / "artifacts/samga_brain_rw"
-            / stage
-            / run_key
-        )
+        output_dir = root / "artifacts/samga_brain_rw" / stage / run_key
         argv = [
             "python",
             str(root / _RUNNER_RELATIVE),
@@ -270,6 +277,10 @@ def _parser() -> argparse.ArgumentParser:
         "--semantic-environment-sha256",
         required=True,
     )
+    parser.add_argument(
+        "--pilot-partition",
+        choices=_PILOT_PARTITIONS,
+    )
     parser.add_argument("--output", required=True, type=Path)
     return parser
 
@@ -279,9 +290,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = build_stage1_brainrw_rows(
         project_root=arguments.project_root,
         phase=arguments.phase,
-        semantic_environment_sha256=(
-            arguments.semantic_environment_sha256
-        ),
+        semantic_environment_sha256=(arguments.semantic_environment_sha256),
+        pilot_partition=arguments.pilot_partition,
     )
     root = _absolute_normalized(arguments.project_root, "project root")
     stage_root = br.reject_development_path(
