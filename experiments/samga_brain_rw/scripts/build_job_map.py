@@ -147,6 +147,7 @@ _BRAINRW_PILOT_PARTITIONS = frozenset(
 _SLURM_ARRAY_JOB_RE = re.compile(
     r"^(?P<array_job_id>[1-9][0-9]*)_(?P<array_task_id>0|[1-9][0-9]*)$"
 )
+_SLURM_JOB_ID_RE = re.compile(r"^[1-9][0-9]*$")
 SLURM_RECOVERY_SACCT_FIELDS = (
     "JobIDRaw",
     "JobID",
@@ -2941,13 +2942,13 @@ def _validate_sacct_record(
     match = _SLURM_ARRAY_JOB_RE.fullmatch(failed_slurm_job)
     if match is None:
         raise ValueError("failed SLURM job must use <array-job>_<task-id>")
-    array_job_id = match.group("array_job_id")
     array_task_id = int(match.group("array_task_id"))
     if array_task_id != int(row["array_index"]):
         raise ValueError("failed SLURM task does not match the sealed row")
+    if _SLURM_JOB_ID_RE.fullmatch(record["JobIDRaw"]) is None:
+        raise ValueError("sacct JobIDRaw must be a canonical positive job ID")
     username = pwd.getpwuid(os.getuid()).pw_name
     expected = {
-        "JobIDRaw": array_job_id,
         "JobID": failed_slurm_job,
         "UID": str(os.getuid()),
         "User": username,
