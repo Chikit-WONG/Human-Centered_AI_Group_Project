@@ -12,9 +12,11 @@ from typing import Any
 
 from build_job_map import (
     completion_is_valid,
+    completion_output_hashes,
     load_job_map,
     should_submit_row,
 )
+from run_training_cell import validate_training_command_outputs
 
 
 QUEUE_COMMAND = [
@@ -71,6 +73,39 @@ def _incomplete_rows(
     ]
 
 
+def _revalidate_completed_smoke_outputs(
+    payload: Mapping[str, object],
+) -> None:
+    expected_names = {
+        "final_checkpoint_sha256",
+        "in_loop_metadata_sha256",
+        "run_manifest_sha256",
+    }
+    for row in _rows(payload):
+        declared = completion_output_hashes(payload, row)
+        if declared is None:
+            raise ValueError(
+                "smoke output revalidation requires every completion"
+            )
+        if set(declared) != expected_names:
+            raise ValueError(
+                "smoke completion hashes differ from the release gate schema"
+            )
+        outputs = validate_training_command_outputs(
+            row["argv"],
+            expected_mode="smoke",
+        )
+        actual = {
+            "final_checkpoint_sha256": outputs.final_checkpoint_sha256,
+            "in_loop_metadata_sha256": outputs.in_loop_metadata_sha256,
+            "run_manifest_sha256": outputs.run_manifest_sha256,
+        }
+        if actual != declared:
+            raise ValueError(
+                "smoke artifact hashes differ from the sealed completion"
+            )
+
+
 def _compress_indices(indices: Sequence[int]) -> str:
     if not indices:
         raise ValueError("cannot submit an empty array")
@@ -89,6 +124,72 @@ def _compress_indices(indices: Sequence[int]) -> str:
     return ",".join(ranges)
 
 
+def _single_argv_value(
+    row: Mapping[str, object],
+    flag: str,
+) -> str:
+    argv = row.get("argv")
+    if not isinstance(argv, list) or any(
+        not isinstance(value, str) for value in argv
+    ):
+        raise ValueError("job row argv must be a list of strings")
+    positions = [
+        index for index, value in enumerate(argv) if value == flag
+    ]
+    if len(positions) != 1:
+        raise ValueError(f"job row must contain {flag} exactly once")
+    position = positions[0]
+    if position + 1 >= len(argv):
+        raise ValueError(f"job row {flag} has no value")
+    return argv[position + 1]
+
+
+def _verified_project_root(
+    payload: Mapping[str, object],
+    slurm_script: Path,
+) -> tuple[Path, Path]:
+    roots = {
+        _single_argv_value(row, "--project-root")
+        for row in _rows(payload)
+    }
+    if len(roots) != 1:
+        raise ValueError("job-map rows must share one project root")
+    raw_root = Path(roots.pop())
+    if not raw_root.is_absolute() or ".." in raw_root.parts:
+        raise ValueError("project root must be absolute and normalized")
+    try:
+        root = raw_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("project root cannot be verified") from exc
+    if root != raw_root or not root.is_dir() or not (root / ".git").exists():
+        raise ValueError("project root is not a verified repository root")
+    try:
+        script = Path(slurm_script).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("SLURM script cannot be verified") from exc
+    try:
+        script.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("SLURM script is outside the project root") from exc
+    return root, script
+
+
+def _verified_log_directory(
+    root: Path,
+    row: Mapping[str, object],
+    log_dir: Path,
+) -> Path:
+    relative = Path(str(row["stdout_path"])).parent
+    expected = root / relative
+    declared = Path(log_dir)
+    if declared.is_absolute():
+        if declared != expected:
+            raise ValueError("absolute log_dir differs from sealed row logs")
+    elif declared != relative:
+        raise ValueError("log_dir differs from the sealed row log paths")
+    return expected
+
+
 def _resource_command(
     payload: Mapping[str, object],
     *,
@@ -102,6 +203,9 @@ def _resource_command(
     if not rows:
         raise ValueError("cannot submit a job map without rows")
     row = rows[0]
+    project_root, verified_script = _verified_project_root(
+        payload, slurm_script
+    )
     bounds = payload.get("array_bounds")
     if (
         not isinstance(bounds, list)
@@ -112,33 +216,45 @@ def _resource_command(
         raise ValueError("job map has invalid immutable array bounds")
     stdout_path = Path(str(row["stdout_path"]))
     stderr_path = Path(str(row["stderr_path"]))
-    expected_log_dir = stdout_path.parent
-    if (
-        stderr_path.parent != expected_log_dir
-        or Path(log_dir) != expected_log_dir
-    ):
+    sealed_log_dir = _verified_log_directory(
+        project_root,
+        row,
+        log_dir,
+    )
+    if stderr_path.parent != stdout_path.parent:
         raise ValueError("log_dir differs from the sealed row log paths")
-    if "," in str(job_map_path) or "\n" in str(job_map_path):
+    try:
+        sealed_job_map = Path(job_map_path).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("job-map path cannot be verified") from exc
+    for value in (str(sealed_job_map), str(project_root)):
+        if "," in value or "\n" in value:
+            raise ValueError(
+                "sealed path cannot be encoded in SLURM --export"
+            )
+    if not sealed_log_dir.is_absolute():
         raise ValueError("job-map path cannot be encoded in SLURM --export")
     return [
         "sbatch",
         "--parsable",
+        f"--chdir={project_root}",
         f"--partition={row['partition']}",
         f"--gres={row['gres']}",
         f"--cpus-per-task={row['cpus']}",
         f"--mem={row['memory']}",
         f"--time={row['time']}",
         f"--array={_compress_indices(indices)}",
-        f"--output={row['stdout_path']}",
-        f"--error={row['stderr_path']}",
+        f"--output={project_root / stdout_path}",
+        f"--error={project_root / stderr_path}",
         (
             "--export=ALL,"
-            f"JOB_MAP={job_map_path},"
+            f"PROJECT_ROOT={project_root},"
+            f"JOB_MAP={sealed_job_map},"
             f"JOB_MAP_SHA256={job_map_sha256},"
             f"JOB_MAP_ARRAY_MIN={bounds[0]},"
             f"JOB_MAP_ARRAY_MAX={bounds[1]}"
         ),
-        str(slurm_script),
+        str(verified_script),
     ]
 
 
@@ -167,7 +283,14 @@ def _submit(
         )
     if not eligible:
         raise ValueError("no incomplete rows are eligible for submission")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    project_root, _ = _verified_project_root(payload, slurm_script)
+    first_row = _rows(payload)[0]
+    sealed_log_dir = _verified_log_directory(
+        project_root,
+        first_row,
+        log_dir,
+    )
+    sealed_log_dir.mkdir(parents=True, exist_ok=True)
     runner(
         QUEUE_COMMAND,
         check=True,
@@ -224,6 +347,7 @@ def submit_available_pilot(
     pilot_incomplete = _incomplete_rows(pilot)
     if not pilot_incomplete:
         return "already-complete"
+    _revalidate_completed_smoke_outputs(smoke)
     _submit(
         pilot,
         job_map_path=pilot_path,

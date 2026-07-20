@@ -18,7 +18,10 @@ from torch.utils.data import DataLoader
 
 from samga_brain_rw import brainrw as br
 from samga_brain_rw.hashing import canonical_json_bytes
-from samga_brain_rw.scores import independent_retrieval_metrics
+from samga_brain_rw.scores import (
+    ScoreArtifact,
+    independent_retrieval_metrics,
+)
 
 
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -395,7 +398,11 @@ def _validation_metrics(
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> dict[str, object]:
+) -> tuple[
+    dict[str, object],
+    np.ndarray,
+    tuple[str, ...],
+]:
     similarity, identifiers = br.evaluate_brainrw_similarity(
         model,
         dataset,
@@ -409,17 +416,22 @@ def _validation_metrics(
         identifiers,
         identifiers,
     )
-    return {
-        "query_count": metrics.query_count,
-        "gallery_count": metrics.gallery_count,
-        "top1_count": metrics.top1_count,
-        "top5_count": metrics.top5_count,
-        "top1_rate": metrics.top1_rate,
-        "top5_rate": metrics.top5_rate,
-    }
+    return (
+        {
+            "query_count": metrics.query_count,
+            "gallery_count": metrics.gallery_count,
+            "top1_count": metrics.top1_count,
+            "top5_count": metrics.top5_count,
+            "top1_rate": metrics.top1_rate,
+            "top5_rate": metrics.top5_rate,
+        },
+        similarity,
+        identifiers,
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    runtime = br.probe_brainrw_production_runtime()
     _validate_cli(args)
     initial_git_provenance = _git_provenance()
     config = br.verify_brainrw_config(args.config, args.clip_path)
@@ -432,6 +444,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         manifest,
         args.subject,
         args.seed,
+        runtime.semantic_environment_sha256,
     )
     resume = None
     if args.resume != "none":
@@ -446,6 +459,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             subject=args.subject,
             seed=args.seed,
         )
+        if (
+            dict(resume.payload["semantic_environment"])
+            != dict(runtime.semantic_environment)
+            or resume.payload["semantic_environment_sha256"]
+            != runtime.semantic_environment_sha256
+        ):
+            raise ValueError(
+                "resume checkpoint semantic environment mismatch"
+            )
+        if (
+            resume.payload["runtime_contract_sha256"]
+            != runtime.contract_sha256
+        ):
+            raise ValueError(
+                "resume checkpoint runtime contract mismatch"
+            )
         if resume.payload["git_sha"] != initial_git_provenance[
             "git_sha"
         ]:
@@ -456,7 +485,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
+    if runtime.device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
     model, processor = br.build_brainrw_model(
@@ -490,25 +519,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ),
         )
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    runtime_dtype = (
-        torch.bfloat16
-        if device.type == "cuda"
-        and training["precision"] == "bf16"
-        else torch.float32
-    )
-    runtime_dtype_name = (
-        "bfloat16"
-        if runtime_dtype is torch.bfloat16
-        else "float32"
-    )
-    if resume is not None and br.checkpoint_runtime_dtype(
-        resume.payload,
-        device,
-    ) is not runtime_dtype:
-        raise ValueError("resume checkpoint runtime_dtype mismatch")
+    device = runtime.device
+    runtime_dtype = runtime.dtype
+    runtime_dtype_name = str(runtime.contract["dtype"])
+    if training["precision"] != "bf16":
+        raise ValueError("Brain-RW production precision must be bf16")
     model.to(device=device, dtype=runtime_dtype)
     optimizer = _build_optimizer(model, optimizer_config)
     sampler = br.StatefulIndexSampler(
@@ -630,7 +645,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if not produced_batch:
             raise ValueError("training loader produced no batches")
 
-    metrics = _validation_metrics(
+    (
+        metrics,
+        validation_similarity,
+        validation_identifiers,
+    ) = _validation_metrics(
         model,
         val_dataset,
         processor,
@@ -690,8 +709,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "data_order_sha256": base_data_order_sha256,
         "effective_batch_size": effective_batch_size,
         "steps": global_step,
+        "semantic_environment": _json_clone(
+            dict(runtime.semantic_environment)
+        ),
+        "semantic_environment_sha256": (
+            runtime.semantic_environment_sha256
+        ),
+        "runtime_contract": _json_clone(dict(runtime.contract)),
+        "runtime_contract_sha256": runtime.contract_sha256,
         "runtime_dtype": runtime_dtype_name,
-        "environment": br.capture_environment(),
+        "runtime_evidence": _json_clone(dict(runtime.evidence)),
+        "runtime_evidence_sha256": runtime.evidence_sha256,
+        "environment": _json_clone(dict(runtime.semantic_environment)),
         "git_sha": git_sha,
         "git_provenance": _json_clone(
             initial_git_provenance
@@ -718,6 +747,51 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         payload,
         manifest,
     )
+    training_smoke_score_directory: str | None = None
+    if not training_complete:
+        training_smoke_score_directory = "training_smoke/in_loop"
+        ScoreArtifact.save(
+            output / "training_smoke" / "in_loop",
+            validation_similarity,
+            validation_identifiers,
+            validation_identifiers,
+            {
+                "checkpoint_sha256": checkpoint_hash,
+                "config_sha256": config.sha256,
+                "git_sha": git_sha,
+                "global_step": global_step,
+                "planned_steps": planned_steps,
+                "protocol_sha256": manifest.protocol_sha256,
+                "seed": args.seed,
+                "source_records": [
+                    {
+                        "manifest_sha256": manifest.manifest_sha256,
+                        "records_sha256": manifest.records_sha256,
+                        "role": "val-dev",
+                        "role_payload_sha256": (
+                            manifest.val_dev_role_sha256
+                        ),
+                        "source_manifest_sha256": (
+                            manifest.source_manifest_sha256
+                        ),
+                        "source_payload_byte_count": (
+                            manifest.source_payload_byte_count
+                        ),
+                        "source_payload_path": str(
+                            manifest.source_payload_path
+                        ),
+                        "source_payload_sha256": (
+                            manifest.source_payload_sha256
+                        ),
+                    }
+                ],
+                "split_role": "val-dev",
+                "stage": "training_smoke/in_loop",
+                "subject": args.subject,
+                "training_complete": False,
+            },
+        )
+
     run_manifest = {
         "schema_version": 1,
         "payload_type": "samga_brain_rw.brainrw_run_manifest",
@@ -745,10 +819,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "effective_batch_size": effective_batch_size,
         "planned_steps": planned_steps,
         "completed_steps": global_step,
+        "semantic_environment": _json_clone(
+            dict(runtime.semantic_environment)
+        ),
+        "semantic_environment_sha256": (
+            runtime.semantic_environment_sha256
+        ),
+        "runtime_contract": _json_clone(dict(runtime.contract)),
+        "runtime_contract_sha256": runtime.contract_sha256,
         "runtime_dtype": runtime_dtype_name,
+        "runtime_evidence": _json_clone(dict(runtime.evidence)),
+        "runtime_evidence_sha256": runtime.evidence_sha256,
         "git_sha": git_sha,
         "git_provenance": initial_git_provenance,
         "validation_metrics": metrics,
+        "training_smoke_score_directory": (
+            training_smoke_score_directory
+        ),
         "resumed_from_sha256": resumed_from_sha256,
     }
     br.write_development_file_exclusive(

@@ -296,6 +296,7 @@ def test_brainrw_clip_lora_locks_recipe_and_hashes(configs_dir: Path) -> None:
         "precision": "bf16",
         "batch_size": 512,
         "trial_averaging": 4,
+        "gradient_checkpointing": True,
         "channels": CHANNELS,
     }
 

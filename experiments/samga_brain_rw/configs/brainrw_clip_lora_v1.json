@@ -27,6 +27,7 @@
   "training": {
     "epochs": 25,
     "epoch_policy": "fixed",
+    "gradient_checkpointing": true,
     "precision": "bf16",
     "batch_size": 512,
     "trial_averaging": 4,

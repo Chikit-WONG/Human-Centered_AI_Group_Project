@@ -22,9 +22,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from samga_brain_rw.checkpoint_identity import (
+    validate_epoch_checkpoint_identity,
+)
 from samga_brain_rw.checkpoint_io import load_typed_torch_checkpoint
 from samga_brain_rw.checkpoints import CHECKPOINT_PAYLOAD_TYPE
+from samga_brain_rw.config import make_run_key
 from samga_brain_rw.hashing import canonical_json_bytes, sha256_json
+from samga_brain_rw.runtime_contract import (
+    validate_environment_binding,
+)
 from samga_brain_rw.scores import ScoreArtifact
 
 
@@ -58,8 +65,33 @@ _RUN_SUMMARY_EXTRA_KEYS = frozenset(
         "checkpoint_hashes",
         "in_loop_score_directory",
         "max_train_steps",
+        "resume_source_checkpoint_sha256",
+        "environment",
+        "runtime_contract",
+        "runtime_contract_sha256",
+        "semantic_environment_sha256",
+        "runtime_evidence",
         "top1_rate",
         "top5_rate",
+    }
+)
+_RUNTIME_EVIDENCE_KEYS = frozenset(
+    {
+        "accelerator_name",
+        "attention_evidence_scope",
+        "autocast",
+        "compute_capability",
+        "compute_dtype",
+        "cudnn_sdp_enabled",
+        "cuda_available",
+        "cuda_matmul_tf32",
+        "cudnn_tf32",
+        "device_count",
+        "flash_sdp_enabled",
+        "math_sdp_enabled",
+        "mem_efficient_sdp_enabled",
+        "torch_sdpa_canary_passed",
+        "torch_sdpa_policy",
     }
 )
 _SEALED_COMPONENTS = frozenset(
@@ -124,7 +156,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--adapter-lr-ratio", type=float)
     parser.add_argument("--whitening-artifact", type=Path)
     parser.add_argument("--max-train-steps", type=int)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="cuda", choices=("cuda",))
     return parser
 
 
@@ -144,11 +176,13 @@ def parse_arguments(
     for name in ("expected_config_sha256", "expected_input_bundle_sha256"):
         if _SHA256_RE.fullmatch(getattr(arguments, name)) is None:
             parser.error(f"--{name.replace('_', '-')} must be lowercase SHA-256")
-    expected_run_key = (
-        f"stage{arguments.stage}__{arguments.config_id}__"
-        f"sub-{arguments.subject:02d}__seed-{arguments.seed}__"
-        f"{arguments.expected_config_sha256}__"
-        f"{arguments.expected_input_bundle_sha256}"
+    expected_run_key = make_run_key(
+        f"stage{arguments.stage}",
+        arguments.config_id,
+        arguments.subject,
+        arguments.seed,
+        arguments.expected_config_sha256,
+        arguments.expected_input_bundle_sha256,
     )
     if arguments.run_key != expected_run_key:
         parser.error("--run-key does not bind the declared cell identities")
@@ -284,6 +318,61 @@ def _sha256(value: object, context: str) -> str:
     return value
 
 
+def _validate_runtime_manifest_metadata(
+    value: Mapping[str, object],
+) -> None:
+    environment = validate_environment_binding(value["environment"])
+    runtime_contract = _mapping(
+        value["runtime_contract"],
+        "run manifest runtime_contract",
+    )
+    if runtime_contract != environment["runtime_contract"]:
+        raise ValueError(
+            "run manifest runtime_contract differs from environment"
+        )
+    runtime_contract_sha256 = _sha256(
+        value["runtime_contract_sha256"],
+        "run manifest runtime_contract_sha256",
+    )
+    if runtime_contract_sha256 != environment["runtime_contract_sha256"]:
+        raise ValueError("run manifest runtime contract hash mismatch")
+    semantic_environment_sha256 = _sha256(
+        value["semantic_environment_sha256"],
+        "run manifest semantic_environment_sha256",
+    )
+    if (
+        semantic_environment_sha256
+        != environment["semantic_environment_sha256"]
+    ):
+        raise ValueError("run manifest semantic environment hash mismatch")
+
+    evidence = _mapping(
+        value["runtime_evidence"],
+        "run manifest runtime_evidence",
+    )
+    if set(evidence) != _RUNTIME_EVIDENCE_KEYS:
+        raise ValueError(
+            "run manifest runtime_evidence keys differ from the locked schema"
+        )
+    if evidence["cuda_available"] is not True:
+        raise ValueError("run manifest runtime evidence requires CUDA")
+    if (
+        type(evidence["device_count"]) is not int
+        or evidence["device_count"] < 1
+    ):
+        raise ValueError(
+            "run manifest runtime evidence device_count must be positive"
+        )
+    for key in _RUNTIME_EVIDENCE_KEYS - {
+        "cuda_available",
+        "device_count",
+    }:
+        if evidence[key] != runtime_contract[key]:
+            raise ValueError(
+                f"run manifest runtime evidence {key} mismatch"
+            )
+
+
 def _validate_run_manifest(
     value: Mapping[str, object],
     arguments: argparse.Namespace,
@@ -293,7 +382,7 @@ def _validate_run_manifest(
         raise ValueError("run_manifest.json keys differ from the locked schema")
     if (
         value["schema_version"] != 1
-        or value["payload_type"] != "samga_brain_rw.run_manifest"
+        or value["payload_type"] != "samga_brain_rw.development_run"
     ):
         raise ValueError("run manifest identity mismatch")
     expected = {
@@ -318,6 +407,13 @@ def _validate_run_manifest(
         raise ValueError("run manifest in-loop directory mismatch")
     if type(value["global_step"]) is not int or value["global_step"] <= 0:
         raise ValueError("run manifest global_step must be positive")
+    resume_source = value["resume_source_checkpoint_sha256"]
+    if resume_source is not None:
+        _sha256(
+            resume_source,
+            "run manifest resume_source_checkpoint_sha256",
+        )
+    _validate_runtime_manifest_metadata(value)
     if arguments.mode == "smoke":
         if value["completed"] is not False:
             raise ValueError("smoke run must remain partial")
@@ -352,6 +448,10 @@ def _validate_checkpoint(
     if loaded.sha256 != checkpoint_sha256:
         raise ValueError("typed checkpoint hash mismatch")
     payload = _mapping(loaded.payload, "checkpoint payload")
+    validate_epoch_checkpoint_identity(
+        payload,
+        loaded.envelope,
+    )
     expected = {
         "payload_type": CHECKPOINT_PAYLOAD_TYPE,
         "subject": arguments.subject,
@@ -362,6 +462,13 @@ def _validate_checkpoint(
     for key, expected_value in expected.items():
         if payload.get(key) != expected_value:
             raise ValueError(f"checkpoint {key} mismatch")
+    checkpoint_environment = validate_environment_binding(
+        payload.get("environment")
+    )
+    if checkpoint_environment != run_manifest["environment"]:
+        raise ValueError(
+            "checkpoint environment differs from run manifest"
+        )
     candidate = _mapping(payload.get("candidate_spec"), "checkpoint candidate_spec")
     candidate_expected = {
         "config_id": arguments.config_id,
@@ -392,12 +499,175 @@ def _validate_checkpoint(
     epoch_complete = runtime.get("epoch_complete")
     if type(epoch_complete) is not bool:
         raise ValueError("checkpoint epoch_complete must be boolean")
+    if runtime.get("resume_source_checkpoint_sha256") != (
+        run_manifest["resume_source_checkpoint_sha256"]
+    ):
+        raise ValueError(
+            "checkpoint resume source differs from run manifest"
+        )
     if arguments.mode == "smoke":
         if epoch_complete:
             raise ValueError("smoke checkpoint must be partial (epoch_complete=false)")
     elif epoch != 60 or not epoch_complete:
         raise ValueError("full checkpoint must be epoch-60 complete")
     return MappingProxyType(payload), checkpoint_sha256
+
+
+def _validate_in_loop_score_artifact(
+    score_artifact: ScoreArtifact,
+    *,
+    run_manifest: Mapping[str, object],
+    checkpoint_payload: Mapping[str, object],
+    final_checkpoint_sha256: str,
+    arguments: argparse.Namespace,
+) -> None:
+    metadata = _mapping(
+        getattr(score_artifact, "metadata", None),
+        "in-loop score metadata",
+    )
+    expected_stage = (
+        "training_smoke/in_loop"
+        if arguments.mode == "smoke"
+        else f"stage{arguments.stage}"
+    )
+    expected_identity = {
+        "checkpoint_sha256": final_checkpoint_sha256,
+        "config_sha256": arguments.expected_config_sha256,
+        "git_sha": run_manifest["git_sha"],
+        "protocol_sha256": run_manifest["protocol_sha256"],
+        "seed": arguments.seed,
+        "stage": expected_stage,
+        "subject": arguments.subject,
+    }
+    for key, expected in expected_identity.items():
+        if metadata.get(key) != expected:
+            raise ValueError(f"in-loop score {key} mismatch")
+    if metadata.get("split_role") != "val-dev":
+        raise ValueError("in-loop score split_role must be val-dev")
+
+    if arguments.mode == "smoke":
+        if metadata.get("training_complete") is not False:
+            raise ValueError(
+                "smoke in-loop score training_complete must be false"
+            )
+        global_step = metadata.get("global_step")
+        if (
+            type(global_step) is not int
+            or global_step != run_manifest["global_step"]
+            or global_step != arguments.max_train_steps
+        ):
+            raise ValueError(
+                "smoke in-loop score global_step mismatch"
+            )
+        planned_steps = metadata.get("planned_steps")
+        if (
+            type(planned_steps) is not int
+            or planned_steps <= global_step
+        ):
+            raise ValueError(
+                "smoke in-loop score planned_steps must exceed global_step"
+            )
+
+    source_records = metadata.get("source_records")
+    if not isinstance(source_records, (list, tuple)) or len(source_records) != 1:
+        raise ValueError(
+            "in-loop score must bind exactly one source record"
+        )
+    source = _mapping(
+        source_records[0],
+        "in-loop score source record",
+    )
+    if source.get("role") != "val-dev":
+        raise ValueError("in-loop score source record role mismatch")
+    if source.get("run_key") != arguments.run_key:
+        raise ValueError("in-loop score source record run_key mismatch")
+
+    input_hashes = _mapping(
+        checkpoint_payload.get("input_hashes"),
+        "checkpoint input_hashes",
+    )
+    source_input_bindings = {
+        "manifest_sha256": "manifest_sha256",
+        "records_sha256": "records_sha256",
+        "role_payload_sha256": "val_dev_role_sha256",
+        "source_manifest_sha256": "source_manifest_sha256",
+        "source_payload_sha256": "source_payload_sha256",
+    }
+    for source_key, input_key in source_input_bindings.items():
+        if (
+            input_key in input_hashes
+            and source.get(source_key) != input_hashes[input_key]
+        ):
+            raise ValueError(
+                "in-loop score source record "
+                f"{source_key} input hash mismatch"
+            )
+    derived_input_bindings = {
+        "source_payload_byte_count": "source_payload_byte_count_sha256",
+        "source_payload_path": "source_payload_path_sha256",
+    }
+    for source_key, input_key in derived_input_bindings.items():
+        if (
+            input_key in input_hashes
+            and sha256_json(source.get(source_key)) != input_hashes[input_key]
+        ):
+            raise ValueError(
+                "in-loop score source record "
+                f"{source_key} input hash mismatch"
+            )
+    if (
+        "input_bundle_sha256" in source
+        and source["input_bundle_sha256"]
+        != arguments.expected_input_bundle_sha256
+    ):
+        raise ValueError(
+            "in-loop score source record input_bundle_sha256 mismatch"
+        )
+
+
+def validate_training_command_outputs(
+    argv: Sequence[str],
+    *,
+    expected_mode: str | None = None,
+) -> TrainingOutputs:
+    """Reparse one sealed runner command and validate its on-disk outputs."""
+
+    if (
+        isinstance(argv, (str, bytes, bytearray))
+        or len(argv) < 3
+        or any(not isinstance(value, str) or not value for value in argv)
+    ):
+        raise ValueError(
+            "sealed training runner argv must be a string sequence"
+        )
+    command = list(argv)
+    if command[0] != "python":
+        raise ValueError("sealed training runner argv prefix mismatch")
+    try:
+        arguments = parse_arguments(command[2:])
+    except SystemExit as exc:
+        raise ValueError(
+            "sealed training runner argument parsing failed"
+        ) from exc
+    if expected_mode not in (None, "smoke", "full"):
+        raise ValueError("expected_mode must be smoke, full, or None")
+    if expected_mode is not None and arguments.mode != expected_mode:
+        raise ValueError(
+            "sealed training runner mode differs from expected_mode"
+        )
+    project_root = _development_path(
+        arguments.project_root,
+        "sealed training command project root",
+    )
+    expected_runner = (
+        project_root
+        / "experiments/samga_brain_rw/scripts/run_training_cell.py"
+    )
+    if Path(command[1]) != expected_runner:
+        raise ValueError(
+            "sealed training runner path differs from project-root binding"
+        )
+    return validate_training_outputs(arguments)
 
 
 def validate_training_outputs(arguments: argparse.Namespace) -> TrainingOutputs:
@@ -421,14 +691,24 @@ def validate_training_outputs(arguments: argparse.Namespace) -> TrainingOutputs:
     if final_name not in checkpoint_hashes:
         raise ValueError("final checkpoint is missing from checkpoint_hashes")
     final_checkpoint_path = output_dir / final_name
-    _, final_checkpoint_sha256 = _validate_checkpoint(
+    checkpoint_payload, final_checkpoint_sha256 = _validate_checkpoint(
         final_checkpoint_path,
         run_manifest,
         arguments,
     )
     if checkpoint_hashes[final_name] != final_checkpoint_sha256:
         raise ValueError("checkpoint_hashes final entry mismatch")
-    ScoreArtifact.load(output_dir / "in_loop", {"val-dev"})
+    in_loop_score = ScoreArtifact.load(
+        output_dir / "in_loop",
+        {"val-dev"},
+    )
+    _validate_in_loop_score_artifact(
+        in_loop_score,
+        run_manifest=run_manifest,
+        checkpoint_payload=checkpoint_payload,
+        final_checkpoint_sha256=final_checkpoint_sha256,
+        arguments=arguments,
+    )
     in_loop_metadata_path = output_dir / "in_loop" / "metadata.json"
     return TrainingOutputs(
         run_manifest_path=run_manifest_path,
@@ -490,7 +770,7 @@ def _train_command(arguments: argparse.Namespace) -> list[str]:
         "--output-dir",
         str(arguments.output_dir),
         "--device",
-        arguments.device,
+        "cuda",
     ]
     if arguments.stage == 2:
         command.extend(
@@ -549,7 +829,7 @@ def _evaluation_command(
         "--output-dir",
         str(arguments.output_dir / directory),
         "--device",
-        arguments.device,
+        "cuda",
     ]
 
 

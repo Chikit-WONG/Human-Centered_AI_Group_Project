@@ -3,8 +3,9 @@
 Every numerical path converts inputs to ``float64`` and rejects non-finite
 values before computing a result.  Score-artifact alignment deliberately
 compares only shared experiment provenance: branch-specific checkpoints and
-configs are expected to differ, while scope, protocol, cell identity, source
-records, ordered IDs, and their hashes must agree exactly.
+configs, stages, run keys, and runtime attestations are expected to differ,
+while scope, protocol, cell identity, common source-record identity, and
+ordered IDs must agree exactly.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -32,6 +34,10 @@ TEMPERATURE_FORMULA = "alpha * S_I / T_I + (1 - alpha) * S_C / T_C"
 RRF_FORMULA = "w / (k + rank_I) + (1 - w) / (k + rank_C)"
 
 _SCORE_PAYLOAD_TYPE = "samga_brain_rw.score_matrix"
+_SAMGA_TERMINAL_STAGES = frozenset({"stage0", "stage2"})
+_BRAINRW_TERMINAL_STAGES = frozenset({"brainrw-clip-lora"})
+_ALL_TERMINAL_STAGES = _SAMGA_TERMINAL_STAGES | _BRAINRW_TERMINAL_STAGES
+_TRAINING_SMOKE_STAGE = "training_smoke/in_loop"
 _SHARED_METADATA_KEYS = (
     "protocol_sha256",
     "subject",
@@ -54,6 +60,26 @@ _SHARED_PROVENANCE_KEYS = (
     "query_ids_sha256",
     "gallery_ids_sha256",
 )
+_COMMON_SOURCE_RECORD_KEYS = (
+    "manifest_sha256",
+    "records_sha256",
+    "role",
+    "role_payload_sha256",
+    "source_manifest_sha256",
+    "source_payload_byte_count",
+    "source_payload_path",
+    "source_payload_sha256",
+)
+_COMMON_SOURCE_SHA256_KEYS = frozenset(
+    {
+        "manifest_sha256",
+        "records_sha256",
+        "role_payload_sha256",
+        "source_manifest_sha256",
+        "source_payload_sha256",
+    }
+)
+_LOWER_HEX = frozenset("0123456789abcdef")
 
 
 def _as_score_matrix(scores: np.ndarray, name: str) -> np.ndarray:
@@ -385,7 +411,76 @@ def enumerate_stage1_configs() -> tuple[FusionConfig, ...]:
     return tuple(configs)
 
 
-def _artifact_alignment_binding(artifact: ScoreArtifact) -> dict[str, object]:
+def _require_common_source_sha256(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in _LOWER_HEX for character in value)
+    ):
+        raise ValueError(f"{name} must be lowercase SHA-256 hex")
+    return value
+
+
+def _common_source_records(
+    source_records: object,
+    *,
+    split_role: object,
+) -> list[dict[str, object]]:
+    records = _deep_thaw(source_records)
+    if not isinstance(records, list) or not records:
+        raise ValueError("score artifact source_records must be a non-empty list")
+    common_records: list[dict[str, object]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                f"score artifact source_records[{index}] must be a mapping"
+            )
+        missing = [
+            key for key in _COMMON_SOURCE_RECORD_KEYS if key not in record
+        ]
+        if missing:
+            raise ValueError(
+                "score artifact common source provenance is missing fields "
+                f"at record {index}: {missing}"
+            )
+        common = {key: record[key] for key in _COMMON_SOURCE_RECORD_KEYS}
+        for key in _COMMON_SOURCE_SHA256_KEYS:
+            _require_common_source_sha256(
+                common[key],
+                f"source_records[{index}].{key}",
+            )
+        if common["role"] != split_role:
+            raise ValueError(
+                "score artifact source-record role differs from split role"
+            )
+        byte_count = common["source_payload_byte_count"]
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count <= 0
+        ):
+            raise ValueError(
+                "score artifact source payload byte count must be positive"
+            )
+        source_path = common["source_payload_path"]
+        if (
+            not isinstance(source_path, str)
+            or not source_path
+            or "\x00" in source_path
+            or not PurePosixPath(source_path).is_absolute()
+        ):
+            raise ValueError(
+                "score artifact source payload path must be absolute POSIX"
+            )
+        common_records.append(common)
+    return common_records
+
+
+def _artifact_alignment_binding(
+    artifact: ScoreArtifact,
+    *,
+    allowed_stages: frozenset[str],
+) -> dict[str, object]:
     from .scores import ScoreArtifact
 
     if not isinstance(artifact, ScoreArtifact):
@@ -408,6 +503,20 @@ def _artifact_alignment_binding(artifact: ScoreArtifact) -> dict[str, object]:
             f"score artifact is missing alignment metadata: {missing_metadata}"
         )
 
+    stage = artifact.metadata["stage"]
+    if (
+        stage == _TRAINING_SMOKE_STAGE
+        or artifact.metadata.get("training_complete") is False
+    ):
+        raise ValueError(
+            "score fusion rejects partial training-smoke artifacts"
+        )
+    if stage not in allowed_stages:
+        raise ValueError(
+            "score fusion requires a terminal branch stage; "
+            f"received {stage!r}"
+        )
+
     query_ids = tuple(artifact.query_ids)
     gallery_ids = tuple(artifact.gallery_ids)
     expected_query_hash = ordered_ids_sha256(query_ids)
@@ -426,6 +535,10 @@ def _artifact_alignment_binding(artifact: ScoreArtifact) -> dict[str, object]:
     expected_source_hash = sha256_json(source_records)
     if artifact.metadata["source_records_sha256"] != expected_source_hash:
         raise ValueError("score artifact source-record hash mismatch")
+    common_source_records = _common_source_records(
+        source_records,
+        split_role=artifact.metadata["split_role"],
+    )
 
     missing_provenance = [
         key for key in _SHARED_PROVENANCE_KEYS if key not in artifact.provenance
@@ -445,9 +558,9 @@ def _artifact_alignment_binding(artifact: ScoreArtifact) -> dict[str, object]:
         "protocol_sha256": artifact.metadata["protocol_sha256"],
         "subject": artifact.metadata["subject"],
         "seed": artifact.metadata["seed"],
-        "stage": artifact.metadata["stage"],
-        "source_records": source_records,
-        "source_records_sha256": artifact.metadata["source_records_sha256"],
+        "split_role": artifact.metadata["split_role"],
+        "common_source_records": common_source_records,
+        "common_source_records_sha256": sha256_json(common_source_records),
         "query_ids": query_ids,
         "query_ids_sha256": expected_query_hash,
         "gallery_ids": gallery_ids,
@@ -457,11 +570,32 @@ def _artifact_alignment_binding(artifact: ScoreArtifact) -> dict[str, object]:
     }
 
 
-def assert_aligned(left: ScoreArtifact, right: ScoreArtifact) -> None:
-    """Require exact shared identity and provenance for two score artifacts."""
+def common_alignment_payload(
+    artifact: ScoreArtifact,
+) -> dict[str, object]:
+    """Return JSON-native common data identity for one terminal branch."""
 
-    left_binding = _artifact_alignment_binding(left)
-    right_binding = _artifact_alignment_binding(right)
+    binding = _artifact_alignment_binding(
+        artifact,
+        allowed_stages=_ALL_TERMINAL_STAGES,
+    )
+    payload = _deep_thaw(binding)
+    if not isinstance(payload, dict):
+        raise AssertionError("common alignment binding must be a mapping")
+    return payload
+
+
+def assert_aligned(left: ScoreArtifact, right: ScoreArtifact) -> None:
+    """Require a terminal SAMGA/BrainRW pair with exact common data identity."""
+
+    left_binding = _artifact_alignment_binding(
+        left,
+        allowed_stages=_SAMGA_TERMINAL_STAGES,
+    )
+    right_binding = _artifact_alignment_binding(
+        right,
+        allowed_stages=_BRAINRW_TERMINAL_STAGES,
+    )
     if left_binding != right_binding:
         differing = sorted(
             key
@@ -660,6 +794,7 @@ __all__ = [
     "FusionConfig",
     "FusionValidationMetrics",
     "assert_aligned",
+    "common_alignment_payload",
     "convex_fusion",
     "enumerate_stage1_configs",
     "querywise_zscore",

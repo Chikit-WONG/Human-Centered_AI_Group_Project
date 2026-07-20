@@ -662,6 +662,7 @@ def _validate_brainrw(payload: dict[str, object]) -> None:
         "training": {
             "epochs",
             "epoch_policy",
+            "gradient_checkpointing",
             "precision",
             "batch_size",
             "trial_averaging",
@@ -691,6 +692,10 @@ def _validate_brainrw(payload: dict[str, object]) -> None:
         "weight_decay",
     ):
         _number(sections["optimizer"][key], f"optimizer.{key}")
+    _boolean(
+        sections["training"]["gradient_checkpointing"],
+        "training.gradient_checkpointing",
+    )
     for key in ("epochs", "batch_size", "trial_averaging"):
         _integer(sections["training"][key], f"training.{key}")
     for key in ("epoch_policy", "precision"):

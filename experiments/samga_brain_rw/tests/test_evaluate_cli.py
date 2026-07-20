@@ -15,10 +15,22 @@ import evaluate as samga_evaluate
 from samga_brain_rw.brainrw import ManifestIdentity
 from samga_brain_rw.config import ProtocolConfig, SemanticConfig, resolve_run_config
 from samga_brain_rw.hashing import sha256_json
+from samga_brain_rw.runtime_contract import (
+    PINNED_SEMANTIC_ENVIRONMENT,
+    PRODUCTION_RUNTIME_CONTRACT,
+    build_environment_binding,
+)
 
 
 def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _production_environment_binding() -> dict[str, object]:
+    return build_environment_binding(
+        PINNED_SEMANTIC_ENVIRONMENT,
+        PRODUCTION_RUNTIME_CONTRACT,
+    )
 
 
 _PROTOCOL = ProtocolConfig.from_path(samga_train._PROTOCOL_CONFIG_PATH)
@@ -81,6 +93,120 @@ def test_parser_requires_explicit_development_only_paths(
     assert arguments.checkpoint == tmp_path / "checkpoint_epoch060.pt"
     assert arguments.checkpoint_kind == "raw"
     assert arguments.output_dir.name == "saved_checkpoint"
+    assert arguments.device == "cuda"
+
+
+@pytest.mark.parametrize("device", ["auto", "cpu", "cuda:1"])
+def test_parser_rejects_nonproduction_device(
+    tmp_path: Path,
+    device: str,
+) -> None:
+    argv = [*_argv(tmp_path), "--device", device]
+    with pytest.raises(SystemExit):
+        samga_evaluate.parse_arguments(argv)
+
+
+def test_runtime_preflight_fails_before_evaluation_path_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def reject_runtime(device: str) -> object:
+        events.append(f"runtime:{device}")
+        raise RuntimeError("evaluation runtime probe failed")
+
+    def forbidden_guard(arguments: object) -> object:
+        del arguments
+        events.append("paths")
+        raise AssertionError("paths must not precede runtime preflight")
+
+    monkeypatch.setattr(
+        samga_evaluate,
+        "require_production_runtime",
+        reject_runtime,
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "_guard_paths",
+        forbidden_guard,
+    )
+
+    with pytest.raises(RuntimeError, match="runtime probe"):
+        samga_evaluate.run_evaluation(SimpleNamespace(device="cuda"))
+
+    assert events == ["runtime:cuda"]
+
+
+def test_clean_repository_and_upstream_preflight_precede_manifest_and_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    environment = _production_environment_binding()
+    payload = _config_payload(tmp_path)
+
+    monkeypatch.setattr(
+        samga_evaluate,
+        "require_production_runtime",
+        lambda device: events.append("runtime")
+        or SimpleNamespace(
+            device=torch.device("cuda:0"),
+            environment_binding=environment,
+            contract=PRODUCTION_RUNTIME_CONTRACT,
+            evidence={},
+        ),
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "clean_repository_git_sha",
+        lambda: events.append("git") or "a" * 40,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "_guard_paths",
+        lambda arguments: events.append("paths")
+        or samga_evaluate.EvaluationPaths(
+            config=tmp_path / "internvit_baseline_v1.json",
+            manifest=tmp_path / "manifest.json",
+            feature_cache=tmp_path / "features.npy",
+            checkpoint=tmp_path / "checkpoint.pt",
+            output_dir=tmp_path / "output",
+        ),
+    )
+
+    class SemanticFactory:
+        @classmethod
+        def from_path(cls, path: Path) -> _Semantic:
+            events.append("config")
+            return _Semantic(payload)
+
+    monkeypatch.setattr(samga_evaluate, "SemanticConfig", SemanticFactory)
+    monkeypatch.setattr(
+        samga_evaluate,
+        "load_locked_upstream_components",
+        lambda path, commit: events.append("upstream")
+        or (_ for _ in ()).throw(ValueError("upstream import contract rejected")),
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "load_development_manifest_identity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("manifest is forbidden before upstream preflight")
+        ),
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "ProtocolSubjectDataset",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("dataset is forbidden before upstream preflight")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="upstream import contract"):
+        samga_evaluate.run_evaluation(SimpleNamespace(device="cuda", subject=8))
+
+    assert events == ["runtime", "git", "paths", "config", "upstream"]
 
 
 @pytest.mark.parametrize(
@@ -192,23 +318,31 @@ def _input_hashes(
     manifest: ManifestIdentity,
 ) -> dict[str, str]:
     config = _config_payload(tmp_path)
-    return {
-        "cache_sha256": _h("cache"),
-        "checkpoint_sha256": samga_train._NO_INITIAL_CHECKPOINT_SHA256,
-        "manifest_sha256": manifest.manifest_sha256,
-        "model_sha256": sha256_json(config["model"]),
-        "protocol_sha256": manifest.protocol_sha256,
-        "source_manifest_sha256": manifest.source_manifest_sha256,
-        "source_payload_sha256": manifest.source_payload_sha256,
-        "source_payload_path_sha256": sha256_json(
-            str(manifest.source_payload_path)
+    return samga_train._build_input_hashes(
+        manifest,
+        SimpleNamespace(
+            cache_sha256=_h("cache"),
+            model_sha256=sha256_json(config["model"]),
         ),
-        "source_payload_byte_count_sha256": sha256_json(
-            manifest.source_payload_byte_count
-        ),
-        "train_role_sha256": manifest.train_role_sha256,
-        "val_dev_role_sha256": manifest.val_dev_role_sha256,
-    }
+    )
+
+
+def _evaluation_config(
+    tmp_path: Path,
+) -> samga_evaluate.EvaluationConfig:
+    payload = _config_payload(tmp_path)
+    return samga_evaluate.EvaluationConfig(
+        semantic=_Semantic(payload),
+        payload=payload,
+        protocol=_PROTOCOL,
+        stage2_semantic=_STAGE2,
+        stage2_payload=_STAGE2.canonical_payload(),
+        upstream_root=(tmp_path / "SAMGA").absolute(),
+        upstream_commit=samga_evaluate.PINNED_UPSTREAM_SHA,
+        cache_sha256=_h("cache"),
+        model_sha256=sha256_json(payload["model"]),
+        batch_size=512,
+    )
 
 
 def _candidate_spec(
@@ -231,19 +365,16 @@ def _candidate_spec(
         config_id=config_id,
         subject=8,
         seed=42,
+        environment_binding=_production_environment_binding(),
         baseline_config_sha256=_h("baseline-config"),
         stage2_config_sha256=_STAGE2.sha256 if whitening else None,
         layernorm_config_id="s2-layernorm-off",
-        whitening_config_id=(
-            "s2-whitening-on" if whitening else "s2-whitening-off"
-        ),
+        whitening_config_id=("s2-whitening-on" if whitening else "s2-whitening-off"),
         preprojector_config_id="s2-preproj-shared",
         adapter_kind="identity",
         adapter_rank=None,
         adapter_lr_ratio=None,
-        whitening_payload_sha256=(
-            _h("whitening-payload") if whitening else None
-        ),
+        whitening_payload_sha256=(_h("whitening-payload") if whitening else None),
     )
     resolved = resolve_run_config(_PROTOCOL, candidate_payload, input_hashes)
     body: dict[str, object] = {
@@ -258,9 +389,7 @@ def _candidate_spec(
         "input_bundle_sha256": resolved.input_bundle_sha256,
         "run_key": resolved.run_key,
         "layernorm_config_id": "s2-layernorm-off",
-        "whitening_config_id": (
-            "s2-whitening-on" if whitening else "s2-whitening-off"
-        ),
+        "whitening_config_id": ("s2-whitening-on" if whitening else "s2-whitening-off"),
         "preprojector_config_id": "s2-preproj-shared",
         "adapter_kind": "identity",
         "adapter_rank": None,
@@ -311,6 +440,7 @@ def _checkpoint(
     payload = {
         "subject": 8,
         "seed": 42,
+        "environment": _production_environment_binding(),
         "config_sha256": config_sha256,
         "schedule_sha256": samga_evaluate.SCHEDULE_SHA256,
         "trajectory_sha256": _h("trajectory"),
@@ -319,6 +449,7 @@ def _checkpoint(
         "runtime_state": {
             "epoch_complete": True,
             "next_epoch": 61,
+            "resume_source_checkpoint_sha256": None,
         },
         "input_hashes": input_hashes,
         "run_manifest": run_manifest,
@@ -336,15 +467,102 @@ def _checkpoint(
     )
 
 
+def test_evaluator_accepts_exact_training_input_hash_schema(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    loaded = _checkpoint(tmp_path)
+    expected = samga_train._build_input_hashes(
+        manifest,
+        SimpleNamespace(
+            cache_sha256=_h("cache"),
+            model_sha256=sha256_json(_config_payload(tmp_path)["model"]),
+        ),
+    )
+
+    identity = samga_evaluate._evaluation_identity(
+        loaded,
+        manifest=manifest,
+        config=_evaluation_config(tmp_path),
+        subject=8,
+        seed=42,
+    )
+
+    assert identity.input_hashes == dict(sorted(expected.items()))
+    assert identity.input_hashes["ordered_ids_sha256"] == expected["ordered_ids_sha256"]
+    assert identity.input_hashes["records_sha256"] == manifest.records_sha256
+    assert (
+        identity.input_hashes["train_ordered_ids_sha256"]
+        == manifest.train_ordered_ids_sha256
+    )
+    assert (
+        identity.input_hashes["val_dev_ordered_ids_sha256"]
+        == manifest.val_dev_ordered_ids_sha256
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "ordered_ids_sha256",
+        "records_sha256",
+        "train_ordered_ids_sha256",
+        "val_dev_ordered_ids_sha256",
+    ],
+)
+def test_each_training_manifest_input_hash_mismatch_fails_closed(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    manifest = _manifest(tmp_path)
+    loaded = _checkpoint(tmp_path)
+    payload = dict(loaded.payload)
+    inputs = dict(payload["input_hashes"])
+    inputs[field] = _h(f"wrong-{field}")
+    payload["input_hashes"] = inputs
+
+    with pytest.raises(ValueError, match=field):
+        samga_evaluate._evaluation_identity(
+            _mutated_checkpoint(loaded, payload),
+            manifest=manifest,
+            config=_evaluation_config(tmp_path),
+            subject=8,
+            seed=42,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unknown"])
+def test_training_input_hash_schema_rejects_missing_and_unknown_keys(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    manifest = _manifest(tmp_path)
+    loaded = _checkpoint(tmp_path)
+    payload = dict(loaded.payload)
+    inputs = dict(payload["input_hashes"])
+    if mutation == "missing":
+        del inputs["ordered_ids_sha256"]
+    else:
+        inputs["unknown_sha256"] = _h("unknown")
+    payload["input_hashes"] = inputs
+
+    with pytest.raises(ValueError, match="input_hashes.*schema"):
+        samga_evaluate._evaluation_identity(
+            _mutated_checkpoint(loaded, payload),
+            manifest=manifest,
+            config=_evaluation_config(tmp_path),
+            subject=8,
+            seed=42,
+        )
+
+
 class _FakeDataset(Dataset[dict[str, object]]):
     scope = "val-dev"
     subject_id = 8
     query_ids = ("image-a", "image-b")
     gallery_ids = ("image-a", "image-b")
     row_indices = (12_540, 12_541)
-    feature_cache_metadata = MappingProxyType(
-        {"feature_sha256": _h("cache")}
-    )
+    feature_cache_metadata = MappingProxyType({"feature_sha256": _h("cache")})
 
     def __init__(self, tmp_path: Path) -> None:
         self.manifest_path = (tmp_path / "sub-08_protocol.json").absolute()
@@ -368,6 +586,16 @@ def _install_runtime(
     loaded = checkpoint or _checkpoint(tmp_path)
     verified_manifest = manifest_identity or _manifest(tmp_path)
     semantic = _Semantic(_config_payload(tmp_path))
+
+    def production_runtime(device: str) -> SimpleNamespace:
+        events.append("runtime")
+        assert device == "cuda"
+        return SimpleNamespace(
+            device=torch.device("cuda:0"),
+            environment_binding=_production_environment_binding(),
+            contract=PRODUCTION_RUNTIME_CONTRACT,
+            evidence={"accelerator_name": "NVIDIA A40"},
+        )
 
     def guard(path: Path, context: str) -> Path:
         events.append(f"guard:{context}")
@@ -440,13 +668,17 @@ def _install_runtime(
         dataset: object,
         *,
         batch_size: int,
-        device: str,
+        device: object,
         seed: int,
     ) -> SimpleNamespace:
         events.append("evaluate")
         assert isinstance(model, FakeModel)
         assert isinstance(dataset, _FakeDataset)
-        assert (batch_size, device, seed) == (512, "auto", 42)
+        assert (batch_size, device, seed) == (
+            512,
+            torch.device("cuda:0"),
+            42,
+        )
         return SimpleNamespace(
             similarity=np.asarray(
                 [[0.9, 0.1], [0.2, 0.8]],
@@ -472,6 +704,16 @@ def _install_runtime(
                 "metadata": metadata,
             }
 
+    monkeypatch.setattr(
+        samga_evaluate,
+        "require_production_runtime",
+        production_runtime,
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "clean_repository_git_sha",
+        lambda: events.append("git") or "a" * 40,
+    )
     monkeypatch.setattr(samga_evaluate, "reject_development_path", guard)
     monkeypatch.setattr(
         samga_evaluate,
@@ -521,6 +763,7 @@ def test_main_verifies_all_identities_before_dataset_and_wires_public_runtime(
 
     assert samga_evaluate.main(_argv(tmp_path)) == 0
 
+    assert events[0] == "runtime"
     assert events.index("manifest") < events.index("dataset")
     assert events.index("config") < events.index("dataset")
     assert events.index("checkpoint") < events.index("dataset")
@@ -534,6 +777,9 @@ def test_main_verifies_all_identities_before_dataset_and_wires_public_runtime(
     assert spec["whitening_config_id"] == "s2-whitening-off"
     assert spec["preprojector_config_id"] == "s2-preproj-shared"
     assert spec["adapter_kind"] == "identity"
+    assert spec["environment"] == _production_environment_binding()
+    assert spec["device"] == torch.device("cuda:0")
+    assert spec["resume_source_checkpoint_sha256"] is None
 
     checkpoint = _checkpoint(tmp_path)
     candidate = checkpoint.payload["candidate_spec"]
@@ -556,14 +802,32 @@ def test_main_verifies_all_identities_before_dataset_and_wires_public_runtime(
         "subject",
     }
     assert score["metadata"]["checkpoint_sha256"] == _h("checkpoint")
-    assert score["metadata"]["config_sha256"] == candidate[
-        "semantic_config_sha256"
-    ]
+    assert score["metadata"]["config_sha256"] == candidate["semantic_config_sha256"]
     assert score["metadata"]["git_sha"] == "a" * 40
     assert score["metadata"]["protocol_sha256"] == _PROTOCOL.sha256
     assert score["metadata"]["split_role"] == "val-dev"
     assert score["metadata"]["stage"] == "stage0"
     assert score["metadata"]["source_records"][0]["run_key"] == candidate["run_key"]
+
+
+def test_current_evaluator_git_sha_must_match_checkpoint_before_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events, _ = _install_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        samga_evaluate,
+        "clean_repository_git_sha",
+        lambda: events.append("git") or "b" * 40,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="Git SHA|git_sha"):
+        samga_evaluate.main(_argv(tmp_path))
+
+    assert "dataset" not in events
+    assert "evaluate" not in events
+    assert "save" not in events
 
 
 def test_checkpoint_identity_mismatch_fails_before_dataset_or_cache_read(
@@ -587,7 +851,7 @@ def test_checkpoint_identity_mismatch_fails_before_dataset_or_cache_read(
         samga_evaluate.main(_argv(tmp_path))
 
     assert "dataset" not in events
-    assert "upstream" not in events
+    assert "upstream" in events
     assert "evaluate" not in events
     assert "save" not in events
 
@@ -644,6 +908,7 @@ def test_whitening_checkpoint_rebuilds_only_from_sealed_payload(
         tmp_path,
         checkpoint=loaded,
     )
+
     class FakeWhitening:
         payload_sha256 = _h("whitening-payload")
         input_provenance_sha256 = _h("manifest")
@@ -692,6 +957,18 @@ def test_sealed_cli_path_is_rejected_before_any_identity_or_data_load(
     )
     monkeypatch.setattr(
         samga_evaluate,
+        "require_production_runtime",
+        lambda device: SimpleNamespace(
+            environment_binding=_production_environment_binding()
+        ),
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
+        "clean_repository_git_sha",
+        lambda: "a" * 40,
+    )
+    monkeypatch.setattr(
+        samga_evaluate,
         "load_development_manifest_identity",
         lambda *args, **kwargs: pytest.fail(
             "sealed path must fail before manifest loading"
@@ -716,9 +993,7 @@ def _reseal_candidate(
     candidate = dict(payload["candidate_spec"])
     candidate.update(updates)
     body = {
-        key: value
-        for key, value in candidate.items()
-        if key != "candidate_spec_sha256"
+        key: value for key, value in candidate.items() if key != "candidate_spec_sha256"
     }
     candidate["candidate_spec_sha256"] = sha256_json(body)
     payload["candidate_spec"] = candidate
@@ -730,11 +1005,7 @@ def _reseal_run(
 ) -> None:
     run = dict(payload["run_manifest"])
     run.update(updates)
-    body = {
-        key: value
-        for key, value in run.items()
-        if key != "run_manifest_sha256"
-    }
+    body = {key: value for key, value in run.items() if key != "run_manifest_sha256"}
     run["run_manifest_sha256"] = sha256_json(body)
     payload["run_manifest"] = run
 
@@ -813,6 +1084,7 @@ def _rebind_resolved_candidate(
         config_id=str(candidate["config_id"]),
         subject=int(candidate["subject"]),
         seed=int(candidate["seed"]),
+        environment_binding=payload["environment"],
         baseline_config_sha256=str(candidate["baseline_config_sha256"]),
         stage2_config_sha256=candidate["stage2_config_sha256"],
         layernorm_config_id=str(candidate["layernorm_config_id"]),
@@ -852,6 +1124,36 @@ def _mutated_checkpoint(
         payload=MappingProxyType(payload),
         sha256=loaded.sha256,
     )
+
+
+def test_checkpoint_environment_mismatch_fails_before_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    loaded = _checkpoint(tmp_path)
+    payload = dict(loaded.payload)
+    semantic_environment = dict(PINNED_SEMANTIC_ENVIRONMENT)
+    semantic_environment["numpy"] = "1.26.5"
+    payload["environment"] = build_environment_binding(
+        semantic_environment,
+        PRODUCTION_RUNTIME_CONTRACT,
+    )
+    input_hashes = dict(payload["input_hashes"])
+    _rebind_resolved_candidate(payload, input_hashes)
+    events, _ = _install_runtime(
+        monkeypatch,
+        tmp_path,
+        checkpoint=_mutated_checkpoint(loaded, payload),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="environment.*production runtime",
+    ):
+        samga_evaluate.main(_argv(tmp_path))
+
+    assert "dataset" not in events
+    assert "upstream" in events
 
 
 def _install_fake_whitening(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from samga_brain_rw.adapters import (
     ResidualFeatureAdapter,
 )
 from samga_brain_rw.feature_transforms import TrainWhitening
+from samga_brain_rw.runtime_contract import build_environment_binding
 from samga_brain_rw.trainer import (
     CheckpointPublication,
     SAMGARuntimeModel,
@@ -37,6 +39,47 @@ PINNED_COMMIT = "1a63745b7ff6f98dad34b0f0b8246a9b5260d9c1"
 
 def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _environment_binding(
+    **semantic_overrides: object,
+) -> dict[str, object]:
+    semantic_environment: dict[str, object] = {
+        "schema_version": 1,
+        "python": "synthetic-python",
+        "torch": "synthetic-torch",
+        "transformers": "synthetic-transformers",
+        "peft": "synthetic-peft",
+        "numpy": "synthetic-numpy",
+        "scipy": "synthetic-scipy",
+        "cuda": "synthetic-cuda",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+    semantic_environment.update(semantic_overrides)
+    runtime_contract = {
+        "schema_version": 1,
+        "device_type": "cpu",
+        "device": "cpu",
+        "accelerator_name": "synthetic-cpu",
+        "compute_capability": [0, 0],
+        "compute_dtype": "float32",
+        "autocast": "disabled",
+        "cudnn_sdp_enabled": False,
+        "cuda_matmul_tf32": False,
+        "cudnn_tf32": False,
+        "attention_evidence_scope": "synthetic_test_contract_only",
+        "torch_sdpa_policy": "math_only",
+        "torch_sdpa_canary_passed": False,
+        "flash_sdp_enabled": False,
+        "math_sdp_enabled": True,
+        "mem_efficient_sdp_enabled": False,
+    }
+    return build_environment_binding(
+        semantic_environment,
+        runtime_contract,
+    )
 
 
 class _CheapEEGProject(nn.Module):
@@ -225,6 +268,7 @@ def _spec(
             "manifest_sha256": _h("manifest"),
             "cache_sha256": _h("feature-cache"),
         },
+        "environment": _environment_binding(),
         "run_manifest": {"run_id": "s0-sub01-seed19"},
         "checkpoint_builder": samga_train.build_epoch_checkpoint,
         "checkpoint_restorer": samga_train.restore_training_checkpoint,
@@ -663,6 +707,67 @@ def test_cpu_one_step_smoke_uses_protocol_scopes_and_global_validation(
     assert True in result.model.base.router.calls
 
 
+def test_fresh_optimizer_groups_match_complete_locked_adamw_recipe(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    result = run_training_cell(
+        _spec(
+            tmp_path,
+            components,
+            _DatasetFactory(train_size=6, val_size=2),
+        )
+    )
+    optimizer_state = result.final_checkpoint["optimizer_state_dict"]
+    assert isinstance(optimizer_state, dict)
+    groups = optimizer_state["param_groups"]
+    assert isinstance(groups, list)
+    assert groups
+    expected = {
+        "lr": samga_train.SCHEDULE["stage1_learning_rate"],
+        "initial_lr": samga_train.SCHEDULE["stage1_learning_rate"],
+        "betas": tuple(samga_train.SCHEDULE["betas"]),
+        "eps": samga_train.SCHEDULE["eps"],
+        "weight_decay": samga_train.SCHEDULE["weight_decay"],
+        "amsgrad": samga_train.SCHEDULE["amsgrad"],
+        "maximize": samga_train.SCHEDULE["maximize"],
+        "foreach": samga_train.SCHEDULE["foreach"],
+        "capturable": samga_train.SCHEDULE["capturable"],
+        "differentiable": samga_train.SCHEDULE["differentiable"],
+        "fused": samga_train.SCHEDULE["fused"],
+    }
+    for group in groups:
+        assert {key: group[key] for key in expected} == expected
+
+
+@pytest.mark.parametrize(
+    ("optimizer_stage", "recipe_key", "changed_lr"),
+    [
+        ("stage1", "stage1_learning_rate", 2e-4),
+        ("stage2", "stage2_learning_rate", 3e-5),
+    ],
+)
+def test_optimizer_stage_lr_is_read_from_the_locked_recipe(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    monkeypatch: pytest.MonkeyPatch,
+    optimizer_stage: str,
+    recipe_key: str,
+    changed_lr: float,
+) -> None:
+    spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=6, val_size=2),
+    )
+    model = SAMGARuntimeModel(spec)
+    monkeypatch.setitem(trainer_module.SCHEDULE, recipe_key, changed_lr)
+
+    optimizer, _ = trainer_module._build_optimizer(model, optimizer_stage)
+
+    assert optimizer.param_groups[0]["lr"] == changed_lr
+
+
 @pytest.mark.parametrize(
     ("requested_scope", "metadata_name", "metadata_value", "message"),
     [
@@ -763,6 +868,7 @@ def test_mid_epoch_resume_is_identical_to_uninterrupted_two_steps(
         replace(
             _spec(tmp_path, components, split_factory, max_train_steps=1),
             resume_checkpoint=first.final_checkpoint,
+            resume_source_checkpoint_sha256=_h("first-resume-source"),
         )
     )
 
@@ -894,7 +1000,13 @@ def test_resume_rejects_cross_field_checkpoint_tampering(
         runtime["snapshot_epochs"] = [1]
 
     with pytest.raises(ValueError, match=message):
-        run_training_cell(replace(spec, resume_checkpoint=checkpoint))
+        run_training_cell(
+            replace(
+                spec,
+                resume_checkpoint=checkpoint,
+                resume_source_checkpoint_sha256=_h("tampered-source"),
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -953,6 +1065,7 @@ def test_resume_verifies_objects_after_restorer_returns(
             replace(
                 base,
                 resume_checkpoint=first.final_checkpoint,
+                resume_source_checkpoint_sha256=_h("corrupt-source"),
                 checkpoint_restorer=corrupting_restorer,
             )
         )
@@ -968,7 +1081,13 @@ def test_epoch21_freezes_shared_encoder_and_rebuilds_adamw(
     assert stage1.final_checkpoint["runtime_state"]["epoch_complete"] is True
 
     resumed = run_training_cell(
-        replace(spec, resume_checkpoint=stage1.final_checkpoint)
+        replace(
+            spec,
+            resume_checkpoint=stage1.final_checkpoint,
+            resume_source_checkpoint_sha256=_h(
+                "stage1-complete-source"
+            ),
+        )
     )
 
     assert resumed.optimizer_rebuild_epochs == (21,)
@@ -1014,6 +1133,7 @@ def test_epochs_51_to_60_are_retained_and_sink_receipts_are_verified(
         replace(
             base_spec,
             resume_checkpoint=first_50.final_checkpoint,
+            resume_source_checkpoint_sha256=_h("epoch50-source"),
             max_train_steps=10,
             checkpoint_sink=sink,
         )
@@ -1062,6 +1182,7 @@ def test_retained_checkpoint_requires_durable_retention_attestation(
             replace(
                 base_spec,
                 resume_checkpoint=first_50.final_checkpoint,
+                resume_source_checkpoint_sha256=_h("retention-source"),
                 max_train_steps=1,
                 checkpoint_sink=nondurable_sink,
             )
@@ -1093,4 +1214,196 @@ def test_checkpoint_sink_must_attest_exclusive_atomic_verified_publish(
                 _DatasetFactory(train_size=2),
                 checkpoint_sink=unsafe_sink,
             )
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["python", "torch", "numpy", "cuda"],
+)
+def test_resume_environment_mismatch_fails_before_dataset_or_restorer(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    field: str,
+) -> None:
+    factory = _DatasetFactory(train_size=6, val_size=2)
+    spec = _spec(tmp_path, components, factory)
+    first = run_training_cell(spec)
+    checkpoint = copy.deepcopy(first.final_checkpoint)
+    checkpoint["environment"] = _environment_binding(
+        **{field: f"mismatched-{field}"}
+    )
+    factory.calls.clear()
+    restorer_calls: list[object] = []
+
+    def recording_restorer(
+        payload: Mapping[str, object],
+        **kwargs: object,
+    ) -> tuple[int, int]:
+        restorer_calls.append((payload, kwargs))
+        return samga_train.restore_training_checkpoint(
+            payload,
+            **kwargs,
+        )
+
+    with pytest.raises(ValueError, match="environment.*mismatch"):
+        run_training_cell(
+            replace(
+                spec,
+                resume_checkpoint=checkpoint,
+                resume_source_checkpoint_sha256=_h(
+                    f"environment-source-{field}"
+                ),
+                checkpoint_restorer=recording_restorer,
+            )
+        )
+
+    assert factory.calls == []
+    assert restorer_calls == []
+
+
+@pytest.mark.parametrize(
+    ("group_index", "field"),
+    [
+        (0, "weight_decay"),
+        (0, "betas"),
+        (0, "eps"),
+        (1, "lr"),
+        (1, "initial_lr"),
+        (0, "params"),
+    ],
+)
+def test_resume_rejects_every_optimizer_group_recipe_tamper_before_restore(
+    tmp_path: Path,
+    components: UpstreamComponents,
+    group_index: int,
+    field: str,
+) -> None:
+    spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=6, val_size=2),
+        stage=2,
+        candidate_spec={"config_id": "adapter-candidate"},
+        adapter_kind="adapter",
+        adapter_rank=8,
+        adapter_lr_ratio=0.05,
+    )
+    first = run_training_cell(spec)
+    checkpoint = copy.deepcopy(first.final_checkpoint)
+    optimizer_state = checkpoint["optimizer_state_dict"]
+    scheduler_state = checkpoint["scheduler_state_dict"]
+    assert isinstance(optimizer_state, dict)
+    assert isinstance(scheduler_state, dict)
+    groups = optimizer_state["param_groups"]
+    assert isinstance(groups, list)
+    assert len(groups) == 2
+    group = groups[group_index]
+    assert isinstance(group, dict)
+    if field == "weight_decay":
+        group[field] = 0.25
+    elif field == "betas":
+        group[field] = (0.8, 0.9)
+    elif field == "eps":
+        group[field] = 1e-7
+    elif field == "lr":
+        group[field] = float(group[field]) * 2.0
+        scheduler_state["base_lrs"][group_index] = group[field]
+        scheduler_state["_last_lr"][group_index] = group[field]
+    elif field == "initial_lr":
+        group[field] = float(group[field]) * 2.0
+    else:
+        parameters = list(group[field])
+        assert len(parameters) >= 2
+        group[field] = list(reversed(parameters))
+    restorer_calls: list[object] = []
+
+    def recording_restorer(
+        payload: Mapping[str, object],
+        **kwargs: object,
+    ) -> tuple[int, int]:
+        restorer_calls.append((payload, kwargs))
+        return samga_train.restore_training_checkpoint(
+            payload,
+            **kwargs,
+        )
+
+    with pytest.raises(ValueError, match="optimizer.*recipe"):
+        run_training_cell(
+            replace(
+                spec,
+                resume_checkpoint=checkpoint,
+                resume_source_checkpoint_sha256=_h(
+                    f"optimizer-source-{group_index}-{field}"
+                ),
+                checkpoint_restorer=recording_restorer,
+            )
+        )
+
+    assert restorer_calls == []
+
+
+def test_checkpoint_lineage_records_actual_immediate_resume_source(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=6, val_size=2),
+    )
+    fresh = run_training_cell(spec)
+    assert (
+        fresh.final_checkpoint["runtime_state"][
+            "resume_source_checkpoint_sha256"
+        ]
+        is None
+    )
+
+    actual_source = _h("actual-transport-checkpoint")
+    resumed = run_training_cell(
+        replace(
+            spec,
+            resume_checkpoint=fresh.final_checkpoint,
+            resume_source_checkpoint_sha256=actual_source,
+        )
+    )
+
+    assert resumed.final_checkpoint["runtime_state"][
+        "resume_source_checkpoint_sha256"
+    ] == actual_source
+    assert (
+        resumed.final_checkpoint["input_hashes"]
+        == fresh.final_checkpoint["input_hashes"]
+    )
+    assert (
+        resumed.final_checkpoint["run_manifest"]
+        == fresh.final_checkpoint["run_manifest"]
+    )
+    assert (
+        resumed.final_checkpoint["config_sha256"]
+        == fresh.final_checkpoint["config_sha256"]
+    )
+
+
+def test_resume_payload_and_source_sha_lineage_are_coupled(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    spec = _spec(
+        tmp_path,
+        components,
+        _DatasetFactory(train_size=6, val_size=2),
+    )
+    with pytest.raises(ValueError, match="resume.*source|lineage"):
+        replace(
+            spec,
+            resume_source_checkpoint_sha256=_h("orphan-source"),
+        )
+
+    first = run_training_cell(spec)
+    with pytest.raises(ValueError, match="resume.*source|lineage"):
+        replace(
+            spec,
+            resume_checkpoint=first.final_checkpoint,
         )

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from samga_brain_rw.config import make_run_key
 from samga_brain_rw.hashing import canonical_json_bytes, sha256_json
 
 
@@ -26,7 +27,12 @@ SCHEMA_VERSION = 1
 JOB_MAP_TYPE = "samga_brain_rw.job_map"
 CLAIM_TYPE = "samga_brain_rw.job_claim"
 RECOVERY_TYPE = "samga_brain_rw.job_claim_recovery"
+ATTEMPT_TYPE = "samga_brain_rw.job_attempt"
 LOG_ROOT = PurePosixPath("logs/samga_brain_rw")
+DEVELOPMENT_OUTPUT_ROOTS = (
+    PurePosixPath("artifacts/samga_brain_rw"),
+    PurePosixPath("results/samga_brain_rw"),
+)
 ALLOWED_A40_PARTITIONS = {
     "debug",
     "i64m1tga40u",
@@ -82,6 +88,22 @@ RECOVERY_PAYLOAD_KEYS = {
     "claim_sha256",
     "next_generation",
     "recovery_audit_sha256",
+    "attempt_record_sha256",
+    "quarantine",
+    "restart_mode",
+}
+ATTEMPT_PAYLOAD_KEYS = {
+    "job_map_sha256",
+    "row_sha256",
+    "array_index",
+    "generation",
+    "claim_sha256",
+}
+QUARANTINE_KEYS = {
+    "file_count",
+    "quarantine_path",
+    "source_output_dir",
+    "tree_sha256",
 }
 COMPLETION_PAYLOAD_KEYS = {
     "job_map_sha256",
@@ -113,6 +135,10 @@ class JobClaim:
     @property
     def recovery_path(self) -> Path:
         return self.path.with_name("recovery.json")
+
+    @property
+    def attempt_path(self) -> Path:
+        return self.path.with_name("attempt.json")
 
 
 @dataclass(frozen=True)
@@ -221,6 +247,32 @@ def _validate_log_path(value: object, label: str, suffix: str) -> str:
     return text
 
 
+def _validate_canonical_absolute_path(
+    value: object,
+    label: str,
+) -> Path:
+    text = _require_nonempty_string(value, label)
+    pure = PurePosixPath(text)
+    if (
+        not pure.is_absolute()
+        or ".." in pure.parts
+        or pure.as_posix() != text
+    ):
+        raise ValueError(
+            f"{label} must be an absolute normalized path"
+        )
+    path = Path(text)
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be inspected safely") from exc
+    if resolved != path:
+        raise ValueError(
+            f"{label} contains a symlink component or is not normalized"
+        )
+    return path
+
+
 def _flag_value(argv: Sequence[str], flag: str) -> str:
     positions = [index for index, value in enumerate(argv) if value == flag]
     if len(positions) != 1:
@@ -271,11 +323,22 @@ def _validate_training_runner_argv(
         "--expected-config-sha256",
         "--expected-input-bundle-sha256",
         "--run-key",
+        "--device",
     )
     values = {flag: _flag_value(argv, flag) for flag in required}
     stage = match.group("stage")
     phase = match.group("phase")
     expected_mode = "smoke" if phase == "smoke" else "full"
+    expected_run_key = make_run_key(
+        f"stage{stage}",
+        str(row["config_id"]),
+        int(row["subject"]),
+        int(row["seed"]),
+        str(row["config_sha256"]),
+        str(row["input_bundle_sha256"]),
+    )
+    if row["run_key"] != expected_run_key:
+        raise ValueError("sealed row run_key is not canonical")
     expected = {
         "--mode": expected_mode,
         "--stage": stage,
@@ -288,24 +351,53 @@ def _validate_training_runner_argv(
             row["input_bundle_sha256"]
         ),
         "--run-key": str(row["run_key"]),
+        "--device": "cuda",
     }
     for flag, expected_value in expected.items():
         if values[flag] != expected_value:
             label = flag.removeprefix("--").replace("-", "_")
             raise ValueError(f"sealed argv {label} does not match the row")
-    if PurePosixPath(values["--output-dir"]).name != row["run_key"]:
-        raise ValueError("sealed argv output directory does not match run_key")
     if values["--resume"] == "":
         raise ValueError("sealed argv resume must be explicit")
     for flag in ("--config", "--manifest", "--feature-cache", "--project-root"):
         _require_nonempty_string(values[flag], f"argv {flag}")
-    project_root = PurePosixPath(values["--project-root"])
-    if not project_root.is_absolute() or ".." in project_root.parts:
-        raise ValueError("sealed argv project-root must be absolute and normalized")
-    expected_runner = (project_root / expected_suffix).as_posix()
+    project_root = _validate_canonical_absolute_path(
+        values["--project-root"],
+        "sealed argv project-root",
+    )
+    expected_runner = (
+        project_root / expected_suffix
+    ).as_posix()
     if executable != expected_runner:
         raise ValueError(
             "unified runner path does not match the declared project-root"
+        )
+    output_dir = _validate_canonical_absolute_path(
+        values["--output-dir"],
+        "sealed argv output directory",
+    )
+    completion_path = _validate_canonical_absolute_path(
+        row["completion_path"],
+        "completion_path",
+    )
+    if output_dir.name != row["run_key"]:
+        raise ValueError("sealed argv output directory does not match run_key")
+    if completion_path.parent != output_dir:
+        raise ValueError(
+            "completion_path parent does not match sealed argv output directory"
+        )
+    for relative_root in DEVELOPMENT_OUTPUT_ROOTS:
+        development_root = project_root / relative_root.as_posix()
+        try:
+            relative_output = output_dir.relative_to(development_root)
+        except ValueError:
+            continue
+        if relative_output.parts:
+            break
+    else:
+        raise ValueError(
+            "sealed argv output directory must remain below the project-root "
+            "artifacts/samga_brain_rw or results/samga_brain_rw"
         )
     role = str(row["role"])
     if (stage == "0" and role != "baseline") or (
@@ -444,13 +536,13 @@ def _validate_row(
     _validate_slurm_log_pattern(
         row["stderr_path"], "stderr_path", ".err"
     )
-    completion_path = _require_nonempty_string(
+    completion_path = _validate_canonical_absolute_path(
         row["completion_path"],
         "completion_path",
     )
-    if _is_forbidden_path_token(completion_path):
+    if _is_forbidden_path_token(str(completion_path)):
         raise ValueError("completion_path contains a forbidden test/formal path")
-    if Path(completion_path).suffix != ".json":
+    if completion_path.suffix != ".json":
         raise ValueError("completion_path must end in .json")
     _validate_completion_schema(row["expected_completion_schema"])
     return dict(row)
@@ -638,6 +730,55 @@ def _read_regular_file(path: Path) -> bytes:
         os.close(fd)
 
 
+def _read_regular_file_at(
+    directory_fd: int,
+    name: str,
+    path: Path,
+) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ValueError(f"cannot read sealed regular file: {path}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"sealed path is not a regular file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _strict_load_at(
+    directory_fd: int,
+    name: str,
+    path: Path,
+) -> dict[str, object]:
+    data = _read_regular_file_at(directory_fd, name, path)
+    try:
+        result = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid sealed JSON: {path}") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"sealed JSON must contain an object: {path}")
+    if canonical_json_bytes(result) != data:
+        raise ValueError(f"sealed JSON bytes are not canonical: {path}")
+    return result
+
+
 def _strict_load(path: Path) -> dict[str, object]:
     data = _read_regular_file(path)
     try:
@@ -680,6 +821,61 @@ def _exclusive_publish(path: Path, data: bytes) -> None:
             os.close(directory_fd)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _exclusive_publish_at(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+) -> None:
+    if (
+        not name
+        or name in {".", ".."}
+        or PurePosixPath(name).name != name
+    ):
+        raise ValueError("sealed record name must be one safe path component")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    temporary_name: str | None = None
+    temporary_fd = -1
+    for _ in range(128):
+        candidate = f".{name}.{os.urandom(16).hex()}.tmp"
+        try:
+            temporary_fd = os.open(
+                candidate,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        temporary_name = candidate
+        break
+    if temporary_name is None:
+        raise RuntimeError("cannot allocate exclusive state-record temporary")
+    try:
+        with os.fdopen(temporary_fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
 
 def write_job_map(
@@ -761,30 +957,478 @@ def _row_context(
     )
 
 
-def _state_dir(row: Mapping[str, object]) -> Path:
+def _output_dir(row: Mapping[str, object]) -> Path:
     completion = Path(str(row["completion_path"]))
+    output_dir = completion.parent
+    if output_dir == output_dir.parent:
+        raise ValueError("completion output directory cannot be a filesystem root")
+    return output_dir
+
+
+def _state_dir(row: Mapping[str, object]) -> Path:
+    output_dir = _output_dir(row)
     return (
-        completion.parent
+        output_dir.parent
         / ".job-claims"
-        / f"{completion.stem}-array-{int(row['array_index']):06d}"
+        / f"{output_dir.name}-array-{int(row['array_index']):06d}"
     )
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _open_directory_path_nofollow(
+    path: Path,
+    *,
+    create: bool,
+) -> int:
+    checked = Path(path)
+    if not checked.is_absolute():
+        raise ValueError(f"directory path must be absolute: {checked}")
+    current_fd = os.open("/", _directory_open_flags())
+    try:
+        for component in checked.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(component, 0o777, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+    return current_fd
 
 
 @contextlib.contextmanager
-def _transition_lock(directory: Path) -> Iterator[None]:
-    directory.mkdir(parents=True, exist_ok=True)
-    lock_path = directory / ".transition.lock"
-    fd = os.open(
-        lock_path,
-        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
+def _open_state_directory(
+    directory: Path,
+    *,
+    create: bool,
+) -> Iterator[int | None]:
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        state_fd = _open_directory_path_nofollow(
+            directory,
+            create=create,
+        )
+    except FileNotFoundError:
+        if not create:
+            yield None
+            return
+        raise
+    except OSError as exc:
+        raise ValueError(
+            "state directory contains a symbolic link or is not a real "
+            f"directory: {directory}"
+        ) from exc
+    try:
+        yield state_fd
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        os.close(state_fd)
+
+
+@contextlib.contextmanager
+def _open_child_directory(
+    parent_fd: int,
+    name: str,
+    path: Path,
+    *,
+    create: bool = False,
+    exclusive: bool = False,
+) -> Iterator[int]:
+    if create:
+        try:
+            os.mkdir(name, 0o777, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            if exclusive:
+                raise ValueError(
+                    f"state generation already exists or is unsafe: {path}"
+                ) from exc
+    try:
+        child_fd = os.open(
+            name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"directory entry is symbolic or not a real directory: {path}"
+        ) from exc
+    try:
+        yield child_fd
+    finally:
+        os.close(child_fd)
+
+
+def _entry_lexists_at(
+    directory_fd: int,
+    name: str,
+    path: Path,
+) -> bool:
+    try:
+        os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError(f"cannot inspect sealed state entry: {path}") from exc
+    return True
+
+
+def _generation_name(generation: int) -> str:
+    return f"generation-{generation:06d}"
+
+
+@contextlib.contextmanager
+def _open_generation_directory(
+    state_fd: int,
+    base: Path,
+    generation: int,
+    *,
+    create: bool = False,
+) -> Iterator[int]:
+    name = _generation_name(generation)
+    with _open_child_directory(
+        state_fd,
+        name,
+        base / name,
+        create=create,
+        exclusive=create,
+    ) as generation_fd:
+        yield generation_fd
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
+def _directory_tree_identity(root: Path) -> dict[str, object]:
+    try:
+        root_mode = root.lstat().st_mode
+    except OSError as exc:
+        raise ValueError(f"cannot inspect output directory: {root}") from exc
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise ValueError(f"output path is not a real directory: {root}")
+
+    directories: list[str] = []
+    files: list[dict[str, object]] = []
+
+    def visit(directory: Path, relative_parts: tuple[str, ...]) -> None:
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise ValueError(
+                f"cannot enumerate output directory: {directory}"
+            ) from exc
+        for entry in entries:
+            relative = PurePosixPath(*relative_parts, entry.name).as_posix()
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot inspect output tree entry: {entry.path}"
+                ) from exc
+            entry_path = Path(entry.path)
+            if stat.S_ISLNK(mode):
+                raise ValueError(
+                    f"output tree contains a symbolic link: {entry_path}"
+                )
+            if stat.S_ISDIR(mode):
+                directories.append(relative)
+                visit(entry_path, (*relative_parts, entry.name))
+                continue
+            if not stat.S_ISREG(mode):
+                raise ValueError(
+                    f"output tree contains a non-regular entry: {entry_path}"
+                )
+            data = _read_regular_file(entry_path)
+            files.append(
+                {
+                    "byte_count": len(data),
+                    "path": relative,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+
+    visit(root, ())
+    tree = {
+        "directories": directories,
+        "files": files,
+    }
+    return {
+        "file_count": len(files),
+        "tree_sha256": sha256_json(tree),
+    }
+
+
+def _directory_tree_identity_from_fd(
+    root_fd: int,
+    root: Path,
+) -> dict[str, object]:
+    directories: list[str] = []
+    files: list[dict[str, object]] = []
+
+    def visit(directory_fd: int, relative_parts: tuple[str, ...]) -> None:
+        scan_fd = os.dup(directory_fd)
+        try:
+            with os.scandir(scan_fd) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+                for entry in entries:
+                    relative = PurePosixPath(
+                        *relative_parts,
+                        entry.name,
+                    ).as_posix()
+                    entry_path = root / relative
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                    except OSError as exc:
+                        raise ValueError(
+                            "cannot inspect output tree entry: "
+                            f"{entry_path}"
+                        ) from exc
+                    if stat.S_ISLNK(mode):
+                        raise ValueError(
+                            "output tree contains a symbolic link: "
+                            f"{entry_path}"
+                        )
+                    if stat.S_ISDIR(mode):
+                        directories.append(relative)
+                        with _open_child_directory(
+                            directory_fd,
+                            entry.name,
+                            entry_path,
+                        ) as child_fd:
+                            visit(
+                                child_fd,
+                                (*relative_parts, entry.name),
+                            )
+                        continue
+                    if not stat.S_ISREG(mode):
+                        raise ValueError(
+                            "output tree contains a non-regular entry: "
+                            f"{entry_path}"
+                        )
+                    data = _read_regular_file_at(
+                        directory_fd,
+                        entry.name,
+                        entry_path,
+                    )
+                    files.append(
+                        {
+                            "byte_count": len(data),
+                            "path": relative,
+                            "sha256": hashlib.sha256(data).hexdigest(),
+                        }
+                    )
+        finally:
+            os.close(scan_fd)
+
+    visit(root_fd, ())
+    return {
+        "file_count": len(files),
+        "tree_sha256": sha256_json(
+            {"directories": directories, "files": files}
+        ),
+    }
+
+
+def _directory_tree_identity_at(
+    parent_fd: int,
+    name: str,
+    root: Path,
+) -> dict[str, object]:
+    with _open_child_directory(parent_fd, name, root) as root_fd:
+        return _directory_tree_identity_from_fd(root_fd, root)
+
+
+def _quarantine_path(base: Path, generation: int) -> Path:
+    return (
+        base
+        / "quarantine"
+        / f"generation-{generation:06d}-output"
+    )
+
+
+def _quarantine_output(
+    row: Mapping[str, object],
+    *,
+    base: Path,
+    generation: int,
+    state_fd: int,
+) -> dict[str, object] | None:
+    output_dir = _output_dir(row)
+    quarantine_path = _quarantine_path(base, generation)
+    _validate_canonical_absolute_path(
+        str(quarantine_path),
+        "recovery quarantine path",
+    )
+    output_exists = _path_lexists(output_dir)
+    quarantine_root = base / "quarantine"
+    quarantine_name = quarantine_path.name
+    with _open_child_directory(
+        state_fd,
+        "quarantine",
+        quarantine_root,
+        create=True,
+    ) as quarantine_fd:
+        quarantine_exists = _entry_lexists_at(
+            quarantine_fd,
+            quarantine_name,
+            quarantine_path,
+        )
+        if output_exists and quarantine_exists:
+            raise RuntimeError(
+                "source output and its canonical quarantine both exist"
+            )
+        if quarantine_exists:
+            identity = _directory_tree_identity_at(
+                quarantine_fd,
+                quarantine_name,
+                quarantine_path,
+            )
+            return {
+                **identity,
+                "quarantine_path": str(quarantine_path),
+                "source_output_dir": str(output_dir),
+            }
+        if not output_exists:
+            return None
+        identity = _directory_tree_identity(output_dir)
+        try:
+            os.rename(
+                output_dir,
+                quarantine_name,
+                dst_dir_fd=quarantine_fd,
+            )
+            os.fsync(quarantine_fd)
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot atomically quarantine output directory: {output_dir}"
+            ) from exc
+        moved_identity = _directory_tree_identity_at(
+            quarantine_fd,
+            quarantine_name,
+            quarantine_path,
+        )
+        if moved_identity != identity:
+            raise RuntimeError("quarantined output tree identity changed")
+        return {
+            **identity,
+            "quarantine_path": str(quarantine_path),
+            "source_output_dir": str(output_dir),
+        }
+
+
+def _validate_quarantine(
+    value: object,
+    *,
+    row: Mapping[str, object],
+    base: Path,
+    generation: int,
+    state_fd: int,
+) -> None:
+    expected_path = _quarantine_path(base, generation)
+    _validate_canonical_absolute_path(
+        str(expected_path),
+        "recovery quarantine path",
+    )
+    quarantine_root = base / "quarantine"
+    if not _entry_lexists_at(
+        state_fd,
+        "quarantine",
+        quarantine_root,
+    ):
+        if value is None:
+            return
+        raise ValueError("recorded recovery quarantine directory is missing")
+    with _open_child_directory(
+        state_fd,
+        "quarantine",
+        quarantine_root,
+    ) as quarantine_fd:
+        quarantine_exists = _entry_lexists_at(
+            quarantine_fd,
+            expected_path.name,
+            expected_path,
+        )
+        if value is None:
+            if quarantine_exists:
+                raise ValueError(
+                    "recovery quarantine exists but was not recorded"
+                )
+            return
+        actual_identity = _directory_tree_identity_at(
+            quarantine_fd,
+            expected_path.name,
+            expected_path,
+        )
+    if not isinstance(value, dict):
+        raise ValueError("recovery quarantine must be an object or null")
+    _require_exact_keys(value, QUARANTINE_KEYS, "recovery quarantine")
+    if value["quarantine_path"] != str(expected_path):
+        raise ValueError("recovery quarantine path is not canonical")
+    if value["source_output_dir"] != str(_output_dir(row)):
+        raise ValueError("recovery quarantine source does not match the row")
+    expected_identity = {
+        "file_count": _require_int(
+            value["file_count"],
+            "quarantine file_count",
+            minimum=0,
+        ),
+        "tree_sha256": _require_sha256(
+            value["tree_sha256"],
+            "quarantine tree_sha256",
+        ),
+    }
+    if actual_identity != expected_identity:
+        raise ValueError("recovery quarantine tree identity mismatch")
+
+
+@contextlib.contextmanager
+def _transition_lock(directory: Path) -> Iterator[int]:
+    with _open_state_directory(directory, create=True) as state_fd:
+        if state_fd is None:
+            raise RuntimeError("state directory creation returned no descriptor")
+        try:
+            lock_fd = os.open(
+                ".transition.lock",
+                (
+                    os.O_CREAT
+                    | os.O_RDWR
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                ),
+                0o600,
+                dir_fd=state_fd,
+            )
+        except OSError as exc:
+            raise ValueError(
+                "transition lock is symbolic or not a regular file"
+            ) from exc
+        try:
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise ValueError("transition lock is not a regular file")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield state_fd
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 def _record_document(
@@ -799,14 +1443,178 @@ def _record_document(
     }
 
 
+def _allocate_staging_generation(
+    state_fd: int,
+    generation: int,
+) -> tuple[str, int]:
+    prefix = f".generation-staging-{generation:06d}-"
+    for _ in range(128):
+        staging_name = f"{prefix}{os.urandom(16).hex()}"
+        try:
+            os.mkdir(
+                staging_name,
+                0o700,
+                dir_fd=state_fd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            staging_fd = os.open(
+                staging_name,
+                _directory_open_flags(),
+                dir_fd=state_fd,
+            )
+        except BaseException:
+            try:
+                os.rmdir(staging_name, dir_fd=state_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        return staging_name, staging_fd
+    raise RuntimeError("cannot allocate unique staging generation directory")
+
+
+def _discard_staging_generation(
+    state_fd: int,
+    staging_fd: int,
+    staging_name: str,
+) -> None:
+    scan_fd = os.dup(staging_fd)
+    try:
+        with os.scandir(scan_fd) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+            for entry in entries:
+                try:
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                except OSError as exc:
+                    raise RuntimeError(
+                        "cannot inspect staging generation during cleanup"
+                    ) from exc
+                if not stat.S_ISREG(mode):
+                    raise RuntimeError(
+                        "staging generation contains an unsafe entry"
+                    )
+                os.unlink(entry.name, dir_fd=staging_fd)
+    finally:
+        os.close(scan_fd)
+    os.fsync(staging_fd)
+    try:
+        os.rmdir(staging_name, dir_fd=state_fd)
+    except FileNotFoundError:
+        return
+    os.fsync(state_fd)
+
+
+def _rename_staged_generation(
+    state_fd: int,
+    staging_name: str,
+    final_name: str,
+) -> None:
+    final_path = Path(final_name)
+    if _entry_lexists_at(state_fd, final_name, final_path):
+        raise ValueError(
+            "state generation already exists or is unsafe"
+        )
+    try:
+        os.rename(
+            staging_name,
+            final_name,
+            src_dir_fd=state_fd,
+            dst_dir_fd=state_fd,
+        )
+    except OSError as exc:
+        raise ValueError(
+            "cannot atomically publish staged state generation"
+        ) from exc
+
+
+def _publish_staged_generation_record(
+    state_fd: int,
+    *,
+    base: Path,
+    generation: int,
+    record_name: str,
+    data: bytes,
+) -> None:
+    final_name = _generation_name(generation)
+    staging_name, staging_fd = _allocate_staging_generation(
+        state_fd,
+        generation,
+    )
+    published = False
+    try:
+        _exclusive_publish_at(staging_fd, record_name, data)
+        os.fsync(staging_fd)
+        _rename_staged_generation(
+            state_fd,
+            staging_name,
+            final_name,
+        )
+        published = True
+        os.fsync(state_fd)
+    finally:
+        try:
+            if not published:
+                _discard_staging_generation(
+                    state_fd,
+                    staging_fd,
+                    staging_name,
+                )
+        finally:
+            os.close(staging_fd)
+    final_path = base / final_name / record_name
+    if not _entry_lexists_at(
+        state_fd,
+        final_name,
+        final_path.parent,
+    ):
+        raise RuntimeError("published generation is not visible")
+
+
 def _create_record(
     path: Path,
     payload_type: str,
     payload: dict[str, object],
+    *,
+    directory_fd: int | None = None,
+    state_fd: int | None = None,
+    generation: int | None = None,
+    create_generation: bool = False,
 ) -> tuple[dict[str, object], str]:
+    if directory_fd is not None and state_fd is not None:
+        raise ValueError("record publication received conflicting descriptors")
+    if (state_fd is None) != (generation is None):
+        raise ValueError(
+            "state record publication requires both state fd and generation"
+        )
+    if create_generation and state_fd is None:
+        raise ValueError(
+            "generation creation requires a state directory descriptor"
+        )
     document = _record_document(payload_type, payload)
     data = canonical_json_bytes(document)
-    _exclusive_publish(path, data)
+    if directory_fd is not None:
+        _exclusive_publish_at(directory_fd, path.name, data)
+    elif state_fd is not None and generation is not None:
+        if path.parent.name != _generation_name(generation):
+            raise ValueError("state record generation path is not canonical")
+        if create_generation:
+            _publish_staged_generation_record(
+                state_fd,
+                base=path.parent.parent,
+                generation=generation,
+                record_name=path.name,
+                data=data,
+            )
+        else:
+            with _open_generation_directory(
+                state_fd,
+                path.parent.parent,
+                generation,
+            ) as generation_fd:
+                _exclusive_publish_at(generation_fd, path.name, data)
+    else:
+        _exclusive_publish(path, data)
     return document, hashlib.sha256(data).hexdigest()
 
 
@@ -815,8 +1623,17 @@ def _read_record(
     *,
     payload_type: str,
     payload_keys: set[str],
+    directory_fd: int | None = None,
 ) -> tuple[dict[str, object], str]:
-    document = _strict_load(path)
+    document = (
+        _strict_load(path)
+        if directory_fd is None
+        else _strict_load_at(
+            directory_fd,
+            path.name,
+            path,
+        )
+    )
     _require_exact_keys(document, DOCUMENT_KEYS, payload_type)
     if document["schema_version"] != SCHEMA_VERSION:
         raise ValueError(f"unsupported {payload_type} schema_version")
@@ -849,16 +1666,36 @@ def _claim_from_document(
     )
 
 
-def _generation_numbers(base: Path) -> list[int]:
-    if not base.exists():
-        return []
-    numbers = sorted(
-        int(match.group(1))
-        for child in base.iterdir()
-        if child.is_dir()
-        for match in [_GENERATION_RE.fullmatch(child.name)]
-        if match is not None
-    )
+def _generation_numbers(state_fd: int) -> list[int]:
+    try:
+        scan_fd = os.open(
+            ".",
+            _directory_open_flags(),
+            dir_fd=state_fd,
+        )
+    except OSError as exc:
+        raise ValueError("cannot enumerate state generations") from exc
+    numbers: list[int] = []
+    try:
+        with os.scandir(scan_fd) as iterator:
+            for entry in iterator:
+                match = _GENERATION_RE.fullmatch(entry.name)
+                if match is None:
+                    continue
+                try:
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                except OSError as exc:
+                    raise ValueError(
+                        "cannot inspect claim generation"
+                    ) from exc
+                if not stat.S_ISDIR(mode):
+                    raise ValueError(
+                        "claim generation is symbolic or not a real directory"
+                    )
+                numbers.append(int(match.group(1)))
+    finally:
+        os.close(scan_fd)
+    numbers.sort()
     if numbers and numbers != list(range(1, numbers[-1] + 1)):
         raise ValueError("claim generations must be contiguous")
     return numbers
@@ -898,54 +1735,193 @@ def _validate_claim_payload(
         )
 
 
+def _load_attempt(
+    claim: JobClaim,
+    *,
+    generation_fd: int,
+    map_sha256: str,
+    row_sha256: str,
+    array_index: int,
+) -> tuple[dict[str, object], str] | None:
+    if not _entry_lexists_at(
+        generation_fd,
+        claim.attempt_path.name,
+        claim.attempt_path,
+    ):
+        return None
+    if claim.generation == 1:
+        raise ValueError("first claim cannot contain a recovery attempt")
+    document, digest = _read_record(
+        claim.attempt_path,
+        payload_type=ATTEMPT_TYPE,
+        payload_keys=ATTEMPT_PAYLOAD_KEYS,
+        directory_fd=generation_fd,
+    )
+    attempt = document["payload"]
+    if not isinstance(attempt, dict):
+        raise ValueError("attempt payload must be an object")
+    if (
+        attempt["job_map_sha256"] != map_sha256
+        or attempt["row_sha256"] != row_sha256
+        or attempt["array_index"] != array_index
+        or attempt["generation"] != claim.generation
+        or attempt["claim_sha256"] != claim.sha256
+    ):
+        raise ValueError(
+            "attempt does not match its recovered claim generation"
+        )
+    return document, digest
+
+
+def _load_recovery_record(
+    previous: JobClaim,
+    *,
+    generation_fd: int,
+    state_fd: int,
+    row: Mapping[str, object],
+    base: Path,
+    map_sha256: str,
+    row_sha256: str,
+) -> tuple[dict[str, object], str]:
+    attempt = _load_attempt(
+        previous,
+        generation_fd=generation_fd,
+        map_sha256=map_sha256,
+        row_sha256=row_sha256,
+        array_index=int(row["array_index"]),
+    )
+    document, digest = _read_record(
+        previous.recovery_path,
+        payload_type=RECOVERY_TYPE,
+        payload_keys=RECOVERY_PAYLOAD_KEYS,
+        directory_fd=generation_fd,
+    )
+    recovery = document["payload"]
+    if not isinstance(recovery, dict):
+        raise ValueError("recovery payload must be an object")
+    if recovery["restart_mode"] != "fresh":
+        raise ValueError("recovery restart_mode must be fresh")
+    _validate_quarantine(
+        recovery["quarantine"],
+        row=row,
+        base=base,
+        generation=previous.generation,
+        state_fd=state_fd,
+    )
+    if (
+        recovery["claim_sha256"] != previous.sha256
+        or recovery["next_generation"] != previous.generation + 1
+        or recovery["attempt_record_sha256"]
+        != (attempt[1] if attempt is not None else None)
+    ):
+        raise ValueError("recovery record does not match its previous claim")
+    if previous.generation > 1 and attempt is None:
+        raise ValueError(
+            "recovered claim was superseded without an attempt"
+        )
+    _require_sha256(
+        recovery["recovery_audit_sha256"],
+        "recovery_audit_sha256",
+    )
+    return document, digest
+
+
 def _load_claim_chain(
     row: Mapping[str, object],
     *,
+    state_fd: int,
     map_sha256: str,
     row_sha256: str,
+    allow_pending_recovery: bool = False,
 ) -> list[JobClaim]:
     base = _state_dir(row)
     claims: list[JobClaim] = []
-    for generation in _generation_numbers(base):
-        path = base / f"generation-{generation:06d}" / "claim.json"
-        document, digest = _read_record(
-            path,
-            payload_type=CLAIM_TYPE,
-            payload_keys=CLAIM_PAYLOAD_KEYS,
-        )
-        claim = _claim_from_document(path, generation, document, digest)
-        _validate_claim_payload(
-            claim,
-            map_sha256=map_sha256,
-            row_sha256=row_sha256,
-            array_index=int(row["array_index"]),
-        )
+    with contextlib.ExitStack() as stack:
+        generation_fds = {
+            generation: stack.enter_context(
+                _open_generation_directory(
+                    state_fd,
+                    base,
+                    generation,
+                )
+            )
+            for generation in _generation_numbers(state_fd)
+        }
+        for generation, generation_fd in generation_fds.items():
+            path = (
+                base
+                / _generation_name(generation)
+                / "claim.json"
+            )
+            document, digest = _read_record(
+                path,
+                payload_type=CLAIM_TYPE,
+                payload_keys=CLAIM_PAYLOAD_KEYS,
+                directory_fd=generation_fd,
+            )
+            claim = _claim_from_document(
+                path,
+                generation,
+                document,
+                digest,
+            )
+            _validate_claim_payload(
+                claim,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(row["array_index"]),
+            )
+            if claims:
+                previous = claims[-1]
+                _, recovery_sha256 = _load_recovery_record(
+                    previous,
+                    generation_fd=generation_fds[previous.generation],
+                    state_fd=state_fd,
+                    row=row,
+                    base=base,
+                    map_sha256=map_sha256,
+                    row_sha256=row_sha256,
+                )
+                current_payload = claim.document["payload"]
+                if not isinstance(current_payload, dict):
+                    raise ValueError("invalid claim recovery chain")
+                if (
+                    current_payload["recovered_from_claim_sha256"]
+                    != previous.sha256
+                    or current_payload["recovery_record_sha256"]
+                    != recovery_sha256
+                ):
+                    raise ValueError("claim recovery chain hash mismatch")
+            claims.append(claim)
         if claims:
-            previous = claims[-1]
-            recovery_document, recovery_sha256 = _read_record(
-                previous.recovery_path,
-                payload_type=RECOVERY_TYPE,
-                payload_keys=RECOVERY_PAYLOAD_KEYS,
-            )
-            recovery = recovery_document["payload"]
-            current_payload = claim.document["payload"]
-            if not isinstance(recovery, dict) or not isinstance(current_payload, dict):
-                raise ValueError("invalid claim recovery chain")
-            if (
-                recovery["claim_sha256"] != previous.sha256
-                or recovery["next_generation"] != generation
-                or current_payload["recovered_from_claim_sha256"] != previous.sha256
-                or current_payload["recovery_record_sha256"] != recovery_sha256
+            current = claims[-1]
+            current_fd = generation_fds[current.generation]
+            if _entry_lexists_at(
+                current_fd,
+                current.recovery_path.name,
+                current.recovery_path,
             ):
-                raise ValueError("claim recovery chain hash mismatch")
-            _require_sha256(
-                recovery["recovery_audit_sha256"],
-                "recovery_audit_sha256",
+                _load_recovery_record(
+                    current,
+                    generation_fd=current_fd,
+                    state_fd=state_fd,
+                    row=row,
+                    base=base,
+                    map_sha256=map_sha256,
+                    row_sha256=row_sha256,
+                )
+                if not allow_pending_recovery:
+                    raise ValueError(
+                        "audited recovery is missing its next claim generation"
+                    )
+            _load_attempt(
+                current,
+                generation_fd=current_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(row["array_index"]),
             )
-        claims.append(claim)
-    if claims and claims[-1].recovery_path.exists():
-        raise ValueError("audited recovery is missing its next claim generation")
-    return claims
+        return claims
 
 
 def _validate_output_hashes(
@@ -969,6 +1945,8 @@ def _validate_output_hashes(
 def _load_completion(
     payload: Mapping[str, object],
     row: Mapping[str, object],
+    *,
+    state_fd: int | None,
 ) -> JobCompletion:
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
     path = Path(str(checked_row["completion_path"]))
@@ -983,10 +1961,15 @@ def _load_completion(
     completion_payload = document["payload"]
     if not isinstance(completion_payload, dict):
         raise ValueError("completion payload must be an object")
-    claims = _load_claim_chain(
-        checked_row,
-        map_sha256=map_sha256,
-        row_sha256=row_sha256,
+    claims = (
+        []
+        if state_fd is None
+        else _load_claim_chain(
+            checked_row,
+            state_fd=state_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+        )
     )
     if not claims:
         raise ValueError("completion has no immutable claim")
@@ -1006,18 +1989,41 @@ def _load_completion(
     return JobCompletion(path=path, sha256=digest, document=document)
 
 
+def completion_output_hashes(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+) -> dict[str, str] | None:
+    """Return sealed output hashes, or ``None`` only when completion is absent."""
+
+    _, checked_row, _, _ = _row_context(payload, row)
+    path = Path(str(checked_row["completion_path"]))
+    if not _path_lexists(path):
+        return None
+    with _open_state_directory(
+        _state_dir(checked_row),
+        create=False,
+    ) as state_fd:
+        completion = _load_completion(
+            payload,
+            checked_row,
+            state_fd=state_fd,
+        )
+    completion_payload = completion.document["payload"]
+    if not isinstance(completion_payload, dict):
+        raise ValueError("completion payload must be an object")
+    output_hashes = completion_payload["output_hashes"]
+    if not isinstance(output_hashes, dict):
+        raise ValueError("completion output_hashes must be an object")
+    return dict(_validate_output_hashes(checked_row, output_hashes))
+
+
 def completion_is_valid(
     payload: Mapping[str, object],
     row: Mapping[str, object],
 ) -> bool:
     """Return false only for absence; reject any present invalid completion."""
 
-    _, checked_row, _, _ = _row_context(payload, row)
-    path = Path(str(checked_row["completion_path"]))
-    if not path.exists():
-        return False
-    _load_completion(payload, checked_row)
-    return True
+    return completion_output_hashes(payload, row) is not None
 
 
 def should_submit_row(
@@ -1027,14 +2033,49 @@ def should_submit_row(
     """Return whether a row lacks a valid completion and an active first claim."""
 
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
-    if completion_is_valid(payload, checked_row):
-        return False
-    claims = _load_claim_chain(
-        checked_row,
-        map_sha256=map_sha256,
-        row_sha256=row_sha256,
-    )
-    return not claims or claims[-1].generation > 1
+    base = _state_dir(checked_row)
+    with _open_state_directory(base, create=False) as state_fd:
+        if _path_lexists(Path(str(checked_row["completion_path"]))):
+            _load_completion(
+                payload,
+                checked_row,
+                state_fd=state_fd,
+            )
+            return False
+        claims = (
+            []
+            if state_fd is None
+            else _load_claim_chain(
+                checked_row,
+                state_fd=state_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+            )
+        )
+        if not claims:
+            should_submit = True
+        else:
+            current = claims[-1]
+            if current.generation == 1:
+                return False
+            with _open_generation_directory(
+                state_fd,
+                base,
+                current.generation,
+            ) as generation_fd:
+                should_submit = _load_attempt(
+                    current,
+                    generation_fd=generation_fd,
+                    map_sha256=map_sha256,
+                    row_sha256=row_sha256,
+                    array_index=int(checked_row["array_index"]),
+                ) is None
+    if should_submit and _path_lexists(_output_dir(checked_row)):
+        raise RuntimeError(
+            "unaudited output exists; audited recovery is required "
+            "before submission"
+        )
+    return should_submit
 
 
 def claim_job_row(
@@ -1045,11 +2086,24 @@ def claim_job_row(
 
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
     base = _state_dir(checked_row)
-    with _transition_lock(base):
-        if completion_is_valid(payload, checked_row):
+    with _transition_lock(base) as state_fd:
+        if _path_lexists(
+            Path(str(checked_row["completion_path"]))
+        ):
+            _load_completion(
+                payload,
+                checked_row,
+                state_fd=state_fd,
+            )
             raise RuntimeError("job row already has a valid completion")
+        output_dir = _output_dir(checked_row)
+        if _path_lexists(output_dir):
+            raise RuntimeError(
+                "unaudited output exists; audited recovery is required"
+            )
         claims = _load_claim_chain(
             checked_row,
+            state_fd=state_fd,
             map_sha256=map_sha256,
             row_sha256=row_sha256,
         )
@@ -1066,17 +2120,27 @@ def claim_job_row(
             "recovery_record_sha256": None,
         }
         path = base / "generation-000001" / "claim.json"
-        document, digest = _create_record(path, CLAIM_TYPE, claim_payload)
+        document, digest = _create_record(
+            path,
+            CLAIM_TYPE,
+            claim_payload,
+            state_fd=state_fd,
+            generation=1,
+            create_generation=True,
+        )
         return _claim_from_document(path, 1, document, digest)
 
 
-def recover_job_row(
+def _recover_job_row_unverified_for_testing(
     payload: Mapping[str, object],
     row: Mapping[str, object],
     *,
     recovery_audit_sha256: str,
 ) -> JobClaim:
-    """Recover a stale claim through a sealed audit record and next generation."""
+    """Exercise recovery transitions without proving that a claim is stale.
+
+    This helper is intentionally internal and is not exposed by the CLI.
+    """
 
     audit_sha256 = _require_sha256(
         recovery_audit_sha256,
@@ -1084,28 +2148,90 @@ def recover_job_row(
     )
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
     base = _state_dir(checked_row)
-    with _transition_lock(base):
-        if completion_is_valid(payload, checked_row):
+    with _transition_lock(base) as state_fd:
+        if _path_lexists(
+            Path(str(checked_row["completion_path"]))
+        ):
+            _load_completion(
+                payload,
+                checked_row,
+                state_fd=state_fd,
+            )
             raise RuntimeError("cannot recover a completed job row")
         claims = _load_claim_chain(
             checked_row,
+            state_fd=state_fd,
             map_sha256=map_sha256,
             row_sha256=row_sha256,
+            allow_pending_recovery=True,
         )
         if not claims:
             raise RuntimeError("no stale claim exists to recover")
         previous = claims[-1]
         next_generation = previous.generation + 1
-        recovery_payload: dict[str, object] = {
-            "claim_sha256": previous.sha256,
-            "next_generation": next_generation,
-            "recovery_audit_sha256": audit_sha256,
-        }
-        _, recovery_sha256 = _create_record(
-            previous.recovery_path,
-            RECOVERY_TYPE,
-            recovery_payload,
-        )
+        with _open_generation_directory(
+            state_fd,
+            base,
+            previous.generation,
+        ) as previous_fd:
+            attempt = _load_attempt(
+                previous,
+                generation_fd=previous_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(checked_row["array_index"]),
+            )
+            if previous.generation > 1 and attempt is None:
+                raise RuntimeError(
+                    "recovered claim must consume its attempt before recovery"
+                )
+            if _entry_lexists_at(
+                previous_fd,
+                previous.recovery_path.name,
+                previous.recovery_path,
+            ):
+                recovery_document, recovery_sha256 = _load_recovery_record(
+                    previous,
+                    generation_fd=previous_fd,
+                    state_fd=state_fd,
+                    row=checked_row,
+                    base=base,
+                    map_sha256=map_sha256,
+                    row_sha256=row_sha256,
+                )
+                recovery_payload = recovery_document["payload"]
+                if not isinstance(recovery_payload, dict):
+                    raise ValueError("recovery payload must be an object")
+                if (
+                    recovery_payload["recovery_audit_sha256"]
+                    != audit_sha256
+                ):
+                    raise ValueError(
+                        "requested audit does not match the pending recovery"
+                    )
+            else:
+                quarantine = _quarantine_output(
+                    checked_row,
+                    base=base,
+                    generation=previous.generation,
+                    state_fd=state_fd,
+                )
+                recovery_payload = {
+                    "claim_sha256": previous.sha256,
+                    "next_generation": next_generation,
+                    "recovery_audit_sha256": audit_sha256,
+                    "attempt_record_sha256": (
+                        attempt[1] if attempt is not None else None
+                    ),
+                    "quarantine": quarantine,
+                    "restart_mode": "fresh",
+                }
+                _, recovery_sha256 = _create_record(
+                    previous.recovery_path,
+                    RECOVERY_TYPE,
+                    recovery_payload,
+                    directory_fd=previous_fd,
+                )
         claim_payload: dict[str, object] = {
             "job_map_sha256": map_sha256,
             "row_sha256": row_sha256,
@@ -1119,13 +2245,74 @@ def recover_job_row(
             / f"generation-{next_generation:06d}"
             / "claim.json"
         )
-        document, digest = _create_record(path, CLAIM_TYPE, claim_payload)
+        document, digest = _create_record(
+            path,
+            CLAIM_TYPE,
+            claim_payload,
+            state_fd=state_fd,
+            generation=next_generation,
+            create_generation=True,
+        )
         return _claim_from_document(
             path,
             next_generation,
             document,
             digest,
         )
+
+
+def consume_recovery_attempt(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+) -> Path:
+    """Atomically consume the current recovered generation's sole attempt."""
+
+    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    base = _state_dir(checked_row)
+    with _transition_lock(base) as state_fd:
+        claims = _load_claim_chain(
+            checked_row,
+            state_fd=state_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+        )
+        if _path_lexists(_output_dir(checked_row)):
+            raise RuntimeError(
+                "unaudited output exists; new audited recovery is required"
+            )
+        if not claims or claims[-1].generation == 1:
+            raise RuntimeError("no recovered claim is available to attempt")
+        current = claims[-1]
+        with _open_generation_directory(
+            state_fd,
+            base,
+            current.generation,
+        ) as current_fd:
+            if _load_attempt(
+                current,
+                generation_fd=current_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(checked_row["array_index"]),
+            ) is not None:
+                raise RuntimeError(
+                    "recovered claim attempt was already consumed; "
+                    "new audited recovery is required"
+                )
+            attempt_payload: dict[str, object] = {
+                "job_map_sha256": map_sha256,
+                "row_sha256": row_sha256,
+                "array_index": checked_row["array_index"],
+                "generation": current.generation,
+                "claim_sha256": current.sha256,
+            }
+            _create_record(
+                current.attempt_path,
+                ATTEMPT_TYPE,
+                attempt_payload,
+                directory_fd=current_fd,
+            )
+        return current.attempt_path
 
 
 def complete_job_row(
@@ -1161,9 +2348,10 @@ def complete_job_row(
     outputs = _validate_output_hashes(checked_row, output_hashes)
     base = _state_dir(checked_row)
     completion_path = Path(str(checked_row["completion_path"]))
-    with _transition_lock(base):
+    with _transition_lock(base) as state_fd:
         claims = _load_claim_chain(
             checked_row,
+            state_fd=state_fd,
             map_sha256=map_sha256,
             row_sha256=row_sha256,
         )
@@ -1177,8 +2365,28 @@ def complete_job_row(
             raise ValueError(
                 "expected claim identity changed before completion"
             )
-        if completion_path.exists():
-            existing = _load_completion(payload, checked_row)
+        if current.generation > 1:
+            with _open_generation_directory(
+                state_fd,
+                base,
+                current.generation,
+            ) as current_fd:
+                if _load_attempt(
+                    current,
+                    generation_fd=current_fd,
+                    map_sha256=map_sha256,
+                    row_sha256=row_sha256,
+                    array_index=int(checked_row["array_index"]),
+                ) is None:
+                    raise RuntimeError(
+                        "recovered claim cannot complete before its attempt"
+                    )
+        if _path_lexists(completion_path):
+            existing = _load_completion(
+                payload,
+                checked_row,
+                state_fd=state_fd,
+            )
             existing_payload = existing.document["payload"]
             if (
                 not isinstance(existing_payload, dict)
@@ -1237,11 +2445,20 @@ def _run_selected_row(args: argparse.Namespace) -> int:
         return 0
 
     _, _, _, row_sha256 = _row_context(job_map, row)
-    claims = _load_claim_chain(
-        row,
-        map_sha256=str(job_map["payload_sha256"]),
-        row_sha256=row_sha256,
-    )
+    with _open_state_directory(
+        _state_dir(row),
+        create=False,
+    ) as state_fd:
+        claims = (
+            []
+            if state_fd is None
+            else _load_claim_chain(
+                row,
+                state_fd=state_fd,
+                map_sha256=str(job_map["payload_sha256"]),
+                row_sha256=row_sha256,
+            )
+        )
     if claims:
         claim = claims[-1]
         if claim.generation == 1:
@@ -1251,6 +2468,12 @@ def _run_selected_row(args: argparse.Namespace) -> int:
     else:
         claim = claim_job_row(job_map, row)
 
+    if claim.generation > 1:
+        consume_recovery_attempt(job_map, row)
+    if _path_lexists(_output_dir(row)):
+        raise RuntimeError(
+            "unaudited output appeared before the sealed job attempt"
+        )
     environment = os.environ.copy()
     environment.update(
         {
@@ -1342,11 +2565,20 @@ def complete_job_row_from_environment(
         raise ValueError("selected row hash does not match SAMGA_JOB_ROW_SHA256")
 
     _, checked_row, map_sha256, row_sha256 = _row_context(job_map, row)
-    claims = _load_claim_chain(
-        checked_row,
-        map_sha256=map_sha256,
-        row_sha256=row_sha256,
-    )
+    with _open_state_directory(
+        _state_dir(checked_row),
+        create=False,
+    ) as state_fd:
+        claims = (
+            []
+            if state_fd is None
+            else _load_claim_chain(
+                checked_row,
+                state_fd=state_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+            )
+        )
     if not claims:
         raise ValueError("SAMGA_JOB_CLAIM has no current claim")
     current_claim = claims[-1]
@@ -1381,16 +2613,6 @@ def _parser() -> argparse.ArgumentParser:
     select = subparsers.add_parser("select", help="print one validated row")
     _add_selection_arguments(select)
 
-    claim = subparsers.add_parser("claim", help="claim one validated row")
-    _add_selection_arguments(claim)
-
-    recover = subparsers.add_parser("recover", help="audit and recover a stale row")
-    _add_selection_arguments(recover)
-    recover.add_argument("--recovery-audit-sha256", required=True)
-
-    complete = subparsers.add_parser("complete", help="complete one claimed row")
-    _add_selection_arguments(complete)
-    complete.add_argument("--output-hashes", required=True)
 
     complete_env = subparsers.add_parser(
         "complete-env",
@@ -1459,21 +2681,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     payload, row = _load_selected(args)
     if args.command == "select":
         print(canonical_json_bytes(row).decode("utf-8"))
-    elif args.command == "claim":
-        print(claim_job_row(payload, row).path)
-    elif args.command == "recover":
-        print(
-            recover_job_row(
-                payload,
-                row,
-                recovery_audit_sha256=args.recovery_audit_sha256,
-            ).path
-        )
-    elif args.command == "complete":
-        output_hashes = json.loads(args.output_hashes)
-        if not isinstance(output_hashes, dict):
-            raise ValueError("--output-hashes must decode to an object")
-        print(complete_job_row(payload, row, output_hashes).path)
     else:  # pragma: no cover - argparse enforces the command set.
         raise AssertionError(args.command)
     return 0

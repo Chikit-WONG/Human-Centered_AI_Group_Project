@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from samga_brain_rw import brainrw as br
-from samga_brain_rw.hashing import ordered_ids_sha256
+from samga_brain_rw.hashing import ordered_ids_sha256, sha256_json
+from samga_brain_rw.runtime_contract import PINNED_SEMANTIC_ENVIRONMENT
 from samga_brain_rw.scores import ScoreArtifact
 
 
@@ -29,16 +30,29 @@ class _FakeBlock(torch.nn.Module):
 class _FakeVision(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.is_gradient_checkpointing = False
         self.vision_model = torch.nn.Module()
         self.vision_model.encoder = torch.nn.Module()
         self.vision_model.encoder.layers = torch.nn.ModuleList([_FakeBlock()])
         self.visual_projection = torch.nn.Linear(8, 8, bias=False)
-        self.config = type("Config", (), {"projection_dim": 8})()
+        self.config = type(
+            "Config",
+            (),
+            {"num_hidden_layers": 1, "projection_dim": 8},
+        )()
 
     def forward(self, pixel_values: torch.Tensor, **_: object):
         x = pixel_values.reshape(pixel_values.shape[0], 8)
         x = self.vision_model.encoder.layers[0](x)
         return type("Output", (), {"image_embeds": self.visual_projection(x)})()
+
+    def gradient_checkpointing_enable(
+        self,
+        *,
+        gradient_checkpointing_kwargs: dict[str, object],
+    ) -> None:
+        assert gradient_checkpointing_kwargs == {"use_reentrant": False}
+        self.is_gradient_checkpointing = True
 
 
 class _Processor:
@@ -87,6 +101,92 @@ def _identity() -> br.ManifestIdentity:
     )
 
 
+def _runtime_attestation() -> dict[str, object]:
+    semantic_environment = dict(PINNED_SEMANTIC_ENVIRONMENT)
+    contract = {
+        "accelerator": "NVIDIA A40",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+    }
+    evidence = {
+        "accelerator_name": "NVIDIA A40",
+        "bf16_supported": True,
+        "cuda_available": True,
+        "cuda_capability": [8, 6],
+        "cuda_device_count": 1,
+        "cuda_device_index": 0,
+        "cuda_version": "12.8",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+        "torch_version": "2.11.0+cu128",
+        "total_memory_bytes": 48 * 1024**3,
+    }
+    return {
+        "semantic_environment": semantic_environment,
+        "semantic_environment_sha256": (
+            sha256_json(semantic_environment)
+        ),
+        "runtime_contract": contract,
+        "runtime_contract_sha256": sha256_json(contract),
+        "runtime_evidence": evidence,
+        "runtime_evidence_sha256": sha256_json(evidence),
+    }
+
+
+def _evaluation_runtime_metadata() -> dict[str, object]:
+    attestation = _runtime_attestation()
+    return {
+        "training_semantic_environment": attestation[
+            "semantic_environment"
+        ],
+        "training_semantic_environment_sha256": attestation[
+            "semantic_environment_sha256"
+        ],
+        "evaluation_semantic_environment": attestation[
+            "semantic_environment"
+        ],
+        "evaluation_semantic_environment_sha256": attestation[
+            "semantic_environment_sha256"
+        ],
+        "evaluation_runtime_contract": attestation[
+            "runtime_contract"
+        ],
+        "evaluation_runtime_contract_sha256": attestation[
+            "runtime_contract_sha256"
+        ],
+        "evaluation_runtime_evidence": attestation[
+            "runtime_evidence"
+        ],
+        "evaluation_runtime_evidence_sha256": attestation[
+            "runtime_evidence_sha256"
+        ],
+    }
+
+
+def _fake_cpu_runtime() -> br.BrainRWProductionRuntime:
+    attestation = _runtime_attestation()
+    return br.BrainRWProductionRuntime(
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        contract=attestation["runtime_contract"],
+        semantic_environment=attestation[
+            "semantic_environment"
+        ],
+        semantic_environment_sha256=str(
+            attestation["semantic_environment_sha256"]
+        ),
+        contract_sha256=str(
+            attestation["runtime_contract_sha256"]
+        ),
+        evidence=attestation["runtime_evidence"],
+        evidence_sha256=str(
+            attestation["runtime_evidence_sha256"]
+        ),
+    )
+
+
 class _ValDataset:
     calls: list[str | None] = []
 
@@ -126,6 +226,7 @@ class _ValDataset:
 
 def _checkpoint(model: br.BrainRWCLIPLoRAModel, *, subject: int = 1) -> dict[str, object]:
     return {
+        **_runtime_attestation(),
         "schema_version": 1,
         "payload_type": br.BRAINRW_CHECKPOINT_TYPE,
         "complete": True,
@@ -159,7 +260,7 @@ def _checkpoint(model: br.BrainRWCLIPLoRAModel, *, subject: int = 1) -> dict[str
                 Path(__file__).resolve().parents[3]
             ),
         },
-        "runtime_dtype": "float32",
+        "runtime_dtype": "bfloat16",
         "run_key": "brainrw-run",
         "observed_scopes": ["train", "val-dev"],
     }
@@ -172,6 +273,232 @@ def _load_script(experiment_root: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_emitter_runtime_preflight_precedes_artifact_model_and_dataset_reads(
+    experiment_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emit = _load_script(experiment_root)
+    touched: list[str] = []
+
+    def forbidden(
+        *_args: object,
+        name: str,
+        **_kwargs: object,
+    ) -> None:
+        touched.append(name)
+        raise AssertionError(f"{name} must follow runtime preflight")
+
+    monkeypatch.setattr(
+        br,
+        "probe_brainrw_production_runtime",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("NVIDIA A40 unavailable")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        br,
+        "load_development_manifest_identity",
+        lambda *_a, **_k: forbidden(*_a, name="manifest", **_k),
+    )
+    monkeypatch.setattr(
+        br,
+        "load_brainrw_checkpoint",
+        lambda *_a, **_k: forbidden(*_a, name="checkpoint", **_k),
+    )
+    monkeypatch.setattr(
+        br,
+        "build_model_from_checkpoint",
+        lambda *_a, **_k: forbidden(*_a, name="model", **_k),
+    )
+    monkeypatch.setattr(
+        br,
+        "BrainRWDevelopmentDataset",
+        lambda *_a, **_k: forbidden(*_a, name="dataset", **_k),
+    )
+    monkeypatch.setattr(
+        emit,
+        "_git_provenance",
+        lambda: {
+            "clean": True,
+            "git_sha": "a" * 40,
+            "repository_root": str(experiment_root.parents[1]),
+        },
+    )
+    args = emit.parse_args(
+        [
+            "--scope", "val-dev",
+            "--subject", "1",
+            "--seed", "42",
+            "--checkpoint", str(tmp_path / "checkpoint.pt"),
+            "--manifest", str(tmp_path / "sub-01_protocol.json"),
+            "--output-dir", str(tmp_path / "scores"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="A40"):
+        emit.run(args)
+    assert touched == []
+
+
+@pytest.mark.parametrize(
+    ("environment_mismatch", "expected_error"),
+    (
+        (False, "terminal"),
+        (True, "semantic environments"),
+    ),
+)
+def test_emitter_rejects_partial_checkpoint_before_any_later_artifact(
+    experiment_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_mismatch: bool,
+    expected_error: str,
+) -> None:
+    emit = _load_script(experiment_root)
+    events: list[str] = []
+    model = _model()
+    payload = _checkpoint(model)
+    payload["training_complete"] = False
+    payload["global_step"] = 1
+    if environment_mismatch:
+        environment = dict(payload["semantic_environment"])
+        environment["numpy"] = "0.0.0"
+        payload["semantic_environment"] = environment
+    loaded = br.LoadedBrainRWCheckpoint(
+        payload=payload,
+        sha256="b" * 64,
+    )
+
+    def record_runtime() -> br.BrainRWProductionRuntime:
+        events.append("runtime")
+        return _fake_cpu_runtime()
+
+    def record_checkpoint(
+        *_args: object,
+        **_kwargs: object,
+    ) -> br.LoadedBrainRWCheckpoint:
+        events.append("checkpoint")
+        return loaded
+
+    def forbidden(name: str):
+        def fail(*_args: object, **_kwargs: object) -> None:
+            events.append(name)
+            raise AssertionError(f"{name} must follow terminal gate")
+
+        return fail
+
+    monkeypatch.setattr(
+        br,
+        "probe_brainrw_production_runtime",
+        record_runtime,
+    )
+    monkeypatch.setattr(
+        br,
+        "load_brainrw_checkpoint",
+        record_checkpoint,
+    )
+    for target, name in (
+        (emit, "_git_provenance"),
+        (br, "load_development_manifest_identity"),
+        (br, "verify_brainrw_config"),
+        (br, "build_model_from_checkpoint"),
+        (br, "BrainRWDevelopmentDataset"),
+    ):
+        monkeypatch.setattr(target, name, forbidden(name))
+    args = emit.parse_args(
+        [
+            "--scope", "val-dev",
+            "--subject", "1",
+            "--seed", "42",
+            "--checkpoint", str(tmp_path / "checkpoint.pt"),
+            "--manifest", str(tmp_path / "sub-01_protocol.json"),
+            "--output-dir", str(tmp_path / "scores"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        emit.run(args)
+    assert events == ["runtime", "checkpoint"]
+
+
+def test_terminal_score_binds_and_validates_evaluation_runtime(
+    tmp_path: Path,
+) -> None:
+    metadata = {
+        "checkpoint_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        **_evaluation_runtime_metadata(),
+        "git_sha": "c" * 40,
+        "protocol_sha256": "d" * 64,
+        "seed": 42,
+        "source_records": [
+            {
+                "manifest_sha256": "1" * 64,
+                "records_sha256": "2" * 64,
+                "role": "val-dev",
+                "role_payload_sha256": "3" * 64,
+                "source_manifest_sha256": "4" * 64,
+                "source_payload_byte_count": 123,
+                "source_payload_path": "/safe/sub-01/train.pt",
+                "source_payload_sha256": "5" * 64,
+            }
+        ],
+        "split_role": "val-dev",
+        "stage": "brainrw-clip-lora",
+        "subject": 1,
+    }
+    similarity = torch.eye(2).numpy()
+
+    ScoreArtifact.save(
+        tmp_path / "valid",
+        similarity,
+        ("image-a", "image-b"),
+        ("image-a", "image-b"),
+        metadata,
+    )
+    artifact = ScoreArtifact.load(
+        tmp_path / "valid",
+        {"val-dev"},
+    )
+    assert artifact.metadata["evaluation_runtime_contract"] == (
+        artifact.provenance["evaluation_runtime_contract"]
+    )
+
+    tampered = dict(metadata)
+    evidence = dict(tampered["evaluation_runtime_evidence"])
+    evidence["accelerator_name"] = "NVIDIA A800"
+    tampered["evaluation_runtime_evidence"] = evidence
+    tampered["evaluation_runtime_evidence_sha256"] = sha256_json(evidence)
+    with pytest.raises(ValueError, match="runtime|A40"):
+        ScoreArtifact.save(
+            tmp_path / "tampered",
+            similarity,
+            ("image-a", "image-b"),
+            ("image-a", "image-b"),
+            tampered,
+        )
+
+    environment_tampered = dict(metadata)
+    environment = dict(
+        environment_tampered["evaluation_semantic_environment"]
+    )
+    environment["numpy"] = "0.0.0"
+    environment_tampered["evaluation_semantic_environment"] = environment
+    environment_tampered[
+        "evaluation_semantic_environment_sha256"
+    ] = sha256_json(environment)
+    with pytest.raises(ValueError, match="semantic environment"):
+        ScoreArtifact.save(
+            tmp_path / "environment-tampered",
+            similarity,
+            ("image-a", "image-b"),
+            ("image-a", "image-b"),
+            environment_tampered,
+        )
 
 
 def test_emitter_git_provenance_is_anchored_and_clean(
@@ -277,6 +604,11 @@ def test_emitter_rejects_malformed_model_state_before_dataset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     emit = _load_script(experiment_root)
+    monkeypatch.setattr(
+        br,
+        "probe_brainrw_production_runtime",
+        _fake_cpu_runtime,
+    )
     manifest_path = tmp_path / "sub-01_protocol.json"
     manifest_path.write_text(
         "verified by monkeypatch\n",
@@ -358,6 +690,11 @@ def test_emitter_writes_only_typed_val_dev_independent_scores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     emit = _load_script(experiment_root)
+    monkeypatch.setattr(
+        br,
+        "probe_brainrw_production_runtime",
+        _fake_cpu_runtime,
+    )
     manifest = tmp_path / "sub-01_protocol.json"
     manifest.write_text("verified by monkeypatch\n", encoding="utf-8")
     checkpoint_path = tmp_path / "checkpoint.pt"
@@ -449,7 +786,19 @@ def test_emitter_writes_only_typed_val_dev_independent_scores(
     assert validations[0][1] is config_identity
     assert validations[0][3:] == (1, 42)
     assert _ValDataset.calls == ["a" * 64]
-    assert evaluation_dtypes == [torch.float32]
+    assert evaluation_dtypes == [torch.bfloat16]
+    runtime_metadata = _evaluation_runtime_metadata()
+    assert artifact.metadata["evaluation_runtime_contract_sha256"] == (
+        runtime_metadata["evaluation_runtime_contract_sha256"]
+    )
+    assert artifact.metadata["evaluation_runtime_evidence_sha256"] == (
+        runtime_metadata["evaluation_runtime_evidence_sha256"]
+    )
+    for key in runtime_metadata:
+        assert artifact.metadata[key] == artifact.provenance[key]
+    assert artifact.metadata["evaluation_runtime_contract"]["accelerator"] == (
+        "NVIDIA A40"
+    )
 
 
 @pytest.mark.parametrize("scope", ["test", "formal-test", "val-confirm"])
@@ -472,6 +821,11 @@ def test_renamed_or_metadata_free_artifacts_fail_before_eeg_or_image_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     emit = _load_script(experiment_root)
+    monkeypatch.setattr(
+        br,
+        "probe_brainrw_production_runtime",
+        _fake_cpu_runtime,
+    )
     touched = False
 
     class ForbiddenDataset:
@@ -515,6 +869,11 @@ def test_checkpoint_identity_and_existing_output_fail_before_dataset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     emit = _load_script(experiment_root)
+    monkeypatch.setattr(
+        br,
+        "probe_brainrw_production_runtime",
+        _fake_cpu_runtime,
+    )
     manifest = tmp_path / "sub-01_protocol.json"
     manifest.write_text("verified by monkeypatch\n", encoding="utf-8")
     checkpoint_path = tmp_path / "checkpoint.pt"

@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+
+import torch
 
 from samga_brain_rw.brainrw import (
     ManifestIdentity,
@@ -23,7 +25,14 @@ from samga_brain_rw.config import (
 )
 from samga_brain_rw.data import POSTERIOR_CHANNELS, ProtocolSubjectDataset
 from samga_brain_rw.feature_transforms import TrainWhitening
-from samga_brain_rw.hashing import sha256_json
+from samga_brain_rw.hashing import ordered_ids_sha256, sha256_json
+from samga_brain_rw.score_provenance import (
+    development_score_source_records,
+)
+from samga_brain_rw.runtime_contract import (
+    require_production_runtime,
+    validate_environment_binding,
+)
 from samga_brain_rw.scores import ScoreArtifact
 from samga_brain_rw.trainer import (
     SAMGARuntimeModel,
@@ -36,6 +45,8 @@ from train import (
     PINNED_UPSTREAM_SHA,
     RUN_PAYLOAD_TYPE,
     SCHEDULE_SHA256,
+    UpstreamPreflight,
+    clean_repository_git_sha,
     build_resolved_candidate_payload,
     load_samga_checkpoint,
 )
@@ -121,7 +132,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--device",
+        choices=("cuda",),
+        default="cuda",
+        help="Production evaluation is sealed to CUDA device 0 on A40.",
+    )
     return parser
 
 
@@ -193,12 +209,11 @@ class EvaluationIdentity:
     candidate: CandidateIdentity
     run_manifest: Mapping[str, object]
     input_hashes: Mapping[str, str]
+    environment: Mapping[str, object]
 
 
 def _require_mapping(value: object, context: str) -> dict[str, object]:
-    if not isinstance(value, Mapping) or any(
-        not isinstance(key, str) for key in value
-    ):
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{context} must be a string-keyed mapping")
     return dict(value)
 
@@ -268,18 +283,49 @@ def _declared_path(value: object, context: str) -> Path:
     return reject_development_path(path, context)
 
 
+def _preflight_upstream_config(path: Path) -> UpstreamPreflight:
+    """Verify pinned config/upstream code before manifest or data access."""
+
+    semantic = SemanticConfig.from_path(path)
+    payload = semantic.canonical_payload()
+    if payload.get("config_type") != "internvit_baseline":
+        raise ValueError("SAMGA requires an internvit_baseline config")
+    upstream = _require_mapping(payload.get("upstream"), "config upstream")
+    upstream_root = _declared_path(
+        upstream.get("path"),
+        "configured upstream SAMGA root",
+    )
+    upstream_commit = upstream.get("git_commit")
+    if upstream_commit != PINNED_UPSTREAM_SHA:
+        raise ValueError("configured upstream SAMGA revision mismatch")
+    components = load_locked_upstream_components(
+        upstream_root,
+        upstream_commit,
+    )
+    return UpstreamPreflight(
+        semantic_sha256=semantic.sha256,
+        semantic_payload=MappingProxyType(payload),
+        upstream_root=upstream_root,
+        upstream_commit=upstream_commit,
+        components=components,
+    )
+
+
 def _load_config(
     path: Path,
     feature_cache: Path,
     *,
     manifest: ManifestIdentity,
+    preflight: UpstreamPreflight,
 ) -> EvaluationConfig:
     semantic = SemanticConfig.from_path(path)
     payload = semantic.canonical_payload()
+    if semantic.sha256 != preflight.semantic_sha256 or payload != dict(
+        preflight.semantic_payload
+    ):
+        raise ValueError("full config identity differs from upstream preflight")
     if payload.get("config_type") != "internvit_baseline":
-        raise ValueError(
-            "SAMGA evaluation requires an internvit_baseline config"
-        )
+        raise ValueError("SAMGA evaluation requires an internvit_baseline config")
     upstream = _require_mapping(payload.get("upstream"), "config upstream")
     model = _require_mapping(payload.get("model"), "config model")
     cache = _require_mapping(payload.get("cache"), "config cache")
@@ -292,15 +338,18 @@ def _load_config(
     upstream_commit = upstream.get("git_commit")
     if upstream_commit != PINNED_UPSTREAM_SHA:
         raise ValueError("configured upstream SAMGA revision mismatch")
+    if (
+        upstream_root != preflight.upstream_root
+        or upstream_commit != preflight.upstream_commit
+    ):
+        raise ValueError("full upstream identity differs from upstream preflight")
     _declared_path(model.get("path"), "configured InternViT model")
     configured_cache = _declared_path(
         cache.get("path"),
         "configured feature cache",
     )
     if configured_cache != feature_cache:
-        raise ValueError(
-            "CLI feature cache path differs from the semantic config"
-        )
+        raise ValueError("CLI feature cache path differs from the semantic config")
     cache_sha256 = _require_sha256(
         cache.get("sha256"),
         "config cache.sha256",
@@ -317,18 +366,14 @@ def _load_config(
         raise ValueError("config batch_size must be locked to 512")
     protocol = ProtocolConfig.from_path(_PROTOCOL_CONFIG_PATH)
     if protocol.sha256 != manifest.protocol_sha256:
-        raise ValueError(
-            "verified manifest differs from the fixed protocol_v1 config"
-        )
+        raise ValueError("verified manifest differs from the fixed protocol_v1 config")
     stage2_semantic = SemanticConfig.from_path(_STAGE2_CONFIG_PATH)
     stage2_payload = stage2_semantic.canonical_payload()
     if (
         stage2_payload.get("config_type") != "stage2_candidates"
         or stage2_payload.get("config_id") != "stage2_candidates_v1"
     ):
-        raise ValueError(
-            "fixed Stage 2 registry has the wrong semantic identity"
-        )
+        raise ValueError("fixed Stage 2 registry has the wrong semantic identity")
     return EvaluationConfig(
         semantic=semantic,
         payload=payload,
@@ -350,13 +395,9 @@ def _input_hashes(
     config: EvaluationConfig,
 ) -> dict[str, str]:
     if type(manifest.source_payload_byte_count) is not int:
-        raise ValueError(
-            "manifest source_payload_byte_count must be an integer"
-        )
+        raise ValueError("manifest source_payload_byte_count must be an integer")
     if manifest.source_payload_byte_count <= 0:
-        raise ValueError(
-            "manifest source_payload_byte_count must be positive"
-        )
+        raise ValueError("manifest source_payload_byte_count must be positive")
     source_payload_path = Path(manifest.source_payload_path)
     if not source_payload_path.is_absolute():
         raise ValueError("manifest source_payload_path must be absolute")
@@ -365,14 +406,23 @@ def _input_hashes(
         "checkpoint_sha256": _NO_INITIAL_CHECKPOINT_SHA256,
         "manifest_sha256": manifest.manifest_sha256,
         "model_sha256": config.model_sha256,
+        "ordered_ids_sha256": ordered_ids_sha256(
+            [
+                *manifest.train_ordered_ids,
+                *manifest.val_dev_ordered_ids,
+            ]
+        ),
         "protocol_sha256": manifest.protocol_sha256,
+        "records_sha256": manifest.records_sha256,
         "source_manifest_sha256": manifest.source_manifest_sha256,
         "source_payload_sha256": manifest.source_payload_sha256,
         "source_payload_path_sha256": sha256_json(str(source_payload_path)),
         "source_payload_byte_count_sha256": sha256_json(
             manifest.source_payload_byte_count
         ),
+        "train_ordered_ids_sha256": manifest.train_ordered_ids_sha256,
         "train_role_sha256": manifest.train_role_sha256,
+        "val_dev_ordered_ids_sha256": manifest.val_dev_ordered_ids_sha256,
         "val_dev_role_sha256": manifest.val_dev_role_sha256,
     }
     raw = _require_mapping(value, "checkpoint input_hashes")
@@ -407,19 +457,16 @@ def _candidate_identity(
     config: EvaluationConfig,
     checkpoint_payload: Mapping[str, object],
     input_hashes: Mapping[str, str],
+    environment_binding: Mapping[str, object],
 ) -> CandidateIdentity:
     candidate = _require_mapping(value, "candidate_spec")
     _require_exact_keys(candidate, _CANDIDATE_KEYS, "candidate_spec")
     if type(candidate["schema_version"]) is not int:
-        raise ValueError(
-            "candidate_spec schema_version must be an integer"
-        )
+        raise ValueError("candidate_spec schema_version must be an integer")
     if candidate["schema_version"] != 1:
         raise ValueError("candidate_spec schema_version must equal 1")
     body = {
-        key: candidate[key]
-        for key in _CANDIDATE_KEYS
-        if key != "candidate_spec_sha256"
+        key: candidate[key] for key in _CANDIDATE_KEYS if key != "candidate_spec_sha256"
     }
     candidate_sha256 = _require_sha256(
         candidate["candidate_spec_sha256"],
@@ -444,10 +491,7 @@ def _candidate_identity(
         raise ValueError("candidate_spec subject mismatch")
     if candidate["seed"] != seed:
         raise ValueError("candidate_spec seed mismatch")
-    if (
-        candidate["baseline_config_sha256"]
-        != config.semantic.sha256
-    ):
+    if candidate["baseline_config_sha256"] != config.semantic.sha256:
         raise ValueError("candidate_spec baseline config mismatch")
     if stage == "stage0":
         if candidate["stage2_config_sha256"] is not None:
@@ -500,25 +544,19 @@ def _candidate_identity(
         + int(adapter_kind != "identity")
     )
     if (stage == "stage0" and active != 0) or active > 1:
-        raise ValueError(
-            "candidate_spec violates the one-factor-only policy"
-        )
+        raise ValueError("candidate_spec violates the one-factor-only policy")
     rank = candidate["adapter_rank"]
     ratio = candidate["adapter_lr_ratio"]
     if adapter_kind == "identity":
         if rank is not None or ratio is not None:
-            raise ValueError(
-                "identity candidate cannot set adapter rank or LR ratio"
-            )
+            raise ValueError("identity candidate cannot set adapter rank or LR ratio")
     elif (
         type(rank) is not int
         or rank not in (8, 16, 32)
         or type(ratio) is not float
         or ratio not in (0.05, 0.1)
     ):
-        raise ValueError(
-            "adapter candidate rank/LR ratio differs from the registry"
-        )
+        raise ValueError("adapter candidate rank/LR ratio differs from the registry")
 
     factor_identity: _FactorIdentity = (
         str(layernorm),
@@ -531,21 +569,14 @@ def _candidate_identity(
     if stage == "stage2":
         registry = _stage2_registry_identities(config.stage2_payload)
         expected_identities = registry.get(config_id)
-        if (
-            expected_identities is None
-            or factor_identity not in expected_identities
-        ):
+        if expected_identities is None or factor_identity not in expected_identities:
             raise ValueError(
                 "candidate_spec factor/rank/LR does not match the exact "
                 "fixed Stage 2 registry"
             )
-        checkpoint_entries = config.stage2_payload.get(
-            "checkpoint_averaging"
-        )
+        checkpoint_entries = config.stage2_payload.get("checkpoint_averaging")
         if not isinstance(checkpoint_entries, list):
-            raise ValueError(
-                "fixed Stage 2 checkpoint registry is invalid"
-            )
+            raise ValueError("fixed Stage 2 checkpoint registry is invalid")
         averaged_ids = {
             entry.get("config_id")
             for entry in checkpoint_entries
@@ -554,35 +585,26 @@ def _candidate_identity(
         }
         if config_id in averaged_ids:
             raise ValueError(
-                "averaged/SWA candidate cannot be evaluated as a raw "
-                "epoch checkpoint"
+                "averaged/SWA candidate cannot be evaluated as a raw epoch checkpoint"
             )
 
     whitening_payload = candidate["whitening_payload"]
     if whitening_id == "s2-whitening-on":
         if not isinstance(whitening_payload, Mapping):
-            raise ValueError(
-                "whitening-on requires a sealed TrainWhitening payload"
-            )
+            raise ValueError("whitening-on requires a sealed TrainWhitening payload")
         whitening = TrainWhitening.from_payload(whitening_payload)
         restored_payload = whitening.to_payload()
-        if (
-            restored_payload != dict(whitening_payload)
-            or sha256_json(restored_payload)
-            != sha256_json(dict(whitening_payload))
-        ):
-            raise ValueError(
-                "TrainWhitening failed its sealed payload round-trip"
-            )
+        if restored_payload != dict(whitening_payload) or sha256_json(
+            restored_payload
+        ) != sha256_json(dict(whitening_payload)):
+            raise ValueError("TrainWhitening failed its sealed payload round-trip")
         if whitening.input_provenance_sha256 != manifest.manifest_sha256:
             raise ValueError(
-                "TrainWhitening manifest provenance differs from the "
-                "verified manifest"
+                "TrainWhitening manifest provenance differs from the verified manifest"
             )
         if whitening.cache_provenance_sha256 != config.cache_sha256:
             raise ValueError(
-                "TrainWhitening cache provenance differs from the "
-                "verified cache"
+                "TrainWhitening cache provenance differs from the verified cache"
             )
         rows = whitening.canonical_train_rows
         if (
@@ -592,14 +614,10 @@ def _candidate_identity(
             or any(type(row) is not int or row < 0 for row in rows)
             or len(set(rows)) != len(rows)
         ):
-            raise ValueError(
-                "TrainWhitening canonical train rows are invalid"
-            )
+            raise ValueError("TrainWhitening canonical train rows are invalid")
     else:
         if whitening_payload is not None:
-            raise ValueError(
-                "whitening-off forbids a whitening payload"
-            )
+            raise ValueError("whitening-off forbids a whitening payload")
         whitening = None
 
     whitening_payload_sha256 = (
@@ -610,6 +628,7 @@ def _candidate_identity(
         config_id=config_id,
         subject=subject,
         seed=seed,
+        environment_binding=environment_binding,
         baseline_config_sha256=config.semantic.sha256,
         stage2_config_sha256=(
             config.stage2_semantic.sha256 if stage_number == 2 else None
@@ -634,13 +653,9 @@ def _candidate_identity(
     }
     for key, expected in expected_resolved.items():
         if candidate[key] != expected:
-            raise ValueError(
-                f"candidate_spec {key} differs from fixed resolution"
-            )
+            raise ValueError(f"candidate_spec {key} differs from fixed resolution")
     if checkpoint_config != resolved.semantic_config_sha256:
-        raise ValueError(
-            "checkpoint semantic config differs from fixed resolution"
-        )
+        raise ValueError("checkpoint semantic config differs from fixed resolution")
 
     for key in (
         "full_task_initialization_sha256",
@@ -654,13 +669,9 @@ def _candidate_identity(
         candidate["shared_parameter_intersection_name"],
         "candidate_spec shared_parameter_intersection_name",
     )
-    if candidate["data_order_sha256"] != checkpoint_payload.get(
-        "data_order_sha256"
-    ):
+    if candidate["data_order_sha256"] != checkpoint_payload.get("data_order_sha256"):
         raise ValueError("candidate_spec data-order mismatch")
-    if candidate["trajectory_sha256"] != checkpoint_payload.get(
-        "trajectory_sha256"
-    ):
+    if candidate["trajectory_sha256"] != checkpoint_payload.get("trajectory_sha256"):
         raise ValueError("candidate_spec trajectory mismatch")
     return CandidateIdentity(
         payload=candidate,
@@ -684,9 +695,7 @@ def _run_manifest_identity(
     run = _require_mapping(value, "run_manifest")
     _require_exact_keys(run, _RUN_MANIFEST_KEYS, "run_manifest")
     if type(run["schema_version"]) is not int:
-        raise ValueError(
-            "run_manifest schema_version must be an integer"
-        )
+        raise ValueError("run_manifest schema_version must be an integer")
     if run["schema_version"] != 1:
         raise ValueError("run_manifest schema_version must equal 1")
     if run["payload_type"] != RUN_PAYLOAD_TYPE:
@@ -700,11 +709,7 @@ def _run_manifest_identity(
         raise ValueError("run_manifest subject must be in 1..10")
     if run["seed"] < 0:
         raise ValueError("run_manifest seed must be non-negative")
-    body = {
-        key: run[key]
-        for key in _RUN_MANIFEST_KEYS
-        if key != "run_manifest_sha256"
-    }
+    body = {key: run[key] for key in _RUN_MANIFEST_KEYS if key != "run_manifest_sha256"}
     if sha256_json(body) != _require_sha256(
         run["run_manifest_sha256"],
         "run_manifest_sha256",
@@ -720,9 +725,7 @@ def _run_manifest_identity(
         "cache_sha256": config.cache_sha256,
         "upstream_sha": PINNED_UPSTREAM_SHA,
         "data_order_sha256": checkpoint_payload["data_order_sha256"],
-        "candidate_spec_sha256": candidate.payload[
-            "candidate_spec_sha256"
-        ],
+        "candidate_spec_sha256": candidate.payload["candidate_spec_sha256"],
         "run_key": candidate.payload["run_key"],
     }
     for key, expected_value in expected.items():
@@ -751,6 +754,7 @@ def _evaluation_identity(
         "loaded checkpoint SHA-256",
     )
     checkpoint_identity(payload, subject=subject, seed=seed)
+    environment = validate_environment_binding(payload.get("environment"))
     epoch = payload.get("epoch")
     if type(epoch) is not int:
         raise ValueError("checkpoint epoch must be an integer")
@@ -762,9 +766,7 @@ def _evaluation_identity(
     )
     epoch_complete = runtime_state.get("epoch_complete")
     if type(epoch_complete) is not bool:
-        raise ValueError(
-            "checkpoint epoch_complete must be boolean"
-        )
+        raise ValueError("checkpoint epoch_complete must be boolean")
     if epoch_complete is not True:
         raise ValueError("checkpoint epoch_complete must be true")
     if type(runtime_state.get("next_epoch")) is not int:
@@ -786,6 +788,7 @@ def _evaluation_identity(
         config=config,
         checkpoint_payload=payload,
         input_hashes=input_hashes,
+        environment_binding=environment,
     )
     run_manifest = _run_manifest_identity(
         payload.get("run_manifest"),
@@ -802,6 +805,7 @@ def _evaluation_identity(
         candidate=candidate,
         run_manifest=run_manifest,
         input_hashes=input_hashes,
+        environment=environment,
     )
 
 
@@ -851,12 +855,9 @@ def _build_model(
     paths: EvaluationPaths,
     subject: int,
     seed: int,
-    device: str,
+    device: str | torch.device,
+    components: object,
 ) -> SAMGARuntimeModel:
-    components = load_locked_upstream_components(
-        config.upstream_root,
-        config.upstream_commit,
-    )
     candidate = identity.candidate
     spec = TrainingCellSpec(
         components=components,
@@ -865,28 +866,24 @@ def _build_model(
         stage=candidate.stage_number,
         subject=subject,
         seed=seed,
+        environment=identity.environment,
         config_sha256=identity.checkpoint_payload["config_sha256"],
         schedule_sha256=identity.checkpoint_payload["schedule_sha256"],
-        trajectory_sha256=identity.checkpoint_payload[
-            "trajectory_sha256"
-        ],
-        data_order_sha256=identity.checkpoint_payload[
-            "data_order_sha256"
-        ],
+        trajectory_sha256=identity.checkpoint_payload["trajectory_sha256"],
+        data_order_sha256=identity.checkpoint_payload["data_order_sha256"],
         input_hashes=identity.input_hashes,
         run_manifest=identity.run_manifest,
         candidate_spec=candidate.payload,
         checkpoint_builder=_unused_checkpoint_operation,
         checkpoint_restorer=_unused_checkpoint_operation,
         checkpoint_sink=_unused_checkpoint_operation,
+        resume_source_checkpoint_sha256=None,
         batch_size=config.batch_size,
         num_workers=0,
         device=device,
         layernorm_config_id=candidate.payload["layernorm_config_id"],
         whitening_config_id=candidate.payload["whitening_config_id"],
-        preprojector_config_id=candidate.payload[
-            "preprojector_config_id"
-        ],
+        preprojector_config_id=candidate.payload["preprojector_config_id"],
         adapter_kind=candidate.payload["adapter_kind"],
         adapter_rank=candidate.payload["adapter_rank"],
         adapter_lr_ratio=candidate.payload["adapter_lr_ratio"],
@@ -902,13 +899,10 @@ def _build_model(
         if not isinstance(sealed, Mapping):
             raise AssertionError("whitening candidate lost sealed payload")
         after_load = candidate.whitening.to_payload()
-        if (
-            after_load != dict(sealed)
-            or sha256_json(after_load) != sha256_json(dict(sealed))
+        if after_load != dict(sealed) or sha256_json(after_load) != sha256_json(
+            dict(sealed)
         ):
-            raise ValueError(
-                "TrainWhitening payload changed after model load"
-            )
+            raise ValueError("TrainWhitening payload changed after model load")
     return model
 
 
@@ -949,17 +943,17 @@ def _verify_output_directory(
     run_key: str,
 ) -> None:
     if output_dir.name not in _SCORE_ROLES:
-        raise ValueError(
-            "evaluation output leaf must be a locked parity role"
-        )
+        raise ValueError("evaluation output leaf must be a locked parity role")
     if output_dir.parent.name != run_key:
-        raise ValueError(
-            "evaluation output parent must equal candidate run_key"
-        )
+        raise ValueError("evaluation output parent must equal candidate run_key")
 
 
 def run_evaluation(arguments: argparse.Namespace) -> int:
+    runtime = require_production_runtime(arguments.device)
+    git_sha = clean_repository_git_sha()
+    runtime_environment = validate_environment_binding(runtime.environment_binding)
     paths = _guard_paths(arguments)
+    upstream_preflight = _preflight_upstream_config(paths.config)
     manifest = load_development_manifest_identity(
         paths.manifest,
         expected_subject=arguments.subject,
@@ -970,6 +964,7 @@ def run_evaluation(arguments: argparse.Namespace) -> int:
         paths.config,
         paths.feature_cache,
         manifest=manifest,
+        preflight=upstream_preflight,
     )
     loaded_checkpoint = _load_official_checkpoint(
         paths,
@@ -982,6 +977,12 @@ def run_evaluation(arguments: argparse.Namespace) -> int:
         subject=arguments.subject,
         seed=arguments.seed,
     )
+    if identity.environment != runtime_environment:
+        raise ValueError("checkpoint environment differs from production runtime")
+    if identity.run_manifest["git_sha"] != git_sha:
+        raise ValueError(
+            "checkpoint run_manifest git_sha differs from evaluator Git SHA"
+        )
     _verify_output_directory(
         paths.output_dir,
         run_key=str(identity.candidate.payload["run_key"]),
@@ -1008,18 +1009,16 @@ def run_evaluation(arguments: argparse.Namespace) -> int:
         paths.config,
         paths.feature_cache,
         manifest=rebound_manifest,
+        preflight=upstream_preflight,
     )
     if (
         rebound_config.semantic.sha256 != config.semantic.sha256
         or rebound_config.semantic.canonical_payload()
         != config.semantic.canonical_payload()
         or rebound_config.protocol.sha256 != config.protocol.sha256
-        or rebound_config.stage2_semantic.sha256
-        != config.stage2_semantic.sha256
+        or rebound_config.stage2_semantic.sha256 != config.stage2_semantic.sha256
     ):
-        raise ValueError(
-            "verified config identity changed during dataset load"
-        )
+        raise ValueError("verified config identity changed during dataset load")
     _verify_dataset(
         dataset,
         manifest=manifest,
@@ -1033,28 +1032,20 @@ def run_evaluation(arguments: argparse.Namespace) -> int:
         paths=paths,
         subject=arguments.subject,
         seed=arguments.seed,
-        device=arguments.device,
+        device=runtime.device,
+        components=upstream_preflight.components,
     )
     result = evaluate_development_model(
         model,
         dataset,
         batch_size=config.batch_size,
-        device=arguments.device,
+        device=runtime.device,
         seed=arguments.seed,
     )
-    source_records = [
-        {
-            "manifest_sha256": manifest.manifest_sha256,
-            "records_sha256": manifest.records_sha256,
-            "role": "val-dev",
-            "role_payload_sha256": manifest.val_dev_role_sha256,
-            "source_manifest_sha256": manifest.source_manifest_sha256,
-            "run_key": identity.candidate.payload["run_key"],
-            "source_payload_path": str(manifest.source_payload_path),
-            "source_payload_sha256": manifest.source_payload_sha256,
-            "source_payload_byte_count": manifest.source_payload_byte_count,
-        }
-    ]
+    source_records = development_score_source_records(
+        manifest,
+        run_key=str(identity.candidate.payload["run_key"]),
+    )
     ScoreArtifact.save(
         paths.output_dir,
         result.similarity,
@@ -1062,10 +1053,8 @@ def run_evaluation(arguments: argparse.Namespace) -> int:
         tuple(dataset.gallery_ids),
         {
             "checkpoint_sha256": identity.checkpoint_sha256,
-            "config_sha256": identity.checkpoint_payload[
-                "config_sha256"
-            ],
-            "git_sha": identity.run_manifest["git_sha"],
+            "config_sha256": identity.checkpoint_payload["config_sha256"],
+            "git_sha": git_sha,
             "protocol_sha256": manifest.protocol_sha256,
             "seed": arguments.seed,
             "source_records": source_records,
@@ -1134,11 +1123,7 @@ def _stage2_registry_identities(
         identity = (
             default[0],
             default[1],
-            (
-                str(entry["config_id"])
-                if mode == "separate_per_layer"
-                else default[2]
-            ),
+            (str(entry["config_id"]) if mode == "separate_per_layer" else default[2]),
             *default[3:],
         )
         add(entry.get("config_id"), identity)
@@ -1174,9 +1159,7 @@ def _stage2_registry_identities(
         rank = entry.get("rank")
         ratio = entry.get("learning_rate_ratio")
         if type(rank) is not int or type(ratio) is not float:
-            raise ValueError(
-                "Stage 2 adapter candidate rank/LR types are invalid"
-            )
+            raise ValueError("Stage 2 adapter candidate rank/LR types are invalid")
         add(
             entry.get("config_id"),
             (
@@ -1212,9 +1195,7 @@ def _stage2_registry_identities(
             binding_rank = binding.get("rank")
             binding_ratio = binding.get("learning_rate_ratio")
             if type(binding_rank) is not int or type(binding_ratio) is not float:
-                raise ValueError(
-                    "Stage 2 adapter control rank/LR types are invalid"
-                )
+                raise ValueError("Stage 2 adapter control rank/LR types are invalid")
             add(
                 control_id,
                 (
@@ -1227,8 +1208,7 @@ def _stage2_registry_identities(
                 ),
             )
     return {
-        config_id: frozenset(identities)
-        for config_id, identities in allowed.items()
+        config_id: frozenset(identities) for config_id, identities in allowed.items()
     }
 
 

@@ -20,6 +20,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from .runtime_contract import require_pinned_semantic_environment
 
 import numpy as np
 
@@ -29,6 +30,45 @@ from .hashing import canonical_json_bytes, ordered_ids_sha256, sha256_json
 
 SCORE_PAYLOAD_TYPE = "samga_brain_rw.score_matrix"
 SCORE_SCOPE = "val-dev"
+BRAINRW_TERMINAL_STAGE = "brainrw-clip-lora"
+TRAINING_SMOKE_STAGE = "training_smoke/in_loop"
+_EVALUATION_RUNTIME_KEYS = frozenset(
+    {
+        "evaluation_semantic_environment",
+        "evaluation_semantic_environment_sha256",
+        "training_semantic_environment",
+        "training_semantic_environment_sha256",
+        "evaluation_runtime_contract",
+        "evaluation_runtime_contract_sha256",
+        "evaluation_runtime_evidence",
+        "evaluation_runtime_evidence_sha256",
+    }
+)
+_TRAINING_PROGRESS_KEYS = frozenset(
+    {"global_step", "planned_steps", "training_complete"}
+)
+_BRAINRW_RUNTIME_CONTRACT = {
+    "accelerator": "NVIDIA A40",
+    "device_type": "cuda",
+    "dtype": "bfloat16",
+    "schema_version": 1,
+}
+_BRAINRW_RUNTIME_EVIDENCE_KEYS = frozenset(
+    {
+        "accelerator_name",
+        "bf16_supported",
+        "cuda_available",
+        "cuda_capability",
+        "cuda_device_count",
+        "cuda_device_index",
+        "cuda_version",
+        "device_type",
+        "dtype",
+        "schema_version",
+        "torch_version",
+        "total_memory_bytes",
+    }
+)
 _BUNDLE_FILES = frozenset(
     {"metadata.json", "predictions.csv", "similarity.npy"}
 )
@@ -237,6 +277,20 @@ class ScoreArtifact:
             "stage": source["stage"],
             "subject": source["subject"],
         }
+        if source["stage"] == TRAINING_SMOKE_STAGE:
+            provenance.update(
+                {
+                    key: source[key]
+                    for key in _TRAINING_PROGRESS_KEYS
+                }
+            )
+        if source["stage"] == BRAINRW_TERMINAL_STAGE:
+            provenance.update(
+                {
+                    key: source[key]
+                    for key in _EVALUATION_RUNTIME_KEYS
+                }
+            )
         metric_payload = _metrics_payload(metrics)
         bound_metadata = {
             "checkpoint_sha256": source["checkpoint_sha256"],
@@ -263,6 +317,20 @@ class ScoreArtifact:
             "stage": source["stage"],
             "subject": source["subject"],
         }
+        if source["stage"] == TRAINING_SMOKE_STAGE:
+            bound_metadata.update(
+                {
+                    key: source[key]
+                    for key in _TRAINING_PROGRESS_KEYS
+                }
+            )
+        if source["stage"] == BRAINRW_TERMINAL_STAGE:
+            bound_metadata.update(
+                {
+                    key: source[key]
+                    for key in _EVALUATION_RUNTIME_KEYS
+                }
+            )
         envelope = {
             "schema_version": 1,
             "payload_type": SCORE_PAYLOAD_TYPE,
@@ -520,7 +588,12 @@ def _validate_input_metadata(
 ) -> dict[str, object]:
     if not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping")
-    _strict_keys(metadata, _INPUT_METADATA_KEYS, "score metadata input")
+    expected_keys = _INPUT_METADATA_KEYS
+    if metadata.get("stage") == TRAINING_SMOKE_STAGE:
+        expected_keys = expected_keys | _TRAINING_PROGRESS_KEYS
+    if metadata.get("stage") == BRAINRW_TERMINAL_STAGE:
+        expected_keys = expected_keys | _EVALUATION_RUNTIME_KEYS
+    _strict_keys(metadata, expected_keys, "score metadata input")
     cloned = _json_clone(dict(metadata), "score metadata input")
     if not isinstance(cloned, dict):
         raise AssertionError("JSON-cloned metadata must be an object")
@@ -537,6 +610,10 @@ def _validate_input_metadata(
     stage = cloned["stage"]
     if not isinstance(stage, str) or not stage:
         raise ValueError("stage must be a non-empty string")
+    if stage == TRAINING_SMOKE_STAGE:
+        _validate_training_smoke_progress(cloned)
+    if stage == BRAINRW_TERMINAL_STAGE:
+        _validate_evaluation_runtime_attestation(cloned)
     if cloned["split_role"] != SCORE_SCOPE:
         raise ValueError("score artifacts are restricted to val-dev")
     source_records = cloned["source_records"]
@@ -555,6 +632,120 @@ def _metrics_payload(metrics: RetrievalMetrics) -> dict[str, object]:
         "top5_count": metrics.top5_count,
         "top5_rate": metrics.top5_rate,
     }
+
+
+def _validate_training_smoke_progress(
+    value: Mapping[str, object],
+) -> None:
+    if value.get("training_complete") is not False:
+        raise ValueError(
+            "training-smoke score must declare training_complete=false"
+        )
+    global_step = _require_positive_int(
+        value.get("global_step"),
+        "global_step",
+    )
+    planned_steps = _require_positive_int(
+        value.get("planned_steps"),
+        "planned_steps",
+    )
+    if global_step >= planned_steps:
+        raise ValueError(
+            "training-smoke score must precede the planned terminal step"
+        )
+
+
+def _validate_evaluation_runtime_attestation(
+    value: Mapping[str, object],
+) -> None:
+    semantic_environments: dict[str, dict[str, object]] = {}
+    for role in ("training", "evaluation"):
+        environment = require_pinned_semantic_environment(
+            value.get(f"{role}_semantic_environment")
+        )
+        claimed_sha256 = _require_sha256(
+            value.get(f"{role}_semantic_environment_sha256"),
+            f"{role}_semantic_environment_sha256",
+        )
+        if sha256_json(environment) != claimed_sha256:
+            raise ValueError(
+                f"{role} semantic environment hash mismatch"
+            )
+        semantic_environments[role] = environment
+    if (
+        semantic_environments["training"]
+        != semantic_environments["evaluation"]
+    ):
+        raise ValueError(
+            "training and evaluation semantic environments differ"
+        )
+    contract = _require_mapping(
+        value.get("evaluation_runtime_contract"),
+        "evaluation runtime contract",
+    )
+    if dict(contract) != _BRAINRW_RUNTIME_CONTRACT:
+        raise ValueError(
+            "evaluation runtime contract is not CUDA+bfloat16+A40"
+        )
+    contract_sha256 = _require_sha256(
+        value.get("evaluation_runtime_contract_sha256"),
+        "evaluation_runtime_contract_sha256",
+    )
+    if sha256_json(contract) != contract_sha256:
+        raise ValueError("evaluation runtime contract hash mismatch")
+
+    evidence = _require_mapping(
+        value.get("evaluation_runtime_evidence"),
+        "evaluation runtime evidence",
+    )
+    _strict_keys(
+        evidence,
+        _BRAINRW_RUNTIME_EVIDENCE_KEYS,
+        "evaluation runtime evidence",
+    )
+    evidence_sha256 = _require_sha256(
+        value.get("evaluation_runtime_evidence_sha256"),
+        "evaluation_runtime_evidence_sha256",
+    )
+    if sha256_json(evidence) != evidence_sha256:
+        raise ValueError("evaluation runtime evidence hash mismatch")
+    if (
+        evidence["schema_version"] != 1
+        or evidence["cuda_available"] is not True
+        or evidence["bf16_supported"] is not True
+        or evidence["accelerator_name"] != contract["accelerator"]
+        or evidence["device_type"] != contract["device_type"]
+        or evidence["dtype"] != contract["dtype"]
+    ):
+        raise ValueError(
+            "evaluation runtime evidence differs from the contract"
+        )
+    capability = evidence["cuda_capability"]
+    if not isinstance(capability, list) or capability != [8, 6]:
+        raise ValueError(
+            "evaluation runtime evidence is not an A40 capability"
+        )
+    device_count = _require_positive_int(
+        evidence["cuda_device_count"],
+        "evaluation CUDA device count",
+    )
+    device_index = _require_nonnegative_int(
+        evidence["cuda_device_index"],
+        "evaluation CUDA device index",
+    )
+    if device_index >= device_count:
+        raise ValueError(
+            "evaluation CUDA device index is out of range"
+        )
+    _require_positive_int(
+        evidence["total_memory_bytes"],
+        "evaluation CUDA total memory",
+    )
+    for key in ("cuda_version", "torch_version"):
+        if not isinstance(evidence[key], str) or not evidence[key]:
+            raise ValueError(
+                f"evaluation runtime evidence {key} is invalid"
+            )
 
 
 def _predictions_csv_bytes(metrics: RetrievalMetrics) -> bytes:
@@ -601,8 +792,18 @@ def _validate_envelope(
 
     bound = _require_mapping(envelope["metadata"], "score bound metadata")
     provenance = _require_mapping(envelope["provenance"], "score provenance")
-    _strict_keys(bound, _BOUND_METADATA_KEYS, "score bound metadata")
-    _strict_keys(provenance, _PROVENANCE_KEYS, "score provenance")
+    bound_keys = _BOUND_METADATA_KEYS
+    if bound.get("stage") == TRAINING_SMOKE_STAGE:
+        bound_keys = bound_keys | _TRAINING_PROGRESS_KEYS
+    if bound.get("stage") == BRAINRW_TERMINAL_STAGE:
+        bound_keys = bound_keys | _EVALUATION_RUNTIME_KEYS
+    provenance_keys = _PROVENANCE_KEYS
+    if provenance.get("stage") == TRAINING_SMOKE_STAGE:
+        provenance_keys = provenance_keys | _TRAINING_PROGRESS_KEYS
+    if provenance.get("stage") == BRAINRW_TERMINAL_STAGE:
+        provenance_keys = provenance_keys | _EVALUATION_RUNTIME_KEYS
+    _strict_keys(bound, bound_keys, "score bound metadata")
+    _strict_keys(provenance, provenance_keys, "score provenance")
     if sha256_json(bound) != _require_sha256(
         envelope["metadata_sha256"], "metadata_sha256"
     ):
@@ -659,7 +860,7 @@ def _validate_envelope(
         raise ValueError("source-record SHA-256 provenance mismatch")
     _reject_formal_scope_markers(source_records, path=("source_records",))
 
-    for key in (
+    identity_keys = [
         "checkpoint_sha256",
         "config_sha256",
         "git_sha",
@@ -667,7 +868,12 @@ def _validate_envelope(
         "seed",
         "stage",
         "subject",
-    ):
+    ]
+    if bound["stage"] == TRAINING_SMOKE_STAGE:
+        identity_keys.extend(sorted(_TRAINING_PROGRESS_KEYS))
+    if bound["stage"] == BRAINRW_TERMINAL_STAGE:
+        identity_keys.extend(sorted(_EVALUATION_RUNTIME_KEYS))
+    for key in identity_keys:
         if bound[key] != provenance[key]:
             raise ValueError(f"{key} provenance binding mismatch")
     _validate_bound_identity_values(bound)
@@ -731,6 +937,10 @@ def _validate_bound_identity_values(bound: Mapping[str, object]) -> None:
         raise ValueError("subject must be between 1 and 10")
     if not isinstance(bound["stage"], str) or not bound["stage"]:
         raise ValueError("stage must be a non-empty string")
+    if bound["stage"] == TRAINING_SMOKE_STAGE:
+        _validate_training_smoke_progress(bound)
+    if bound["stage"] == BRAINRW_TERMINAL_STAGE:
+        _validate_evaluation_runtime_attestation(bound)
 
 
 def _validate_declared_metrics(

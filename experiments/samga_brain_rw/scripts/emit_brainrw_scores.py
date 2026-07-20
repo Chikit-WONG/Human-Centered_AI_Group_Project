@@ -9,10 +9,11 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-import torch
-
 from samga_brain_rw import brainrw as br
-from samga_brain_rw.scores import ScoreArtifact
+from samga_brain_rw.scores import (
+    BRAINRW_TERMINAL_STAGE,
+    ScoreArtifact,
+)
 
 
 _GIT_SHA_RE = re.compile(
@@ -120,6 +121,50 @@ def _validate_args(args: argparse.Namespace) -> Path:
     return output
 
 
+def _require_checkpoint_environment(
+    payload: Mapping[str, object],
+    runtime: br.BrainRWProductionRuntime,
+) -> None:
+    semantic_environment = payload.get("semantic_environment")
+    if (
+        not isinstance(semantic_environment, Mapping)
+        or dict(semantic_environment)
+        != dict(runtime.semantic_environment)
+        or payload.get("semantic_environment_sha256")
+        != runtime.semantic_environment_sha256
+    ):
+        raise ValueError(
+            "checkpoint and evaluation semantic environments differ"
+        )
+    runtime_contract = payload.get("runtime_contract")
+    if (
+        not isinstance(runtime_contract, Mapping)
+        or dict(runtime_contract) != dict(runtime.contract)
+        or payload.get("runtime_contract_sha256")
+        != runtime.contract_sha256
+    ):
+        raise ValueError(
+            "checkpoint and evaluation runtime contracts differ"
+        )
+
+
+def _require_terminal_checkpoint(
+    payload: Mapping[str, object],
+) -> None:
+    global_step = payload.get("global_step")
+    planned_steps = payload.get("planned_steps")
+    if (
+        payload.get("complete") is not True
+        or payload.get("training_complete") is not True
+        or type(global_step) is not int
+        or type(planned_steps) is not int
+        or global_step <= 0
+        or global_step != planned_steps
+    ):
+        raise ValueError(
+            "score emission requires a terminal complete training checkpoint"
+        )
+
 def _validate_identities(
     checkpoint: br.LoadedBrainRWCheckpoint,
     manifest: br.ManifestIdentity,
@@ -151,14 +196,7 @@ def _validate_identities(
         subject=subject,
         seed=seed,
     )
-    if (
-        payload.get("training_complete") is not True
-        or payload.get("global_step")
-        != payload.get("planned_steps")
-    ):
-        raise ValueError(
-            "score emission requires a terminal complete training checkpoint"
-        )
+    _require_terminal_checkpoint(payload)
     checkpoint_git = payload.get("git_provenance")
     if (
         not isinstance(checkpoint_git, Mapping)
@@ -170,6 +208,16 @@ def _validate_identities(
 
 
 def run(args: argparse.Namespace) -> ScoreArtifact:
+    runtime = br.probe_brainrw_production_runtime()
+    checkpoint = br.load_brainrw_checkpoint(
+        args.checkpoint,
+        requested_scope="val-dev",
+    )
+    _require_checkpoint_environment(
+        checkpoint.payload,
+        runtime,
+    )
+    _require_terminal_checkpoint(checkpoint.payload)
     output = _validate_args(args)
     initial_git_provenance = _git_provenance()
     # Both metadata-bearing artifacts are verified before constructing a
@@ -177,10 +225,6 @@ def run(args: argparse.Namespace) -> ScoreArtifact:
     manifest = br.load_development_manifest_identity(
         args.manifest,
         expected_subject=args.subject,
-    )
-    checkpoint = br.load_brainrw_checkpoint(
-        args.checkpoint,
-        requested_scope="val-dev",
     )
     config_path = checkpoint.payload.get("config_path")
     clip_path = checkpoint.payload.get("clip_path")
@@ -208,10 +252,8 @@ def run(args: argparse.Namespace) -> ScoreArtifact:
     model, processor = br.build_model_from_checkpoint(
         checkpoint.payload
     )
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    dtype = br.checkpoint_runtime_dtype(checkpoint.payload, device)
+    device = runtime.device
+    dtype = runtime.dtype
     config_payload = checkpoint.payload.get(
         "config_payload", {}
     )
@@ -279,12 +321,32 @@ def run(args: argparse.Namespace) -> ScoreArtifact:
             "config_sha256": checkpoint.payload[
                 "config_sha256"
             ],
+            "training_semantic_environment": dict(
+                checkpoint.payload["semantic_environment"]
+            ),
+            "training_semantic_environment_sha256": (
+                checkpoint.payload["semantic_environment_sha256"]
+            ),
+            "evaluation_semantic_environment": dict(
+                runtime.semantic_environment
+            ),
+            "evaluation_semantic_environment_sha256": (
+                runtime.semantic_environment_sha256
+            ),
+            "evaluation_runtime_contract": dict(runtime.contract),
+            "evaluation_runtime_contract_sha256": (
+                runtime.contract_sha256
+            ),
+            "evaluation_runtime_evidence": dict(runtime.evidence),
+            "evaluation_runtime_evidence_sha256": (
+                runtime.evidence_sha256
+            ),
             "git_sha": checkpoint.payload["git_sha"],
             "protocol_sha256": manifest.protocol_sha256,
             "seed": args.seed,
             "source_records": source_records,
             "split_role": "val-dev",
-            "stage": "brainrw-clip-lora",
+            "stage": BRAINRW_TERMINAL_STAGE,
             "subject": args.subject,
         },
     )

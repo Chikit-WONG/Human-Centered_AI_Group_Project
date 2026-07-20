@@ -8,26 +8,23 @@ PyTorch payload loading.
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import io
 import json
 import math
 import os
-import platform
 import random
 import re
-import socket
 import stat
-import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, MethodType
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_checkpoint
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset, Sampler
 
@@ -39,6 +36,10 @@ from .data import (
     inspect_source_payload_identity,
 )
 from .hashing import canonical_json_bytes, ordered_ids_sha256, sha256_json
+from .runtime_contract import (
+    capture_semantic_environment,
+    require_pinned_semantic_environment,
+)
 
 
 CLIP_LORA_TARGETS = (
@@ -109,7 +110,13 @@ _BRAINRW_CHECKPOINT_KEYS = frozenset(
         "resumed_from_sha256",
         "rng_state",
         "run_key",
+        "runtime_contract",
+        "runtime_contract_sha256",
         "runtime_dtype",
+        "runtime_evidence",
+        "runtime_evidence_sha256",
+        "semantic_environment",
+        "semantic_environment_sha256",
         "sampler_state",
         "scheduler_state",
         "schema_version",
@@ -134,12 +141,100 @@ _BRAINRW_INPUT_HASH_KEYS = frozenset(
         "manifest",
         "protocol",
         "records",
+        "semantic_environment",
         "source_manifest",
         "source_payload",
         "train_role",
         "val_dev_role",
     }
 )
+_BRAINRW_RUNTIME_CONTRACT = MappingProxyType(
+    {
+        "accelerator": "NVIDIA A40",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+    }
+)
+_BRAINRW_RUNTIME_EVIDENCE_KEYS = frozenset(
+    {
+        "accelerator_name",
+        "bf16_supported",
+        "cuda_available",
+        "cuda_capability",
+        "cuda_device_count",
+        "cuda_device_index",
+        "cuda_version",
+        "device_type",
+        "dtype",
+        "schema_version",
+        "torch_version",
+        "total_memory_bytes",
+    }
+)
+
+
+@dataclass(frozen=True)
+class BrainRWProductionRuntime:
+    device: torch.device
+    dtype: torch.dtype
+    contract: Mapping[str, object]
+    contract_sha256: str
+    semantic_environment: Mapping[str, object]
+    semantic_environment_sha256: str
+    evidence: Mapping[str, object]
+    evidence_sha256: str
+
+
+def probe_brainrw_production_runtime() -> BrainRWProductionRuntime:
+    semantic_environment = require_pinned_semantic_environment(
+        capture_semantic_environment()
+    )
+    if not torch.cuda.is_available():
+        raise RuntimeError("Brain-RW production runtime requires CUDA")
+    device_count = int(torch.cuda.device_count())
+    device_index = int(torch.cuda.current_device())
+    if device_count <= 0 or not 0 <= device_index < device_count:
+        raise RuntimeError("Brain-RW CUDA device identity is invalid")
+    properties = torch.cuda.get_device_properties(device_index)
+    accelerator_name = str(properties.name)
+    if accelerator_name != _BRAINRW_RUNTIME_CONTRACT["accelerator"]:
+        raise RuntimeError("Brain-RW production runtime requires NVIDIA A40")
+    if torch.cuda.is_bf16_supported() is not True:
+        raise RuntimeError("Brain-RW production runtime requires bfloat16")
+    cuda_version = torch.version.cuda
+    if not isinstance(cuda_version, str) or not cuda_version:
+        raise RuntimeError("Brain-RW CUDA version evidence is unavailable")
+    evidence = {
+        "accelerator_name": accelerator_name,
+        "bf16_supported": True,
+        "cuda_available": True,
+        "cuda_capability": [
+            int(properties.major),
+            int(properties.minor),
+        ],
+        "cuda_device_count": device_count,
+        "cuda_device_index": device_index,
+        "cuda_version": cuda_version,
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+        "torch_version": str(torch.__version__),
+        "total_memory_bytes": int(properties.total_memory),
+    }
+    contract = dict(_BRAINRW_RUNTIME_CONTRACT)
+    return BrainRWProductionRuntime(
+        device=torch.device("cuda", device_index),
+        dtype=torch.bfloat16,
+        contract=MappingProxyType(contract),
+        contract_sha256=sha256_json(contract),
+        semantic_environment=MappingProxyType(
+            semantic_environment
+        ),
+        semantic_environment_sha256=sha256_json(semantic_environment),
+        evidence=MappingProxyType(evidence),
+        evidence_sha256=sha256_json(evidence),
+    )
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -431,6 +526,85 @@ def _inject_exact_clip_lora(
     return resolved, tuple(manifest)
 
 
+def _explicit_checkpointed_clip_layer_forward(
+    layer: nn.Module,
+    *args: object,
+    **kwargs: object,
+) -> object:
+    original_forward = object.__getattribute__(
+        layer,
+        "_brainrw_original_forward",
+    )
+    if layer.training and torch.is_grad_enabled():
+        return torch_checkpoint.checkpoint(
+            original_forward,
+            *args,
+            use_reentrant=False,
+            **kwargs,
+        )
+    return original_forward(*args, **kwargs)
+
+
+def _enable_vision_gradient_checkpointing(
+    vision_model: nn.Module,
+) -> dict[str, object]:
+    try:
+        encoder = vision_model.get_submodule(
+            "vision_model.encoder"
+        )
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(
+            "CLIP vision model lacks the locked encoder target"
+        ) from exc
+    layers = getattr(encoder, "layers", None)
+    configured_layers = getattr(
+        getattr(vision_model, "config", None),
+        "num_hidden_layers",
+        None,
+    )
+    if (
+        not isinstance(layers, nn.ModuleList)
+        or not layers
+        or type(configured_layers) is not int
+        or configured_layers != len(layers)
+    ):
+        raise RuntimeError(
+            "CLIP vision encoder layers differ from the locked target"
+        )
+    for layer in layers:
+        if (
+            not isinstance(layer, nn.Module)
+            or not callable(getattr(layer, "forward", None))
+            or hasattr(layer, "_brainrw_original_forward")
+        ):
+            raise RuntimeError(
+                "CLIP vision layer cannot be checkpoint-wrapped exactly"
+            )
+    for layer in layers:
+        original_forward = layer.forward
+        object.__setattr__(
+            layer,
+            "_brainrw_original_forward",
+            original_forward,
+        )
+        object.__setattr__(
+            layer,
+            "forward",
+            MethodType(
+                _explicit_checkpointed_clip_layer_forward,
+                layer,
+            ),
+        )
+    return {
+        "enabled": True,
+        "method": "explicit_per_layer_torch_utils_checkpoint",
+        "requested": True,
+        "target": "vision_model.encoder.layers",
+        "use_reentrant": False,
+        "wrapped_layer_count": len(layers),
+    }
+
+
 @dataclass(frozen=True)
 class BrainRWOutput:
     loss: Tensor | None
@@ -458,6 +632,9 @@ class BrainRWCLIPLoRAModel(nn.Module):
         super().__init__()
         if not isinstance(vision_model, nn.Module):
             raise TypeError("vision_model must be an nn.Module")
+        gradient_checkpointing = (
+            _enable_vision_gradient_checkpointing(vision_model)
+        )
         self.projection_dim = _positive_int(
             projection_dim, "projection_dim"
         )
@@ -496,6 +673,7 @@ class BrainRWCLIPLoRAModel(nn.Module):
                 "dropout": float(dropout),
                 "layer_norm_eps": 1e-6,
             },
+            "gradient_checkpointing": gradient_checkpointing,
             "lora": {
                 "semantic_targets": list(lora_targets),
                 "resolved_targets": list(resolved),
@@ -1030,6 +1208,7 @@ def verify_brainrw_config(
     if training != {
         "epochs": 25,
         "epoch_policy": "fixed",
+        "gradient_checkpointing": True,
         "precision": "bf16",
         "batch_size": 512,
         "trial_averaging": 4,
@@ -1084,6 +1263,7 @@ def verify_brainrw_config(
 def input_hashes(
     config: BrainRWConfigIdentity,
     manifest: ManifestIdentity,
+    semantic_environment_sha256: str,
 ) -> dict[str, str]:
     return {
         "clip_config": config.clip_config_sha256,
@@ -1093,6 +1273,10 @@ def input_hashes(
         "manifest": manifest.manifest_sha256,
         "protocol": manifest.protocol_sha256,
         "records": manifest.records_sha256,
+        "semantic_environment": _sha256(
+            semantic_environment_sha256,
+            "semantic environment hash",
+        ),
         "source_manifest": manifest.source_manifest_sha256,
         "source_payload": manifest.source_payload_sha256,
         "train_role": manifest.train_role_sha256,
@@ -1105,8 +1289,13 @@ def brainrw_run_key(
     manifest: ManifestIdentity,
     subject: int,
     seed: int,
+    semantic_environment_sha256: str,
 ) -> tuple[str, str, dict[str, str]]:
-    hashes = input_hashes(config, manifest)
+    hashes = input_hashes(
+        config,
+        manifest,
+        semantic_environment_sha256,
+    )
     bundle = sha256_json(hashes)
     key = make_run_key(
         "brainrw-clip-lora",
@@ -1179,6 +1368,14 @@ def build_brainrw_model(
     *,
     expected_preprocessor_sha256: str,
 ) -> tuple[BrainRWCLIPLoRAModel, object]:
+    training = config_payload.get("training")
+    if (
+        not isinstance(training, Mapping)
+        or training.get("gradient_checkpointing") is not True
+    ):
+        raise ValueError(
+            "Brain-RW requires locked vision gradient checkpointing"
+        )
     clip = config_payload["clip"]
     if not isinstance(clip, Mapping):
         raise ValueError("CLIP config must be a mapping")
@@ -1484,22 +1681,6 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
                 for value in cuda_state
             ]
         )
-
-
-def capture_environment() -> dict[str, object]:
-    packages = {}
-    for name in ("numpy", "torch", "transformers", "peft"):
-        try:
-            packages[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            packages[name] = None
-    return {
-        "python": sys.version,
-        "executable": sys.executable,
-        "platform": platform.platform(),
-        "hostname": socket.gethostname(),
-        "packages": packages,
-    }
 
 
 @dataclass(frozen=True)
@@ -2004,6 +2185,7 @@ def _validate_checkpoint_model_manifest(
     if set(manifest) != {
         "schema_version",
         "brain_mlp",
+        "gradient_checkpointing",
         "lora",
     }:
         raise ValueError(
@@ -2030,9 +2212,38 @@ def _validate_checkpoint_model_manifest(
         manifest["brain_mlp"],
         "model_manifest.brain_mlp",
     )
+    gradient_checkpointing = _checkpoint_mapping(
+        manifest["gradient_checkpointing"],
+        "model_manifest.gradient_checkpointing",
+    )
     lora = _checkpoint_mapping(
         manifest["lora"],
         "model_manifest.lora",
+    )
+    if (
+        set(gradient_checkpointing)
+        != {
+            "enabled",
+            "method",
+            "requested",
+            "target",
+            "use_reentrant",
+            "wrapped_layer_count",
+        }
+        or gradient_checkpointing["enabled"] is not True
+        or gradient_checkpointing["method"]
+        != "explicit_per_layer_torch_utils_checkpoint"
+        or gradient_checkpointing["requested"] is not True
+        or gradient_checkpointing["target"]
+        != "vision_model.encoder.layers"
+        or gradient_checkpointing["use_reentrant"] is not False
+    ):
+        raise ValueError(
+            "checkpoint gradient-checkpointing evidence is invalid"
+        )
+    wrapped_layer_count = _positive_int(
+        gradient_checkpointing["wrapped_layer_count"],
+        "checkpoint wrapped CLIP layer count",
     )
     if set(brain) != {
         "channels",
@@ -2110,6 +2321,25 @@ def _validate_checkpoint_model_manifest(
     ):
         raise ValueError(
             "checkpoint model LoRA targets are invalid"
+        )
+    resolved_targets = list(lora["resolved_targets"])
+    target_counts = {
+        target: sum(
+            name.rsplit(".", 1)[-1] == target
+            for name in resolved_targets
+        )
+        for target in CLIP_LORA_TARGETS
+    }
+    if (
+        target_counts["visual_projection"] != 1
+        or any(
+            target_counts[target] != wrapped_layer_count
+            for target in CLIP_LORA_TARGETS[:-1]
+        )
+        or len(resolved_targets) != wrapped_layer_count * 6 + 1
+    ):
+        raise ValueError(
+            "checkpoint gradient-checkpoint layer count differs from LoRA targets"
         )
     _positive_int(lora["rank"], "checkpoint LoRA rank")
     _positive_int(lora["alpha"], "checkpoint LoRA alpha")
@@ -2347,6 +2577,110 @@ def _validate_checkpoint_metrics(value: object) -> None:
             )
 
 
+def _validate_checkpoint_runtime_attestation(
+    value: Mapping[str, object],
+) -> None:
+    semantic_environment = require_pinned_semantic_environment(
+        value["semantic_environment"]
+    )
+    semantic_environment_sha256 = _sha256(
+        value["semantic_environment_sha256"],
+        "checkpoint semantic_environment_sha256",
+    )
+    if (
+        sha256_json(semantic_environment)
+        != semantic_environment_sha256
+    ):
+        raise ValueError(
+            "checkpoint semantic environment hash mismatch"
+        )
+    environment = _checkpoint_mapping(
+        value["environment"],
+        "environment",
+    )
+    if environment != semantic_environment:
+        raise ValueError(
+            "checkpoint environment differs from semantic environment"
+        )
+    contract = _checkpoint_mapping(
+        value["runtime_contract"],
+        "runtime_contract",
+    )
+    if contract != dict(_BRAINRW_RUNTIME_CONTRACT):
+        raise ValueError(
+            "checkpoint runtime contract is not CUDA+bfloat16+A40"
+        )
+    if _checkpoint_json_sha256(
+        contract,
+        "runtime_contract",
+    ) != _sha256(
+        value["runtime_contract_sha256"],
+        "checkpoint runtime_contract_sha256",
+    ):
+        raise ValueError("checkpoint runtime contract hash mismatch")
+
+    evidence = _checkpoint_mapping(
+        value["runtime_evidence"],
+        "runtime_evidence",
+    )
+    if set(evidence) != _BRAINRW_RUNTIME_EVIDENCE_KEYS:
+        raise ValueError(
+            "checkpoint runtime evidence has an unexpected schema"
+        )
+    if _checkpoint_json_sha256(
+        evidence,
+        "runtime_evidence",
+    ) != _sha256(
+        value["runtime_evidence_sha256"],
+        "checkpoint runtime_evidence_sha256",
+    ):
+        raise ValueError("checkpoint runtime evidence hash mismatch")
+    if (
+        evidence["schema_version"] != 1
+        or evidence["cuda_available"] is not True
+        or evidence["bf16_supported"] is not True
+        or evidence["accelerator_name"] != contract["accelerator"]
+        or evidence["device_type"] != contract["device_type"]
+        or evidence["dtype"] != contract["dtype"]
+    ):
+        raise ValueError(
+            "checkpoint runtime evidence differs from the contract"
+        )
+    capability = evidence["cuda_capability"]
+    if (
+        not isinstance(capability, list)
+        or capability != [8, 6]
+    ):
+        raise ValueError(
+            "checkpoint runtime evidence is not an A40 capability"
+        )
+    device_count = _positive_int(
+        evidence["cuda_device_count"],
+        "checkpoint CUDA device count",
+    )
+    device_index = _nonnegative_int(
+        evidence["cuda_device_index"],
+        "checkpoint CUDA device index",
+    )
+    if device_index >= device_count:
+        raise ValueError(
+            "checkpoint CUDA device index is out of range"
+        )
+    _positive_int(
+        evidence["total_memory_bytes"],
+        "checkpoint CUDA total memory",
+    )
+    for key in ("cuda_version", "torch_version"):
+        if not isinstance(evidence[key], str) or not evidence[key]:
+            raise ValueError(
+                f"checkpoint runtime evidence {key} is invalid"
+            )
+    if value["runtime_dtype"] != contract["dtype"]:
+        raise ValueError(
+            "checkpoint runtime dtype differs from runtime contract"
+        )
+
+
 def _validate_loaded_checkpoint(
     payload: object,
 ) -> dict[str, object]:
@@ -2494,6 +2828,8 @@ def _validate_loaded_checkpoint(
         or hashes["clip_preprocessor"]
         != value["clip_preprocessor_sha256"]
         or hashes["clip_weights"] != value["clip_weights_sha256"]
+        or hashes["semantic_environment"]
+        != value["semantic_environment_sha256"]
     ):
         raise ValueError(
             "checkpoint duplicated input identity mismatch"
@@ -2504,15 +2840,7 @@ def _validate_loaded_checkpoint(
         value["target_manifest_sha256"],
     )
     _validate_checkpoint_resume_state(value)
-    runtime_dtype = value["runtime_dtype"]
-    if runtime_dtype not in {"float32", "bfloat16"}:
-        raise ValueError(
-            "checkpoint runtime_dtype is invalid"
-        )
-    _checkpoint_mapping(
-        value["environment"],
-        "environment",
-    )
+    _validate_checkpoint_runtime_attestation(value)
     provenance = _checkpoint_mapping(
         value["git_provenance"],
         "git_provenance",
@@ -2580,6 +2908,7 @@ def validate_brainrw_checkpoint_identity(
             manifest,
             subject,
             seed,
+            str(value["semantic_environment_sha256"]),
         )
     )
     comparisons = {
@@ -2630,6 +2959,10 @@ def validate_brainrw_checkpoint_identity(
         model_manifest["brain_mlp"],
         "model_manifest.brain_mlp",
     )
+    gradient_checkpointing = _checkpoint_mapping(
+        model_manifest["gradient_checkpointing"],
+        "model_manifest.gradient_checkpointing",
+    )
     lora = _checkpoint_mapping(
         model_manifest["lora"],
         "model_manifest.lora",
@@ -2642,6 +2975,10 @@ def validate_brainrw_checkpoint_identity(
         config.payload["lora"],
         "config lora",
     )
+    config_training = _checkpoint_mapping(
+        config.payload["training"],
+        "config training",
+    )
     if (
         brain["channels"] != 17
         or brain["samples"] != 250
@@ -2652,6 +2989,14 @@ def validate_brainrw_checkpoint_identity(
         or lora["rank"] != config_lora["rank"]
         or lora["alpha"] != config_lora["alpha"]
         or lora["dropout"] != config_lora["dropout"]
+        or config_training.get("gradient_checkpointing") is not True
+        or gradient_checkpointing.get("requested") is not True
+        or gradient_checkpointing.get("enabled") is not True
+        or gradient_checkpointing.get("method")
+        != "explicit_per_layer_torch_utils_checkpoint"
+        or gradient_checkpointing.get("target")
+        != "vision_model.encoder.layers"
+        or gradient_checkpointing.get("use_reentrant") is not False
     ):
         raise ValueError(
             "checkpoint model manifest differs from semantic config"
@@ -2759,22 +3104,6 @@ def build_model_from_checkpoint(
     return model, processor
 
 
-def checkpoint_runtime_dtype(
-    payload: Mapping[str, object],
-    device: torch.device,
-) -> torch.dtype:
-    declared = payload.get("runtime_dtype")
-    if declared == "float32":
-        return torch.float32
-    if declared == "bfloat16":
-        if device.type != "cuda":
-            raise ValueError(
-                "bfloat16 checkpoint evaluation requires CUDA"
-            )
-        return torch.bfloat16
-    raise ValueError(
-        "checkpoint runtime_dtype must be float32 or bfloat16"
-    )
 
 
 def _model_floating_dtype(model: nn.Module) -> torch.dtype:

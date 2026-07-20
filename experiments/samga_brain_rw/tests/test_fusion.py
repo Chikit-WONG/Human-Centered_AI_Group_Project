@@ -24,7 +24,86 @@ from samga_brain_rw.fusion import (
     temperature_fusion,
 )
 from samga_brain_rw.hashing import sha256_json
+from samga_brain_rw.runtime_contract import PINNED_SEMANTIC_ENVIRONMENT
 from samga_brain_rw.scores import ScoreArtifact
+
+
+_COMMON_SOURCE_RECORD_KEYS = (
+    "manifest_sha256",
+    "records_sha256",
+    "role",
+    "role_payload_sha256",
+    "source_manifest_sha256",
+    "source_payload_byte_count",
+    "source_payload_path",
+    "source_payload_sha256",
+)
+
+
+def _common_source_record(index: int = 0) -> dict[str, object]:
+    token = f"{index + 1:x}"
+    return {
+        "manifest_sha256": token * 64,
+        "records_sha256": f"{index + 2:x}" * 64,
+        "role": "val-dev",
+        "role_payload_sha256": f"{index + 3:x}" * 64,
+        "source_manifest_sha256": f"{index + 4:x}" * 64,
+        "source_payload_byte_count": 123 + index,
+        "source_payload_path": f"/safe/sub-01/train-{index}.pt",
+        "source_payload_sha256": f"{index + 5:x}" * 64,
+    }
+
+
+def _samga_source_records(
+    *,
+    stage: str,
+    config: str,
+    subject: int,
+    seed: int,
+    common_records: tuple[dict[str, object], ...] | None = None,
+) -> list[dict[str, object]]:
+    source_stage = stage if stage in {"stage0", "stage2"} else "stage0"
+    run_key = (
+        f"{source_stage}__internvit-baseline__sub-{subject:02d}__seed-{seed}__"
+        f"config-{config}__inputs-{'9' * 64}"
+    )
+    records = common_records or (_common_source_record(),)
+    return [{**record, "run_key": run_key} for record in records]
+
+
+def _brainrw_runtime_metadata() -> dict[str, object]:
+    semantic_environment = dict(PINNED_SEMANTIC_ENVIRONMENT)
+    contract = {
+        "accelerator": "NVIDIA A40",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+    }
+    evidence = {
+        "accelerator_name": "NVIDIA A40",
+        "bf16_supported": True,
+        "cuda_available": True,
+        "cuda_capability": [8, 6],
+        "cuda_device_count": 1,
+        "cuda_device_index": 0,
+        "cuda_version": "12.8",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+        "torch_version": "2.11.0+cu128",
+        "total_memory_bytes": 48 * 1024**3,
+    }
+    semantic_environment_sha256 = sha256_json(semantic_environment)
+    return {
+        "training_semantic_environment": semantic_environment,
+        "training_semantic_environment_sha256": semantic_environment_sha256,
+        "evaluation_semantic_environment": semantic_environment,
+        "evaluation_semantic_environment_sha256": semantic_environment_sha256,
+        "evaluation_runtime_contract": contract,
+        "evaluation_runtime_contract_sha256": sha256_json(contract),
+        "evaluation_runtime_evidence": evidence,
+        "evaluation_runtime_evidence_sha256": sha256_json(evidence),
+    }
 
 
 def _metadata(
@@ -33,26 +112,48 @@ def _metadata(
     config: str,
     protocol: str = "d" * 64,
     subject: int = 1,
-    seed: int = 17,
-    stage: str = "stage-1",
-    query_ids: tuple[str, ...] = ("q0", "q1"),
+    seed: int = 42,
+    stage: str = "stage0",
+    source_records: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    return {
+    if source_records is None:
+        if stage == "brainrw-clip-lora":
+            source_records = [_common_source_record()]
+        else:
+            source_records = _samga_source_records(
+                stage=stage,
+                config=config,
+                subject=subject,
+                seed=seed,
+            )
+    metadata: dict[str, object] = {
         "checkpoint_sha256": checkpoint,
         "config_sha256": config,
         "git_sha": "c" * 40,
         "protocol_sha256": protocol,
         "seed": seed,
-        "source_records": [{"record_id": query_id} for query_id in query_ids],
+        "source_records": source_records,
         "split_role": "val-dev",
         "stage": stage,
         "subject": subject,
     }
+    if stage == "brainrw-clip-lora":
+        metadata.update(_brainrw_runtime_metadata())
+    elif stage == "training_smoke/in_loop":
+        metadata.update(
+            {
+                "global_step": 1,
+                "planned_steps": 120,
+                "training_complete": False,
+            }
+        )
+    return metadata
 
 
 def _save_pair(
     root: Path,
     *,
+    left_metadata: dict[str, object] | None = None,
     right_query_ids: tuple[str, ...] = ("q0", "q1"),
     right_gallery_ids: tuple[str, ...] = ("q0", "q1", "x"),
     right_metadata: dict[str, object] | None = None,
@@ -74,7 +175,8 @@ def _save_pair(
         internvit,
         query_ids,
         gallery_ids,
-        _metadata(checkpoint="a" * 64, config="b" * 64),
+        left_metadata
+        or _metadata(checkpoint="a" * 64, config="b" * 64),
     )
     ScoreArtifact.save(
         right_directory,
@@ -85,7 +187,7 @@ def _save_pair(
         or _metadata(
             checkpoint="e" * 64,
             config="f" * 64,
-            query_ids=right_query_ids,
+            stage="brainrw-clip-lora",
         ),
     )
     return (
@@ -411,16 +513,61 @@ def test_rrf_rejects_missing_duplicate_or_misaligned_gallery_ids() -> None:
         )
 
 
-def test_assert_aligned_accepts_distinct_branch_specific_provenance(
+@pytest.mark.parametrize("samga_stage", ["stage0", "stage2"])
+def test_assert_aligned_accepts_real_terminal_branch_schemas(
     tmp_path: Path,
+    samga_stage: str,
 ) -> None:
-    left, right = _save_pair(tmp_path)
+    left, right = _save_pair(
+        tmp_path,
+        left_metadata=_metadata(
+            checkpoint="a" * 64,
+            config="b" * 64,
+            stage=samga_stage,
+        ),
+    )
 
     assert left.verified.payload_sha256 != right.verified.payload_sha256
     assert sha256_json(_thaw(left.provenance)) != sha256_json(
         _thaw(right.provenance)
     )
+    assert left.metadata["stage"] == samga_stage
+    assert right.metadata["stage"] == "brainrw-clip-lora"
+    assert "run_key" in left.metadata["source_records"][0]
+    assert "run_key" not in right.metadata["source_records"][0]
+    assert left.metadata["source_records_sha256"] != right.metadata[
+        "source_records_sha256"
+    ]
     assert_aligned(left, right)
+
+
+def test_assert_aligned_rejects_identically_aligned_training_smoke_artifacts(
+    tmp_path: Path,
+) -> None:
+    shared_records = _samga_source_records(
+        stage="stage0",
+        config="b" * 64,
+        subject=1,
+        seed=42,
+    )
+    left, right = _save_pair(
+        tmp_path,
+        left_metadata=_metadata(
+            checkpoint="a" * 64,
+            config="b" * 64,
+            stage="training_smoke/in_loop",
+            source_records=shared_records,
+        ),
+        right_metadata=_metadata(
+            checkpoint="e" * 64,
+            config="f" * 64,
+            stage="training_smoke/in_loop",
+            source_records=shared_records,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="terminal|stage|partial|smoke"):
+        assert_aligned(left, right)
 
 
 @pytest.mark.parametrize(
@@ -431,11 +578,11 @@ def test_assert_aligned_accepts_distinct_branch_specific_provenance(
         "protocol",
         "subject",
         "seed",
-        "stage",
+        "terminal_role",
         "source_records",
     ],
 )
-def test_assert_aligned_rejects_shared_alignment_mismatch(
+def test_assert_aligned_rejects_common_alignment_or_branch_role_mismatch(
     tmp_path: Path,
     mismatch: str,
 ) -> None:
@@ -445,14 +592,14 @@ def test_assert_aligned_rejects_shared_alignment_mismatch(
     metadata = _metadata(
         checkpoint="e" * 64,
         config="f" * 64,
-        query_ids=right_query_ids,
+        stage="brainrw-clip-lora",
     )
     if mismatch == "query_ids":
         right_query_ids = ("q1", "q0")
         metadata = _metadata(
             checkpoint="e" * 64,
             config="f" * 64,
-            query_ids=right_query_ids,
+            stage="brainrw-clip-lora",
         )
     elif mismatch == "gallery_ids":
         right_gallery_ids = ("q1", "q0", "x")
@@ -461,20 +608,105 @@ def test_assert_aligned_rejects_shared_alignment_mismatch(
     elif mismatch == "subject":
         metadata["subject"] = 5
     elif mismatch == "seed":
-        metadata["seed"] = 42
-    elif mismatch == "stage":
-        metadata["stage"] = "stage-2"
+        metadata["seed"] = 43
+    elif mismatch == "terminal_role":
+        metadata = _metadata(
+            checkpoint="e" * 64,
+            config="f" * 64,
+            stage="stage2",
+        )
     elif mismatch == "source_records":
-        metadata["source_records"] = [
-            {"record_id": "q0", "source": "different"},
-            {"record_id": "q1"},
-        ]
+        source_record = _common_source_record()
+        source_record["records_sha256"] = "a" * 64
+        metadata["source_records"] = [source_record]
     kwargs["right_query_ids"] = right_query_ids
     kwargs["right_gallery_ids"] = right_gallery_ids
     kwargs["right_metadata"] = metadata
     left, right = _save_pair(tmp_path, **kwargs)
 
-    with pytest.raises(ValueError, match="align|mismatch|provenance|ID"):
+    with pytest.raises(
+        ValueError,
+        match="align|mismatch|provenance|ID|terminal|stage",
+    ):
+        assert_aligned(left, right)
+
+
+@pytest.mark.parametrize("field", _COMMON_SOURCE_RECORD_KEYS)
+def test_assert_aligned_rejects_every_common_source_field_mismatch(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    right_record = _common_source_record()
+    replacements: dict[str, object] = {
+        "manifest_sha256": "a" * 64,
+        "records_sha256": "a" * 64,
+        "role": "train",
+        "role_payload_sha256": "a" * 64,
+        "source_manifest_sha256": "a" * 64,
+        "source_payload_byte_count": 999,
+        "source_payload_path": "/safe/sub-01/different.pt",
+        "source_payload_sha256": "a" * 64,
+    }
+    right_record[field] = replacements[field]
+    left, right = _save_pair(
+        tmp_path,
+        right_metadata=_metadata(
+            checkpoint="e" * 64,
+            config="f" * 64,
+            stage="brainrw-clip-lora",
+            source_records=[right_record],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="align|mismatch|provenance|role"):
+        assert_aligned(left, right)
+
+
+def test_assert_aligned_rejects_missing_common_source_field(
+    tmp_path: Path,
+) -> None:
+    right_record = _common_source_record()
+    del right_record["role_payload_sha256"]
+    left, right = _save_pair(
+        tmp_path,
+        right_metadata=_metadata(
+            checkpoint="e" * 64,
+            config="f" * 64,
+            stage="brainrw-clip-lora",
+            source_records=[right_record],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="missing|source|provenance"):
+        assert_aligned(left, right)
+
+
+def test_assert_aligned_rejects_common_source_record_order_mismatch(
+    tmp_path: Path,
+) -> None:
+    common_records = (_common_source_record(0), _common_source_record(5))
+    left, right = _save_pair(
+        tmp_path,
+        left_metadata=_metadata(
+            checkpoint="a" * 64,
+            config="b" * 64,
+            source_records=_samga_source_records(
+                stage="stage0",
+                config="b" * 64,
+                subject=1,
+                seed=42,
+                common_records=common_records,
+            ),
+        ),
+        right_metadata=_metadata(
+            checkpoint="e" * 64,
+            config="f" * 64,
+            stage="brainrw-clip-lora",
+            source_records=list(reversed(common_records)),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="align|mismatch|provenance|source"):
         assert_aligned(left, right)
 
 
@@ -655,15 +887,31 @@ def test_score_fusion_cli_consumes_typed_val_dev_and_binds_inputs(
     assert [item["config_id"] for item in document["results"]] == [
         config.config_id for config in enumerate_stage1_configs()
     ]
-    assert document["inputs"]["internvit"] == {
+    internvit_binding = dict(document["inputs"]["internvit"])
+    internvit_binding_sha256 = internvit_binding.pop("binding_sha256")
+    assert internvit_binding_sha256 == sha256_json(internvit_binding)
+    assert internvit_binding == {
         "branch_id": "internvit",
+        "provenance": _thaw(left.provenance),
         "provenance_sha256": sha256_json(_thaw(left.provenance)),
+        "run_key": left.metadata["source_records"][0]["run_key"],
         "score_payload_sha256": left.verified.payload_sha256,
+        "source_records": _thaw(left.metadata["source_records"]),
+        "source_records_sha256": left.metadata["source_records_sha256"],
+        "stage": "stage0",
     }
-    assert document["inputs"]["clip"] == {
+    clip_binding = dict(document["inputs"]["clip"])
+    clip_binding_sha256 = clip_binding.pop("binding_sha256")
+    assert clip_binding_sha256 == sha256_json(clip_binding)
+    assert clip_binding == {
         "branch_id": "clip",
+        "provenance": _thaw(right.provenance),
         "provenance_sha256": sha256_json(_thaw(right.provenance)),
+        "run_key": None,
         "score_payload_sha256": right.verified.payload_sha256,
+        "source_records": _thaw(right.metadata["source_records"]),
+        "source_records_sha256": right.metadata["source_records_sha256"],
+        "stage": "brainrw-clip-lora",
     }
     assert document["alignment"]["query_ids_sha256"] == left.metadata[
         "query_ids_sha256"
@@ -671,9 +919,15 @@ def test_score_fusion_cli_consumes_typed_val_dev_and_binds_inputs(
     assert document["alignment"]["gallery_ids_sha256"] == left.metadata[
         "gallery_ids_sha256"
     ]
-    assert document["alignment"]["source_records_sha256"] == left.metadata[
-        "source_records_sha256"
+    assert document["alignment"]["common_source_records"] == [
+        {
+            key: _common_source_record()[key]
+            for key in _COMMON_SOURCE_RECORD_KEYS
+        }
     ]
+    assert document["alignment"]["common_source_records_sha256"] == (
+        sha256_json(document["alignment"]["common_source_records"])
+    )
 
 
 def test_score_fusion_cli_exclusively_preserves_existing_output(

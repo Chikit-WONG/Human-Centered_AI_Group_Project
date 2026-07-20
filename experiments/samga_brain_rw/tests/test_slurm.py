@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from samga_brain_rw.config import make_run_key
 from samga_brain_rw.hashing import sha256_json
 
 
@@ -69,6 +70,10 @@ def submit_module(
     jobmap_module: ModuleType,
 ) -> ModuleType:
     sys.modules["build_job_map"] = jobmap_module
+    _load_script(
+        experiment_root / "scripts" / "run_training_cell.py",
+        "run_training_cell",
+    )
     return _load_script(
         experiment_root / "scripts" / "submit_pilot.py",
         "submit_pilot",
@@ -87,20 +92,37 @@ def _row(
     seed: int = 42,
     partition: str = "debug",
     time: str = "00:30:00",
+    project_root: Path | None = None,
 ) -> dict[str, object]:
     stage_number = 2 if "stage-2" in stage else 0
     selected_mode = mode or ("smoke" if "smoke" in stage else "full")
     config_sha256 = _h(f"config:{config_id}")
     input_bundle_sha256 = _h(f"input:{subject}:{seed}")
-    run_key = (
-        f"stage{stage_number}__{config_id}__sub-{subject:02d}__seed-{seed}__"
-        f"{config_sha256}__{input_bundle_sha256}"
+    run_key = make_run_key(
+        f"stage{stage_number}",
+        config_id,
+        subject,
+        seed,
+        config_sha256,
+        input_bundle_sha256,
     )
-    project_root = Path(__file__).resolve().parents[3]
-    output_dir = tmp_path / stage / run_key
+    selected_project_root = (
+        project_root or tmp_path / "project-root"
+    ).resolve()
+    selected_project_root.mkdir(parents=True, exist_ok=True)
+    output_dir = (
+        selected_project_root
+        / "artifacts"
+        / "samga_brain_rw"
+        / stage
+        / run_key
+    )
     argv = [
         "python",
-        str(project_root / "experiments/samga_brain_rw/scripts/run_training_cell.py"),
+        str(
+            selected_project_root
+            / "experiments/samga_brain_rw/scripts/run_training_cell.py"
+        ),
         "--mode",
         selected_mode,
         "--stage",
@@ -122,7 +144,7 @@ def _row(
         "--output-dir",
         str(output_dir),
         "--project-root",
-        str(project_root),
+        str(selected_project_root),
         "--config-id",
         config_id,
         "--expected-config-sha256",
@@ -131,6 +153,8 @@ def _row(
         input_bundle_sha256,
         "--run-key",
         run_key,
+        "--device",
+        "cuda",
     ]
     if stage_number == 2:
         argv.extend(
@@ -185,7 +209,7 @@ def _row(
         "time": time,
         "stdout_path": "logs/samga_brain_rw/sealed_%A_%a.out",
         "stderr_path": "logs/samga_brain_rw/sealed_%A_%a.err",
-        "completion_path": str(tmp_path / stage / run_key / "completion.json"),
+        "completion_path": str(output_dir / "completion.json"),
         "expected_completion_schema": {
             "schema_version": 1,
             "payload_type": "samga_brain_rw.job_completion",
@@ -246,6 +270,23 @@ def _install_job_environment(
         monkeypatch.setenv(name, value)
 
 
+def _submission_project(
+    tmp_path: Path,
+    experiment_root: Path,
+) -> tuple[Path, Path]:
+    project_root = (tmp_path / "project-root").resolve()
+    project_root.mkdir(parents=True, exist_ok=True)
+    (project_root / ".git").mkdir(exist_ok=True)
+    relative_script = Path(
+        "experiments/samga_brain_rw/slurm/pilot_array.slurm"
+    )
+    source = experiment_root / "slurm" / "pilot_array.slurm"
+    script = project_root / relative_script
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_bytes(source.read_bytes())
+    return project_root, script
+
+
 def test_static_launchers_lock_gpu_logs_environment_and_conda(
     experiment_root: Path,
 ) -> None:
@@ -256,7 +297,16 @@ def test_static_launchers_lock_gpu_logs_environment_and_conda(
         assert "logs/samga_brain_rw" in text
         assert re.search(r"#SBATCH --output=logs/samga_brain_rw/\S+\.out", text)
         assert re.search(r"#SBATCH --error=logs/samga_brain_rw/\S+\.err", text)
-        assert "export PYTHONPATH=experiments/samga_brain_rw" in text
+        assert "PROJECT_ROOT=${PROJECT_ROOT:?" in text
+        assert 'cd -- "${PROJECT_ROOT}"' in text
+        assert (
+            'export PYTHONPATH="${PROJECT_ROOT}/'
+            'experiments/samga_brain_rw"'
+        ) in text
+        assert (
+            '"${PROJECT_ROOT}/experiments/samga_brain_rw/'
+            'scripts/build_job_map.py" run-row'
+        ) in text
         assert "export HF_DATASETS_OFFLINE=1" in text
         assert "export TRANSFORMERS_OFFLINE=1" in text
         assert "export HF_HUB_OFFLINE=1" in text
@@ -581,6 +631,209 @@ def test_training_stage_binds_runner_to_declared_project_root(
         jobmap_module.build_job_map([row])
 
 
+def test_training_row_rejects_output_dir_with_same_run_key_in_other_parent(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    output_position = argv.index("--output-dir") + 1
+    output_dir = Path(argv[output_position])
+    argv[output_position] = str(
+        output_dir.parent.parent / "other-stage" / output_dir.name
+    )
+
+    with pytest.raises(ValueError, match="completion|output"):
+        jobmap_module.build_job_map([row])
+
+
+def test_training_row_accepts_bound_output_below_results_root(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    project_root = Path(
+        argv[argv.index("--project-root") + 1]
+    )
+    output_dir = (
+        project_root
+        / "results"
+        / "samga_brain_rw"
+        / str(row["stage"])
+        / str(row["run_key"])
+    )
+    argv[argv.index("--output-dir") + 1] = str(output_dir)
+    row["completion_path"] = str(output_dir / "completion.json")
+
+    assert jobmap_module.build_job_map([row])["row_count"] == 1
+
+
+def test_training_row_rejects_bound_paths_outside_development_roots(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    project_root = Path(
+        argv[argv.index("--project-root") + 1]
+    )
+    output_dir = (
+        project_root
+        / "unsealed-output"
+        / str(row["run_key"])
+    )
+    argv[argv.index("--output-dir") + 1] = str(output_dir)
+    row["completion_path"] = str(output_dir / "completion.json")
+
+    with pytest.raises(
+        ValueError,
+        match="artifacts|results|development|project.root|outside",
+    ):
+        jobmap_module.build_job_map([row])
+
+
+def test_training_row_rejects_noncanonical_dotdot_paths(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    output_dir = Path(argv[argv.index("--output-dir") + 1])
+    noncanonical = (
+        f"{output_dir.parent.as_posix()}/intermediate/../"
+        f"{output_dir.name}"
+    )
+    argv[argv.index("--output-dir") + 1] = noncanonical
+    row["completion_path"] = f"{noncanonical}/completion.json"
+
+    with pytest.raises(ValueError, match="normalized|canonical|\\.\\."):
+        jobmap_module.build_job_map([row])
+
+
+def test_legacy_row_rejects_relative_completion_path_during_build(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(
+        tmp_path,
+        stage="confirmation",
+        training_runner=False,
+    )
+    row["completion_path"] = "artifacts/run/completion.json"
+
+    with pytest.raises(ValueError, match="completion_path.*absolute|normalized"):
+        jobmap_module.build_job_map([row])
+
+
+def test_training_row_rejects_symlinked_output_containment(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    project_root = Path(
+        argv[argv.index("--project-root") + 1]
+    )
+    development_root = (
+        project_root / "artifacts" / "samga_brain_rw"
+    )
+    development_root.mkdir(parents=True)
+    outside = tmp_path / "outside-output"
+    outside.mkdir()
+    escape = development_root / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    output_dir = escape / str(row["run_key"])
+    argv[argv.index("--output-dir") + 1] = str(output_dir)
+    row["completion_path"] = str(output_dir / "completion.json")
+
+    with pytest.raises(ValueError, match="symlink|normalized|outside"):
+        jobmap_module.build_job_map([row])
+
+
+def test_unified_training_row_seals_explicit_cuda_device(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    assert argv.count("--device") == 1
+    assert argv[argv.index("--device") + 1] == "cuda"
+    payload = jobmap_module.build_job_map([row])
+    sealed_argv = payload["rows"][0]["argv"]
+    assert isinstance(sealed_argv, list)
+    assert sealed_argv[sealed_argv.index("--device") + 1] == "cuda"
+
+
+def test_unified_training_row_rejects_legacy_unprefixed_run_key(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    canonical = str(row["run_key"])
+    assert "__config-" in canonical
+    assert "__inputs-" in canonical
+    assert jobmap_module.build_job_map([row])["row_count"] == 1
+
+    legacy = (
+        f"stage2__s2-layernorm-on__sub-01__seed-42__"
+        f"{row['config_sha256']}__{row['input_bundle_sha256']}"
+    )
+    row["run_key"] = legacy
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    argv[argv.index("--run-key") + 1] = legacy
+    output_position = argv.index("--output-dir") + 1
+    argv[output_position] = str(
+        Path(argv[output_position]).parent / legacy
+    )
+    row["completion_path"] = str(
+        Path(str(row["completion_path"])).parent.parent
+        / legacy
+        / "completion.json"
+    )
+
+    with pytest.raises(ValueError, match="run_key"):
+        jobmap_module.build_job_map([row])
+
+
+@pytest.mark.parametrize("unsupported", ("auto", "cpu"))
+def test_unified_training_row_rejects_non_cuda_device(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+    unsupported: str,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    argv[argv.index("--device") + 1] = unsupported
+    with pytest.raises(ValueError, match="device|cuda"):
+        jobmap_module.build_job_map([row])
+
+
+def test_unified_training_row_rejects_missing_device_but_legacy_is_unchanged(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path)
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    position = argv.index("--device")
+    del argv[position : position + 2]
+    with pytest.raises(ValueError, match="device|cuda"):
+        jobmap_module.build_job_map([row])
+
+    legacy = _row(tmp_path, stage="confirmation", training_runner=False)
+    assert "--device" not in legacy["argv"]
+    assert jobmap_module.build_job_map([legacy])["row_count"] == 1
+
+
 def test_partial_retry_exports_full_map_bounds_and_uses_sealed_logs(
     experiment_root: Path,
     jobmap_module: ModuleType,
@@ -589,6 +842,9 @@ def test_partial_retry_exports_full_map_bounds_and_uses_sealed_logs(
     tmp_path: Path,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    project_root, script = _submission_project(
+        tmp_path, experiment_root
+    )
     rows = [
         _row(
             tmp_path,
@@ -596,6 +852,7 @@ def test_partial_retry_exports_full_map_bounds_and_uses_sealed_logs(
             seed=seed,
             partition="i64m1tga40u",
             time="04:00:00",
+            project_root=project_root,
         )
         for subject, seed in ((1, 42), (5, 43), (8, 42))
     ]
@@ -621,18 +878,27 @@ def test_partial_retry_exports_full_map_bounds_and_uses_sealed_logs(
         payload,
         job_map_path=tmp_path / "pilot.json",
         job_map_sha256=payload["payload_sha256"],
-        slurm_script=experiment_root / "slurm" / "pilot_array.slurm",
+        slurm_script=script,
         log_dir=Path("logs/samga_brain_rw"),
         rows=[payload["rows"][1]],
         runner=fake_runner,
     )
     command = calls[1]
     assert "--array=1-1" in command
+    assert f"--chdir={project_root}" in command
     export = next(value for value in command if value.startswith("--export="))
     assert "JOB_MAP_ARRAY_MIN=0" in export
     assert "JOB_MAP_ARRAY_MAX=2" in export
-    assert "--output=logs/samga_brain_rw/sealed_%A_%a.out" in command
-    assert "--error=logs/samga_brain_rw/sealed_%A_%a.err" in command
+    assert f"PROJECT_ROOT={project_root}" in export
+    assert (
+        f"--output={project_root}/logs/samga_brain_rw/"
+        "sealed_%A_%a.out"
+    ) in command
+    assert (
+        f"--error={project_root}/logs/samga_brain_rw/"
+        "sealed_%A_%a.err"
+    ) in command
+    assert command[-1] == str(script)
 
 
 def test_current_development_launchers_use_immutable_full_map_bounds(
@@ -735,6 +1001,70 @@ def test_complete_env_reloads_and_completes_only_selected_claim(
     assert jobmap_module.completion_is_valid(payload, row)
 
 
+def test_public_claim_cli_is_not_exposed_and_cannot_mutate_state(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "no-public-claim-map.json"
+    payload = jobmap_module.write_job_map([_row(tmp_path)], map_path)
+    row = payload["rows"][0]
+
+    with pytest.raises(SystemExit) as rejected:
+        jobmap_module.main(
+            [
+                "claim",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+            ]
+        )
+
+    assert rejected.value.code == 2
+    assert not jobmap_module._state_dir(row).exists()
+    assert not Path(str(row["completion_path"])).exists()
+
+
+def test_public_complete_cli_is_not_exposed_and_cannot_mutate_state(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "no-public-complete-map.json"
+    payload = jobmap_module.write_job_map([_row(tmp_path)], map_path)
+    row = payload["rows"][0]
+    claim = jobmap_module.claim_job_row(payload, row)
+    claim_bytes = claim.path.read_bytes()
+
+    with pytest.raises(SystemExit) as rejected:
+        jobmap_module.main(
+            [
+                "complete",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+                "--output-hashes",
+                json.dumps(_output_hashes(row, "unbound-public-cli")),
+            ]
+        )
+
+    assert rejected.value.code == 2
+    assert claim.path.read_bytes() == claim_bytes
+    assert not Path(str(row["completion_path"])).exists()
+
+
 def test_complete_env_rejects_recovery_before_completion_lock(
     jobmap_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -758,7 +1088,7 @@ def test_complete_env_rejects_recovery_before_completion_lock(
         output_hashes: object,
         **expected_claim: object,
     ) -> object:
-        second = jobmap_module.recover_job_row(
+        second = jobmap_module._recover_job_row_unverified_for_testing(
             candidate_payload,
             candidate_row,
             recovery_audit_sha256=_h("race-recovery-audit"),
@@ -911,6 +1241,380 @@ def test_completion_is_idempotent_and_prevents_resubmission(
     assert claim.path.exists()
 
 
+def test_claim_rejects_preexisting_job_claims_symlink_without_external_write(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    state_dir = jobmap_module._state_dir(row)
+    claims_root = state_dir.parent
+    claims_root.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-claims"
+    outside.mkdir()
+    claims_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ValueError,
+        match="symlink|symbolic|state|directory",
+    ):
+        jobmap_module.claim_job_row(payload, row)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_claim_rejects_generation_symlink_injected_after_enumeration(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    state_dir = jobmap_module._state_dir(row)
+    generation_path = state_dir / "generation-000001"
+    outside = tmp_path / "outside-injected-generation"
+    outside.mkdir()
+    original_generation_numbers = jobmap_module._generation_numbers
+    injected = False
+
+    def inject_generation_symlink(directory: object) -> list[int]:
+        nonlocal injected
+        numbers = original_generation_numbers(directory)
+        if not injected:
+            generation_path.symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            injected = True
+        return numbers
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_generation_numbers",
+        inject_generation_symlink,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="symlink|symbolic|state|generation|directory",
+    ):
+        jobmap_module.claim_job_row(payload, row)
+
+    assert injected is True
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_point", ("claim-publication", "rename"))
+def test_first_claim_staging_failure_leaves_no_final_generation_and_retries(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    state_dir = jobmap_module._state_dir(row)
+    final_generation = state_dir / "generation-000001"
+    original_publish = jobmap_module._exclusive_publish_at
+    original_rename = jobmap_module._rename_staged_generation
+
+    def fail_claim_publication(
+        directory_fd: int,
+        name: str,
+        data: bytes,
+    ) -> None:
+        if failure_point == "claim-publication" and name == "claim.json":
+            raise RuntimeError("injected staged claim publication failure")
+        original_publish(directory_fd, name, data)
+
+    def fail_staged_rename(
+        state_fd: int,
+        staging_name: str,
+        final_name: str,
+    ) -> None:
+        if failure_point == "rename":
+            raise RuntimeError("injected staged generation rename failure")
+        original_rename(state_fd, staging_name, final_name)
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_exclusive_publish_at",
+        fail_claim_publication,
+    )
+    monkeypatch.setattr(
+        jobmap_module,
+        "_rename_staged_generation",
+        fail_staged_rename,
+    )
+
+    with pytest.raises(RuntimeError, match="injected staged"):
+        jobmap_module.claim_job_row(payload, row)
+
+    assert not final_generation.exists()
+    assert not [
+        entry
+        for entry in state_dir.iterdir()
+        if entry.name.startswith(".generation-staging-")
+    ]
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_exclusive_publish_at",
+        original_publish,
+    )
+    monkeypatch.setattr(
+        jobmap_module,
+        "_rename_staged_generation",
+        original_rename,
+    )
+    claim = jobmap_module.claim_job_row(payload, row)
+    assert claim.generation == 1
+    assert claim.path.is_file()
+
+
+def test_post_rename_parent_fsync_failure_preserves_complete_final_claim(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    state_dir = jobmap_module._state_dir(row)
+    final_generation = state_dir / "generation-000001"
+    final_claim = final_generation / "claim.json"
+    original_rename = jobmap_module.os.rename
+    original_fsync = jobmap_module.os.fsync
+    renamed = False
+    state_fd_after_rename: int | None = None
+    injected = False
+
+    def observe_rename(
+        source: object,
+        destination: object,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal renamed, state_fd_after_rename
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination == "generation-000001":
+            renamed = True
+            state_fd_after_rename = dst_dir_fd
+
+    def fail_first_parent_fsync_after_rename(fd: int) -> None:
+        nonlocal injected
+        if renamed and fd == state_fd_after_rename and not injected:
+            injected = True
+            raise OSError("injected post-rename parent fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr(jobmap_module.os, "rename", observe_rename)
+    monkeypatch.setattr(jobmap_module.os, "fsync", fail_first_parent_fsync_after_rename)
+
+    with pytest.raises(OSError, match="post-rename parent fsync"):
+        jobmap_module.claim_job_row(payload, row)
+
+    assert renamed is True
+    assert injected is True
+    assert final_generation.is_dir()
+    assert final_claim.is_file()
+    assert final_claim.stat().st_size > 0
+    assert not [
+        entry
+        for entry in state_dir.iterdir()
+        if entry.name.startswith(".generation-staging-")
+    ]
+    assert jobmap_module.should_submit_row(payload, row) is False
+    with pytest.raises(RuntimeError, match="active|stale|recovery"):
+        jobmap_module.claim_job_row(payload, row)
+
+
+def test_recovery_generation_staging_failure_retries_same_generation(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    original_rename = jobmap_module._rename_staged_generation
+
+    def fail_generation_two_rename(
+        state_fd: int,
+        staging_name: str,
+        final_name: str,
+    ) -> None:
+        if final_name == "generation-000002":
+            raise RuntimeError("injected recovery generation rename failure")
+        original_rename(state_fd, staging_name, final_name)
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_rename_staged_generation",
+        fail_generation_two_rename,
+    )
+    audit = _h("generation-two-staging-failure")
+    with pytest.raises(RuntimeError, match="injected recovery"):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=audit,
+        )
+
+    second_path = first.path.parent.parent / "generation-000002"
+    assert not second_path.exists()
+    assert first.recovery_path.is_file()
+    assert not [
+        entry
+        for entry in jobmap_module._state_dir(row).iterdir()
+        if entry.name.startswith(".generation-staging-")
+    ]
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_rename_staged_generation",
+        original_rename,
+    )
+    second = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=audit,
+    )
+    assert second.generation == 2
+    assert second.path.is_file()
+
+
+def test_recovery_rejects_generation_one_symlink_without_external_write(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    first_bytes = first.path.read_bytes()
+    generation_path = first.path.parent
+    outside = tmp_path / "outside-generation-one"
+    generation_path.rename(outside)
+    generation_path.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ValueError,
+        match="symlink|symbolic|state|generation|directory",
+    ):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=_h("symlinked-generation-one"),
+        )
+
+    assert (outside / "claim.json").read_bytes() == first_bytes
+    assert {entry.name for entry in outside.iterdir()} == {"claim.json"}
+    assert not (
+        jobmap_module._state_dir(row) / "generation-000002"
+    ).exists()
+
+
+def test_attempt_rejects_generation_two_symlink_without_external_write(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    jobmap_module.claim_job_row(payload, row)
+    second = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=_h("symlinked-generation-two"),
+    )
+    second_bytes = second.path.read_bytes()
+    generation_path = second.path.parent
+    outside = tmp_path / "outside-generation-two"
+    generation_path.rename(outside)
+    generation_path.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ValueError,
+        match="symlink|symbolic|state|generation|directory",
+    ):
+        jobmap_module.consume_recovery_attempt(payload, row)
+
+    assert (outside / "claim.json").read_bytes() == second_bytes
+    assert {entry.name for entry in outside.iterdir()} == {"claim.json"}
+
+
+def test_completion_output_hashes_returns_copy_or_none_and_rejects_tampering(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    assert jobmap_module.completion_output_hashes(payload, row) is None
+
+    jobmap_module.claim_job_row(payload, row)
+    hashes = _output_hashes(row, "declared-outputs")
+    jobmap_module.complete_job_row(payload, row, hashes)
+    loaded = jobmap_module.completion_output_hashes(payload, row)
+    assert loaded == hashes
+    assert loaded is not hashes
+
+    completion_path = Path(str(row["completion_path"]))
+    document = json.loads(completion_path.read_text(encoding="utf-8"))
+    document["payload"]["output_hashes"]["final_checkpoint_sha256"] = _h(
+        "tampered-output"
+    )
+    completion_path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical|hash|completion"):
+        jobmap_module.completion_output_hashes(payload, row)
+
+
+def test_unverified_recovery_helper_is_internal_only(
+    jobmap_module: ModuleType,
+) -> None:
+    assert not hasattr(jobmap_module, "recover_job_row")
+    assert callable(
+        jobmap_module._recover_job_row_unverified_for_testing
+    )
+
+
+def test_unverified_recovery_is_not_exposed_by_cli(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "no-recovery-cli-map.json"
+    payload = jobmap_module.write_job_map(
+        [_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+
+    with pytest.raises(SystemExit):
+        jobmap_module.main(
+            [
+                "recover",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+                "--recovery-audit-sha256",
+                _h("unverified-cli-audit"),
+            ]
+        )
+
+    assert not first.recovery_path.exists()
+
+
 def test_stale_claim_recovery_is_audited_and_never_deletes_original(
     jobmap_module: ModuleType,
     tmp_path: Path,
@@ -919,7 +1623,7 @@ def test_stale_claim_recovery_is_audited_and_never_deletes_original(
     row = payload["rows"][0]
     first = jobmap_module.claim_job_row(payload, row)
     first_bytes = first.path.read_bytes()
-    second = jobmap_module.recover_job_row(
+    second = jobmap_module._recover_job_row_unverified_for_testing(
         payload,
         row,
         recovery_audit_sha256=_h("audited-stale-claim"),
@@ -933,12 +1637,663 @@ def test_stale_claim_recovery_is_audited_and_never_deletes_original(
     assert second.document["payload"]["recovered_from_claim_sha256"] == first.sha256
     assert second.path.exists()
 
+    jobmap_module.consume_recovery_attempt(payload, row)
     jobmap_module.complete_job_row(
         payload,
         row,
         _output_hashes(row, "recovered-metrics"),
     )
     assert jobmap_module.completion_is_valid(payload, row)
+
+
+def test_each_recovery_generation_authorizes_exactly_one_attempt(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "attempt-map.json"
+    payload = jobmap_module.write_job_map(
+        [_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    second = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=_h("generation-2-audit"),
+    )
+    assert first.generation == 1
+    assert second.generation == 2
+    assert jobmap_module.should_submit_row(payload, row) is True
+
+    calls: list[object] = []
+
+    def fail_once(command: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        assert kwargs["check"] is False
+        return SimpleNamespace(returncode=17)
+
+    monkeypatch.setattr(jobmap_module.subprocess, "run", fail_once)
+    run_argv = [
+        "run-row",
+        "--job-map",
+        str(map_path),
+        "--job-map-sha256",
+        str(payload["payload_sha256"]),
+        "--array-index",
+        "0",
+        "--array-min",
+        "0",
+        "--array-max",
+        "0",
+    ]
+    assert jobmap_module.main(run_argv) == 17
+    assert jobmap_module.should_submit_row(payload, row) is False
+    assert second.attempt_path.is_file()
+
+    with pytest.raises(RuntimeError, match="attempt|audit|recovery"):
+        jobmap_module.main(run_argv)
+    assert len(calls) == 1
+
+    third = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=_h("generation-3-audit"),
+    )
+    assert third.generation == 3
+    assert jobmap_module.should_submit_row(payload, row) is True
+    second_recovery = json.loads(
+        second.recovery_path.read_text(encoding="utf-8")
+    )
+    attempt_sha256 = hashlib.sha256(
+        second.attempt_path.read_bytes()
+    ).hexdigest()
+    assert (
+        second_recovery["payload"]["attempt_record_sha256"]
+        == attempt_sha256
+    )
+
+
+def test_run_row_rejects_unclaimed_unaudited_output_directory(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "unaudited-output-map.json"
+    payload = jobmap_module.write_job_map(
+        [_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    output_dir = Path(str(row["completion_path"])).parent
+    output_dir.mkdir(parents=True)
+    partial = output_dir / "partial.bin"
+    partial.write_bytes(b"unaudited partial output")
+    monkeypatch.setattr(
+        jobmap_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unaudited output must fail before subprocess"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="output|audit|recovery"):
+        jobmap_module.main(
+            [
+                "run-row",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+            ]
+        )
+
+    assert partial.read_bytes() == b"unaudited partial output"
+
+
+def test_should_submit_row_rejects_unclaimed_unaudited_output_directory(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    output_dir = Path(str(row["completion_path"])).parent
+    output_dir.mkdir(parents=True)
+    partial = output_dir / "partial.bin"
+    partial.write_bytes(b"unaudited partial output")
+
+    with pytest.raises(RuntimeError, match="output|audit|recovery"):
+        jobmap_module.should_submit_row(payload, row)
+
+    assert partial.read_bytes() == b"unaudited partial output"
+
+
+def test_audited_recovery_atomically_quarantines_output_for_fresh_retry(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "quarantine-map.json"
+    payload = jobmap_module.write_job_map(
+        [_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    output_dir = Path(str(row["completion_path"])).parent
+    first = jobmap_module.claim_job_row(payload, row)
+    assert not first.path.is_relative_to(output_dir)
+    output_dir.mkdir(parents=True)
+    (output_dir / "partial.bin").write_bytes(b"generation-1 partial")
+
+    second = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=_h("quarantine-generation-1"),
+    )
+    assert second.generation == 2
+    assert not output_dir.exists()
+    first_recovery = json.loads(
+        first.recovery_path.read_text(encoding="utf-8")
+    )["payload"]
+    assert first_recovery["restart_mode"] == "fresh"
+    quarantine = first_recovery["quarantine"]
+    assert isinstance(quarantine, dict)
+    assert set(quarantine) == {
+        "file_count",
+        "quarantine_path",
+        "source_output_dir",
+        "tree_sha256",
+    }
+    assert quarantine["source_output_dir"] == str(output_dir)
+    assert re.fullmatch(r"[0-9a-f]{64}", quarantine["tree_sha256"])
+    assert quarantine["file_count"] == 1
+    first_quarantine = Path(quarantine["quarantine_path"])
+    assert first_quarantine.is_dir()
+    assert (
+        first_quarantine / "partial.bin"
+    ).read_bytes() == b"generation-1 partial"
+
+    def fail_recovered_run(
+        _command: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        assert kwargs["check"] is False
+        assert not output_dir.exists()
+        output_dir.mkdir(parents=True)
+        (output_dir / "partial.bin").write_bytes(
+            b"generation-2 partial"
+        )
+        return SimpleNamespace(returncode=23)
+
+    monkeypatch.setattr(
+        jobmap_module.subprocess,
+        "run",
+        fail_recovered_run,
+    )
+    assert jobmap_module.main(
+        [
+            "run-row",
+            "--job-map",
+            str(map_path),
+            "--job-map-sha256",
+            str(payload["payload_sha256"]),
+            "--array-index",
+            "0",
+            "--array-min",
+            "0",
+            "--array-max",
+            "0",
+        ]
+    ) == 23
+    assert output_dir.is_dir()
+    assert jobmap_module.should_submit_row(payload, row) is False
+
+    third = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=_h("quarantine-generation-2"),
+    )
+    assert third.generation == 3
+    assert not output_dir.exists()
+    second_recovery = json.loads(
+        second.recovery_path.read_text(encoding="utf-8")
+    )["payload"]
+    second_quarantine = Path(
+        second_recovery["quarantine"]["quarantine_path"]
+    )
+    assert (
+        second_quarantine / "partial.bin"
+    ).read_bytes() == b"generation-2 partial"
+    assert first_quarantine.is_dir()
+    assert jobmap_module.should_submit_row(payload, row) is True
+
+
+def test_recovery_adopts_quarantine_left_by_prepublication_crash(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    output_dir = Path(str(row["completion_path"])).parent
+    output_dir.mkdir(parents=True)
+    partial = output_dir / "partial.bin"
+    partial.write_bytes(b"partial before recovery publication")
+    original_create_record = jobmap_module._create_record
+
+    def crash_before_recovery_publication(
+        path: Path,
+        payload_type: str,
+        record_payload: dict[str, object],
+        **record_options: object,
+    ) -> object:
+        if payload_type == jobmap_module.RECOVERY_TYPE:
+            raise RuntimeError("injected recovery publication crash")
+        return original_create_record(
+            path,
+            payload_type,
+            record_payload,
+            **record_options,
+        )
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_create_record",
+        crash_before_recovery_publication,
+    )
+    audit_sha256 = _h("prepublication-crash-audit")
+    with pytest.raises(RuntimeError, match="injected"):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=audit_sha256,
+        )
+
+    base = jobmap_module._state_dir(row)
+    quarantine_path = jobmap_module._quarantine_path(base, 1)
+    assert not output_dir.exists()
+    assert (
+        quarantine_path / "partial.bin"
+    ).read_bytes() == b"partial before recovery publication"
+    assert not first.recovery_path.exists()
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_create_record",
+        original_create_record,
+    )
+    second = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=audit_sha256,
+    )
+
+    recovery = json.loads(
+        first.recovery_path.read_text(encoding="utf-8")
+    )["payload"]
+    quarantine = recovery["quarantine"]
+    assert isinstance(quarantine, dict)
+    assert quarantine["quarantine_path"] == str(quarantine_path)
+    assert quarantine["source_output_dir"] == str(output_dir)
+    assert quarantine["file_count"] == 1
+    assert quarantine["tree_sha256"] == (
+        jobmap_module._directory_tree_identity(
+            quarantine_path
+        )["tree_sha256"]
+    )
+    assert recovery["restart_mode"] == "fresh"
+    assert recovery["recovery_audit_sha256"] == audit_sha256
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    assert argv[argv.index("--resume") + 1] == "none"
+    assert second.generation == 2
+
+
+def test_recovery_resumes_published_record_with_missing_next_claim(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "pending-recovery-map.json"
+    payload = jobmap_module.write_job_map(
+        [_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    assert jobmap_module.should_submit_row(payload, row) is False
+    original_create_record = jobmap_module._create_record
+
+    def crash_before_next_claim_publication(
+        path: Path,
+        payload_type: str,
+        record_payload: dict[str, object],
+        **record_options: object,
+    ) -> object:
+        if (
+            payload_type == jobmap_module.CLAIM_TYPE
+            and record_payload.get("generation") == 2
+        ):
+            raise RuntimeError("injected next-claim publication crash")
+        return original_create_record(
+            path,
+            payload_type,
+            record_payload,
+            **record_options,
+        )
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_create_record",
+        crash_before_next_claim_publication,
+    )
+    audit_sha256 = _h("pending-recovery-audit")
+    with pytest.raises(RuntimeError, match="injected"):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=audit_sha256,
+        )
+
+    recovery_bytes = first.recovery_path.read_bytes()
+    recovery = json.loads(
+        recovery_bytes.decode("utf-8")
+    )["payload"]
+    assert recovery["next_generation"] == 2
+    assert recovery["recovery_audit_sha256"] == audit_sha256
+    next_claim_path = (
+        first.path.parent.parent
+        / "generation-000002"
+        / "claim.json"
+    )
+    assert not next_claim_path.exists()
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_create_record",
+        original_create_record,
+    )
+    with pytest.raises(ValueError, match="recovery|next claim"):
+        jobmap_module.should_submit_row(payload, row)
+    with pytest.raises(ValueError, match="recovery|next claim"):
+        jobmap_module.complete_job_row(
+            payload,
+            row,
+            _output_hashes(row, "must-not-complete"),
+        )
+    calls: list[object] = []
+
+    def forbidden_subprocess(*_args: object, **_kwargs: object) -> object:
+        calls.append(object())
+        pytest.fail("pending recovery must fail before subprocess")
+
+    monkeypatch.setattr(
+        jobmap_module.subprocess,
+        "run",
+        forbidden_subprocess,
+    )
+    with pytest.raises(ValueError, match="recovery|next claim"):
+        jobmap_module.main(
+            [
+                "run-row",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+            ]
+        )
+    assert calls == []
+
+    with pytest.raises(
+        ValueError,
+        match="does not match.*audit|audit.*does not match",
+    ):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=_h("different-audit"),
+        )
+    assert first.recovery_path.read_bytes() == recovery_bytes
+    assert not next_claim_path.exists()
+
+    second = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=audit_sha256,
+    )
+    assert second.generation == 2
+    assert second.path == next_claim_path
+    assert first.recovery_path.read_bytes() == recovery_bytes
+    assert second.document["payload"][
+        "recovery_record_sha256"
+    ] == hashlib.sha256(recovery_bytes).hexdigest()
+    assert jobmap_module.should_submit_row(payload, row) is True
+
+
+def test_pending_recovery_rejects_quarantine_unbound_by_null_record(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    original_create_record = jobmap_module._create_record
+
+    def crash_before_next_claim_publication(
+        path: Path,
+        payload_type: str,
+        record_payload: dict[str, object],
+        **record_options: object,
+    ) -> object:
+        if (
+            payload_type == jobmap_module.CLAIM_TYPE
+            and record_payload.get("generation") == 2
+        ):
+            raise RuntimeError("injected next-claim publication crash")
+        return original_create_record(
+            path,
+            payload_type,
+            record_payload,
+            **record_options,
+        )
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_create_record",
+        crash_before_next_claim_publication,
+    )
+    audit_sha256 = _h("null-quarantine-audit")
+    with pytest.raises(RuntimeError, match="injected"):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=audit_sha256,
+        )
+
+    recovery = json.loads(
+        first.recovery_path.read_text(encoding="utf-8")
+    )["payload"]
+    assert recovery["quarantine"] is None
+    quarantine_path = jobmap_module._quarantine_path(
+        jobmap_module._state_dir(row),
+        1,
+    )
+    quarantine_path.mkdir(parents=True)
+    (quarantine_path / "unbound.bin").write_bytes(
+        b"not sealed by recovery record"
+    )
+    monkeypatch.setattr(
+        jobmap_module,
+        "_create_record",
+        original_create_record,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="quarantine.*not recorded|unbound.*quarantine",
+    ):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=audit_sha256,
+        )
+    assert not (
+        first.path.parent.parent
+        / "generation-000002"
+        / "claim.json"
+    ).exists()
+
+
+def test_recovery_rejects_quarantine_root_symlink_without_external_write(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    output_dir = Path(str(row["completion_path"])).parent
+    output_dir.mkdir(parents=True)
+    (output_dir / "partial.bin").write_bytes(b"must remain local")
+
+    state_dir = jobmap_module._state_dir(row)
+    outside = tmp_path / "outside-quarantine-root"
+    outside.mkdir()
+    (state_dir / "quarantine").symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="quarantine|symlink|symbolic|directory",
+    ):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=_h("quarantine-root-symlink"),
+        )
+
+    assert (output_dir / "partial.bin").read_bytes() == b"must remain local"
+    assert list(outside.iterdir()) == []
+    assert not first.recovery_path.exists()
+    assert not (
+        state_dir / "generation-000002"
+    ).exists()
+
+
+def test_recovery_rejects_quarantine_symlink_injected_after_validation(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    output_dir = Path(str(row["completion_path"])).parent
+    output_dir.mkdir(parents=True)
+    (output_dir / "partial.bin").write_bytes(b"must not escape")
+
+    state_dir = jobmap_module._state_dir(row)
+    quarantine_root = state_dir / "quarantine"
+    outside = tmp_path / "outside-quarantine-race"
+    outside.mkdir()
+    original_open_child = jobmap_module._open_child_directory
+    injected = False
+
+    def inject_before_nofollow_open(
+        parent_fd: int,
+        name: str,
+        path: Path,
+        *,
+        create: bool = False,
+        exclusive: bool = False,
+    ) -> object:
+        nonlocal injected
+        if name == "quarantine" and not injected:
+            quarantine_root.symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            injected = True
+        return original_open_child(
+            parent_fd,
+            name,
+            path,
+            create=create,
+            exclusive=exclusive,
+        )
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_open_child_directory",
+        inject_before_nofollow_open,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="quarantine|symlink|symbolic|directory",
+    ):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=_h("quarantine-race"),
+        )
+
+    assert injected is True
+    assert (output_dir / "partial.bin").read_bytes() == b"must not escape"
+    assert list(outside.iterdir()) == []
+    assert not first.recovery_path.exists()
+    assert not (
+        state_dir / "generation-000002"
+    ).exists()
+
+
+@pytest.mark.parametrize("invalid_kind", ("file", "symlink"))
+def test_recovery_rejects_invalid_preexisting_quarantine(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    payload = jobmap_module.build_job_map([_row(tmp_path)])
+    row = payload["rows"][0]
+    first = jobmap_module.claim_job_row(payload, row)
+    quarantine_path = jobmap_module._quarantine_path(
+        jobmap_module._state_dir(row),
+        1,
+    )
+    quarantine_path.parent.mkdir(parents=True)
+    if invalid_kind == "file":
+        quarantine_path.write_bytes(b"not a directory")
+    else:
+        target = tmp_path / "outside-quarantine"
+        target.mkdir()
+        quarantine_path.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        ValueError,
+        match="real directory|symbolic|symlink",
+    ):
+        jobmap_module._recover_job_row_unverified_for_testing(
+            payload,
+            row,
+            recovery_audit_sha256=_h(invalid_kind),
+        )
+    assert not first.recovery_path.exists()
 
 
 def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
@@ -949,8 +2304,17 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
     tmp_path: Path,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    project_root, script = _submission_project(
+        tmp_path, experiment_root
+    )
     smoke = jobmap_module.write_job_map(
-        [_row(tmp_path, stage="stage-2-smoke")],
+        [
+            _row(
+                tmp_path,
+                stage="stage-2-smoke",
+                project_root=project_root,
+            )
+        ],
         tmp_path / "smoke-map.json",
     )
     pilot = jobmap_module.write_job_map(
@@ -961,6 +2325,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
                 seed=42,
                 partition="i64m1tga40u",
                 time="04:00:00",
+                project_root=project_root,
             ),
             _row(
                 tmp_path,
@@ -968,6 +2333,7 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
                 seed=43,
                 partition="i64m1tga40u",
                 time="04:00:00",
+                project_root=project_root,
             ),
         ],
         tmp_path / "pilot-map.json",
@@ -978,7 +2344,6 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
         calls.append(list(command))
         return SimpleNamespace(stdout="12345\n", returncode=0)
 
-    script = experiment_root / "slurm" / "pilot_array.slurm"
     phase = submit_module.submit_available_pilot(
         smoke_job_map=tmp_path / "smoke-map.json",
         smoke_sha256=smoke["payload_sha256"],
@@ -998,11 +2363,37 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
     assert not any("i64m1tga40u" in item for item in calls[1][1:])
 
     smoke_row = smoke["rows"][0]
+    smoke_hashes = _output_hashes(smoke_row, "smoke")
     jobmap_module.claim_job_row(smoke, smoke_row)
     jobmap_module.complete_job_row(
         smoke,
         smoke_row,
-        _output_hashes(smoke_row, "smoke"),
+        smoke_hashes,
+    )
+
+    def fake_output_validator(
+        argv: object,
+        *,
+        expected_mode: str,
+    ) -> SimpleNamespace:
+        assert argv == smoke_row["argv"]
+        assert expected_mode == "smoke"
+        return SimpleNamespace(
+            final_checkpoint_sha256=smoke_hashes[
+                "final_checkpoint_sha256"
+            ],
+            in_loop_metadata_sha256=smoke_hashes[
+                "in_loop_metadata_sha256"
+            ],
+            run_manifest_sha256=smoke_hashes[
+                "run_manifest_sha256"
+            ],
+        )
+
+    monkeypatch.setattr(
+        submit_module,
+        "validate_training_command_outputs",
+        fake_output_validator,
     )
     calls.clear()
     phase = submit_module.submit_available_pilot(
@@ -1027,6 +2418,18 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
             _output_hashes(row, f"pilot:{row['array_index']}"),
         )
     calls.clear()
+
+    def forbid_completed_pilot_validation(
+        *_args: object,
+        **_kwargs: object,
+    ) -> object:
+        pytest.fail("completed pilot must not revalidate smoke outputs")
+
+    monkeypatch.setattr(
+        submit_module,
+        "validate_training_command_outputs",
+        forbid_completed_pilot_validation,
+    )
     phase = submit_module.submit_available_pilot(
         smoke_job_map=tmp_path / "smoke-map.json",
         smoke_sha256=smoke["payload_sha256"],
@@ -1037,6 +2440,227 @@ def test_submitter_checks_queue_and_submits_debug_smoke_before_full_pilot(
         runner=fake_runner,
     )
     assert phase == "already-complete"
+    assert calls == []
+
+
+def test_submitter_revalidates_every_smoke_row_before_pilot_queue(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    smoke_path = tmp_path / "multi-smoke.json"
+    smoke = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                stage="stage-2-smoke",
+                subject=subject,
+                project_root=project_root,
+            )
+            for subject in (1, 5)
+        ],
+        smoke_path,
+    )
+    declared: dict[str, dict[str, str]] = {}
+    for row in smoke["rows"]:
+        hashes = _output_hashes(row, f"smoke:{row['array_index']}")
+        declared[str(row["run_key"])] = hashes
+        jobmap_module.claim_job_row(smoke, row)
+        jobmap_module.complete_job_row(smoke, row, hashes)
+
+    pilot_path = tmp_path / "multi-pilot.json"
+    pilot = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                partition="i64m1tga40u",
+                time="04:00:00",
+                project_root=project_root,
+            )
+        ],
+        pilot_path,
+    )
+    events: list[str] = []
+
+    def fake_output_validator(
+        argv: object,
+        *,
+        expected_mode: str,
+    ) -> SimpleNamespace:
+        assert isinstance(argv, list)
+        assert expected_mode == "smoke"
+        run_key = argv[argv.index("--run-key") + 1]
+        events.append(f"validate:{run_key}")
+        hashes = declared[run_key]
+        return SimpleNamespace(
+            final_checkpoint_sha256=hashes["final_checkpoint_sha256"],
+            in_loop_metadata_sha256=hashes[
+                "in_loop_metadata_sha256"
+            ],
+            run_manifest_sha256=hashes["run_manifest_sha256"],
+        )
+
+    monkeypatch.setattr(
+        submit_module,
+        "validate_training_command_outputs",
+        fake_output_validator,
+        raising=False,
+    )
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        events.append("queue" if command == QUEUE_COMMAND else "sbatch")
+        return SimpleNamespace(stdout="12345\n", returncode=0)
+
+    phase = submit_module.submit_available_pilot(
+        smoke_job_map=smoke_path,
+        smoke_sha256=smoke["payload_sha256"],
+        pilot_job_map=pilot_path,
+        pilot_sha256=pilot["payload_sha256"],
+        slurm_script=script,
+        log_dir=Path("logs/samga_brain_rw"),
+        runner=fake_runner,
+    )
+
+    expected_validations = [
+        f"validate:{row['run_key']}" for row in smoke["rows"]
+    ]
+    assert phase == "pilot-submitted"
+    assert events == [*expected_validations, "queue", "sbatch"]
+
+
+@pytest.mark.parametrize("failure", ("deleted", "hash-mismatch"))
+def test_submitter_rejects_missing_or_tampered_smoke_artifacts_before_queue(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    smoke_path = tmp_path / f"{failure}-smoke.json"
+    smoke = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                stage="stage-2-smoke",
+                project_root=project_root,
+            )
+        ],
+        smoke_path,
+    )
+    row = smoke["rows"][0]
+    declared = _output_hashes(row, failure)
+    jobmap_module.claim_job_row(smoke, row)
+    jobmap_module.complete_job_row(smoke, row, declared)
+    pilot_path = tmp_path / f"{failure}-pilot.json"
+    pilot = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                partition="i64m1tga40u",
+                time="04:00:00",
+                project_root=project_root,
+            )
+        ],
+        pilot_path,
+    )
+
+    def fake_output_validator(
+        _argv: object,
+        *,
+        expected_mode: str,
+    ) -> SimpleNamespace:
+        assert expected_mode == "smoke"
+        if failure == "deleted":
+            raise ValueError("training output cannot be opened safely")
+        return SimpleNamespace(
+            final_checkpoint_sha256=_h("different-checkpoint"),
+            in_loop_metadata_sha256=declared["in_loop_metadata_sha256"],
+            run_manifest_sha256=declared["run_manifest_sha256"],
+        )
+
+    monkeypatch.setattr(
+        submit_module,
+        "validate_training_command_outputs",
+        fake_output_validator,
+        raising=False,
+    )
+    commands: list[list[str]] = []
+    with pytest.raises(ValueError, match="output|artifact|hash|completion"):
+        submit_module.submit_available_pilot(
+            smoke_job_map=smoke_path,
+            smoke_sha256=smoke["payload_sha256"],
+            pilot_job_map=pilot_path,
+            pilot_sha256=pilot["payload_sha256"],
+            slurm_script=script,
+            log_dir=Path("logs/samga_brain_rw"),
+            runner=lambda command, **_kwargs: commands.append(list(command)),
+        )
+    assert commands == []
+
+
+def test_submitter_rejects_stray_output_without_calling_sbatch(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project_root, script = _submission_project(
+        tmp_path,
+        experiment_root,
+    )
+    smoke_path = tmp_path / "stray-output-smoke.json"
+    smoke = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                stage="stage-2-smoke",
+                project_root=project_root,
+            )
+        ],
+        smoke_path,
+    )
+    pilot_path = tmp_path / "stray-output-pilot.json"
+    pilot = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                partition="i64m1tga40u",
+                time="04:00:00",
+                project_root=project_root,
+            )
+        ],
+        pilot_path,
+    )
+    smoke_row = smoke["rows"][0]
+    output_dir = Path(str(smoke_row["completion_path"])).parent
+    output_dir.mkdir(parents=True)
+    (output_dir / "partial.bin").write_bytes(b"stray output")
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        calls.append(list(command))
+        return SimpleNamespace(stdout="12345\n", returncode=0)
+
+    with pytest.raises(RuntimeError, match="output|audit|recovery"):
+        submit_module.submit_available_pilot(
+            smoke_job_map=smoke_path,
+            smoke_sha256=smoke["payload_sha256"],
+            pilot_job_map=pilot_path,
+            pilot_sha256=pilot["payload_sha256"],
+            slurm_script=script,
+            log_dir=Path("logs/samga_brain_rw"),
+            runner=fake_runner,
+        )
+
     assert calls == []
 
 

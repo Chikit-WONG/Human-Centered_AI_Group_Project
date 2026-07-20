@@ -11,6 +11,7 @@ from pathlib import Path
 
 from samga_brain_rw.fusion import (
     assert_aligned,
+    common_alignment_payload,
     enumerate_stage1_configs,
 )
 from samga_brain_rw.hashing import canonical_json_bytes, sha256_json
@@ -207,30 +208,60 @@ def _metrics_payload(metrics: object) -> dict[str, object]:
     }
 
 
+def _source_run_key(source_records: list[object]) -> str | None:
+    observed: list[str | None] = []
+    for index, record in enumerate(source_records):
+        if not isinstance(record, Mapping):
+            raise ValueError(f"source_records[{index}] must be a mapping")
+        value = record.get("run_key")
+        if value is not None and (
+            not isinstance(value, str) or not value
+        ):
+            raise ValueError(
+                f"source_records[{index}].run_key must be a non-empty string"
+            )
+        observed.append(value)
+    present = [value for value in observed if value is not None]
+    if not present:
+        return None
+    if len(present) != len(observed) or len(set(present)) != 1:
+        raise ValueError(
+            "branch source records have inconsistent run_key provenance"
+        )
+    return present[0]
+
+
 def _input_binding(
     artifact: ScoreArtifact,
     branch_id: str,
-) -> dict[str, str]:
-    return {
+) -> dict[str, object]:
+    source_records = _deep_thaw(artifact.metadata["source_records"])
+    if not isinstance(source_records, list) or not source_records:
+        raise ValueError("branch source_records must be a non-empty list")
+    source_records_sha256 = sha256_json(source_records)
+    if source_records_sha256 != artifact.metadata["source_records_sha256"]:
+        raise ValueError("branch source-record SHA-256 mismatch")
+    provenance = _deep_thaw(artifact.provenance)
+    if not isinstance(provenance, dict):
+        raise ValueError("branch provenance must be a mapping")
+    binding: dict[str, object] = {
         "branch_id": branch_id,
-        "provenance_sha256": sha256_json(_deep_thaw(artifact.provenance)),
+        "provenance": provenance,
+        "provenance_sha256": sha256_json(provenance),
+        "run_key": _source_run_key(source_records),
         "score_payload_sha256": artifact.verified.payload_sha256,
+        "source_records": source_records,
+        "source_records_sha256": source_records_sha256,
+        "stage": artifact.metadata["stage"],
+    }
+    return {
+        **binding,
+        "binding_sha256": sha256_json(binding),
     }
 
 
 def _alignment_payload(artifact: ScoreArtifact) -> dict[str, object]:
-    return {
-        "scope": artifact.scope,
-        "protocol_sha256": artifact.metadata["protocol_sha256"],
-        "subject": artifact.metadata["subject"],
-        "seed": artifact.metadata["seed"],
-        "stage": artifact.metadata["stage"],
-        "source_records_sha256": artifact.metadata["source_records_sha256"],
-        "query_ids": list(artifact.query_ids),
-        "query_ids_sha256": artifact.metadata["query_ids_sha256"],
-        "gallery_ids": list(artifact.gallery_ids),
-        "gallery_ids_sha256": artifact.metadata["gallery_ids_sha256"],
-    }
+    return common_alignment_payload(artifact)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

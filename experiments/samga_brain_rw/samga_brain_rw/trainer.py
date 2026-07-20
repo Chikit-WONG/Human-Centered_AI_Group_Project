@@ -34,6 +34,7 @@ from .data import POSTERIOR_CHANNELS, ProtocolSubjectDataset
 from .feature_transforms import LayerNormTransform, TrainWhitening
 from .hashing import sha256_json
 from .model import SAMGALossOutput, SAMGATaskModel
+from .runtime_contract import validate_environment_binding
 from .scores import RetrievalMetrics, independent_retrieval_metrics
 from .upstream_samga import UpstreamComponents
 
@@ -51,7 +52,14 @@ SCHEDULE = {
     "mmd_end": 0.5,
     "optimizer": "AdamW",
     "betas": [0.9, 0.999],
+    "eps": 1e-8,
     "weight_decay": 1e-4,
+    "amsgrad": False,
+    "maximize": False,
+    "foreach": None,
+    "capturable": False,
+    "differentiable": False,
+    "fused": None,
     "scheduler": "constant_per_optimizer_stage",
 }
 SCHEDULE_SHA256 = sha256_json(SCHEDULE)
@@ -99,6 +107,7 @@ _RUNTIME_STATE_KEYS = {
     "schema_version",
     "epoch_complete",
     "next_epoch",
+    "resume_source_checkpoint_sha256",
     "optimizer_base_lr",
     "iterator_generator_state",
     "snapshot_epochs",
@@ -181,6 +190,7 @@ class TrainingCellSpec:
     trajectory_sha256: str
     data_order_sha256: str
     input_hashes: Mapping[str, str]
+    environment: Mapping[str, object]
     run_manifest: Mapping[str, object]
     candidate_spec: Mapping[str, object]
     checkpoint_builder: CheckpointBuilder
@@ -192,6 +202,7 @@ class TrainingCellSpec:
     num_workers: int = 0
     device: str | torch.device = "auto"
     resume_checkpoint: Mapping[str, object] | None = None
+    resume_source_checkpoint_sha256: str | None = None
     layernorm_config_id: str = "s2-layernorm-off"
     whitening_config_id: str = "s2-whitening-off"
     preprojector_config_id: str = "s2-preproj-shared"
@@ -226,6 +237,11 @@ class TrainingCellSpec:
         if self.schedule_sha256 != SCHEDULE_SHA256:
             raise ValueError("schedule_sha256 does not match the locked schedule")
         _validate_hash_mapping(self.input_hashes, "input_hashes")
+        object.__setattr__(
+            self,
+            "environment",
+            validate_environment_binding(self.environment),
+        )
         _validate_string_mapping(self.run_manifest, "run_manifest")
         _validate_string_mapping(self.candidate_spec, "candidate_spec")
         for value, name in (
@@ -302,10 +318,23 @@ class TrainingCellSpec:
             raise ValueError(
                 "TrainWhitening is only accepted by s2-whitening-on"
             )
-        if self.resume_checkpoint is not None:
+        if self.resume_checkpoint is None:
+            if self.resume_source_checkpoint_sha256 is not None:
+                raise ValueError(
+                    "resume source lineage requires a resume checkpoint"
+                )
+        else:
             _validate_string_mapping(
                 self.resume_checkpoint,
                 "resume_checkpoint",
+            )
+            if self.resume_source_checkpoint_sha256 is None:
+                raise ValueError(
+                    "resume checkpoint requires its actual source SHA lineage"
+                )
+            _require_sha256(
+                self.resume_source_checkpoint_sha256,
+                "resume_source_checkpoint_sha256",
             )
         object.__setattr__(self, "active_factor", active[0] if active else None)
 
@@ -1062,6 +1091,7 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
 
     if not isinstance(spec, TrainingCellSpec):
         raise TypeError("spec must be a TrainingCellSpec")
+    _validate_resume_environment_before_data(spec)
     device = _resolve_device(spec.device)
     _seed_fresh_process(spec.seed, device)
     train_dataset = _build_dataset(spec, "train", 0.3)
@@ -1104,6 +1134,11 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
         model,
         checkpoint_stage,
     )
+    if resume is not None:
+        _validate_optimizer_state_against_recipe(
+            resume["optimizer_state_dict"],
+            optimizer.state_dict(),
+        )
     global_step = 0
     start_epoch = 1
     resume_mid_epoch = False
@@ -1331,6 +1366,28 @@ def _validate_hash_mapping(value: object, context: str) -> None:
         _require_sha256(digest, f"{context}.{key}")
 
 
+def _validate_resume_environment_before_data(
+    spec: TrainingCellSpec,
+) -> None:
+    if spec.resume_checkpoint is None:
+        return
+    resume = _mapping(
+        spec.resume_checkpoint,
+        "resume checkpoint",
+    )
+    if "environment" not in resume:
+        raise ValueError(
+            "resume checkpoint environment mismatch: field is missing"
+        )
+    resumed_environment = validate_environment_binding(
+        resume["environment"]
+    )
+    if resumed_environment != dict(spec.environment):
+        raise ValueError(
+            "resume checkpoint environment mismatch"
+        )
+
+
 def _resolve_device(value: str | torch.device) -> torch.device:
     if isinstance(value, str) and value == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1387,27 +1444,88 @@ def _build_optimizer(
 ) -> tuple[torch.optim.AdamW, torch.optim.lr_scheduler.LambdaLR]:
     if optimizer_stage == "stage1":
         include_shared = True
-        learning_rate = 1e-4
+        learning_rate = float(SCHEDULE["stage1_learning_rate"])
     elif optimizer_stage == "stage2":
         include_shared = False
-        learning_rate = 5e-5
+        learning_rate = float(SCHEDULE["stage2_learning_rate"])
     else:
         raise ValueError("optimizer stage must be stage1 or stage2")
     groups = model.optimizer_parameter_groups(
         include_shared=include_shared,
         base_learning_rate=learning_rate,
     )
+    betas = SCHEDULE["betas"]
+    if not isinstance(betas, list) or len(betas) != 2:
+        raise AssertionError("locked AdamW betas are invalid")
     optimizer = torch.optim.AdamW(
         groups,
         lr=learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=1e-4,
+        betas=(float(betas[0]), float(betas[1])),
+        eps=float(SCHEDULE["eps"]),
+        weight_decay=float(SCHEDULE["weight_decay"]),
+        amsgrad=bool(SCHEDULE["amsgrad"]),
+        maximize=bool(SCHEDULE["maximize"]),
+        foreach=SCHEDULE["foreach"],
+        capturable=bool(SCHEDULE["capturable"]),
+        differentiable=bool(SCHEDULE["differentiable"]),
+        fused=SCHEDULE["fused"],
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=[lambda _: 1.0 for _ in groups],
     )
     return optimizer, scheduler
+
+
+def _validate_optimizer_state_against_recipe(
+    checkpoint_state_value: object,
+    fresh_state_value: object,
+) -> None:
+    checkpoint_state = _mapping(
+        checkpoint_state_value,
+        "checkpoint optimizer state",
+    )
+    fresh_state = _mapping(
+        fresh_state_value,
+        "fresh optimizer recipe",
+    )
+    checkpoint_groups = checkpoint_state.get("param_groups")
+    fresh_groups = fresh_state.get("param_groups")
+    if (
+        not isinstance(checkpoint_groups, list)
+        or not isinstance(fresh_groups, list)
+        or len(checkpoint_groups) != len(fresh_groups)
+    ):
+        raise ValueError(
+            "checkpoint optimizer recipe param-group count mismatch"
+        )
+    for index, (checkpoint_value, fresh_value) in enumerate(
+        zip(checkpoint_groups, fresh_groups, strict=True)
+    ):
+        checkpoint_group = _mapping(
+            checkpoint_value,
+            f"checkpoint optimizer recipe group {index}",
+        )
+        fresh_group = _mapping(
+            fresh_value,
+            f"fresh optimizer recipe group {index}",
+        )
+        if set(checkpoint_group) != set(fresh_group):
+            raise ValueError(
+                f"checkpoint optimizer recipe group {index} schema mismatch"
+            )
+        for key in fresh_group:
+            if _semantic_sha256(
+                checkpoint_group[key],
+                f"checkpoint optimizer recipe group {index}.{key}",
+            ) != _semantic_sha256(
+                fresh_group[key],
+                f"fresh optimizer recipe group {index}.{key}",
+            ):
+                raise ValueError(
+                    "checkpoint optimizer recipe mismatch at "
+                    f"group {index}.{key}"
+                )
 
 
 def _mmd_weight_for_epoch(epoch: int) -> float:
@@ -1669,12 +1787,7 @@ def _validate_checkpoint_schema(
     _validate_hash_mapping(payload["input_hashes"], f"{context} input_hashes")
     _mapping(payload["run_manifest"], f"{context} run_manifest")
     _mapping(payload["candidate_spec"], f"{context} candidate_spec")
-    environment = _mapping(payload["environment"], f"{context} environment")
-    _exact_keys(
-        environment,
-        {"python", "torch", "numpy", "cuda"},
-        f"{context} environment",
-    )
+    validate_environment_binding(payload["environment"])
     runtime = _mapping(payload["runtime_state"], f"{context} runtime state")
     _exact_keys(runtime, _RUNTIME_STATE_KEYS, f"{context} runtime state")
     retention = _mapping(payload["retention"], f"{context} retention")
@@ -1710,6 +1823,7 @@ def _validate_checkpoint_position(
         ("data_order_sha256", spec.data_order_sha256),
         ("effective_batch", spec.batch_size),
         ("input_hashes", dict(spec.input_hashes)),
+        ("environment", dict(spec.environment)),
         ("run_manifest", dict(spec.run_manifest)),
         ("candidate_spec", dict(spec.candidate_spec)),
     )
@@ -1724,7 +1838,19 @@ def _validate_checkpoint_position(
         raise ValueError(f"{context} epoch_complete must be boolean")
     if runtime["next_epoch"] != epoch + int(epoch_complete):
         raise ValueError(f"{context} next_epoch mismatch")
-    expected_base_lr = 1e-4 if expected_stage == "stage1" else 5e-5
+    resume_source = runtime["resume_source_checkpoint_sha256"]
+    if resume_source is not None:
+        _require_sha256(
+            resume_source,
+            f"{context} resume source checkpoint",
+        )
+    expected_base_lr = float(
+        SCHEDULE[
+            "stage1_learning_rate"
+            if expected_stage == "stage1"
+            else "stage2_learning_rate"
+        ]
+    )
     if runtime["optimizer_base_lr"] != expected_base_lr:
         raise ValueError(f"{context} optimizer base LR mismatch")
     _cpu_generator_state(
@@ -2081,6 +2207,14 @@ def _validate_built_checkpoint(
         dataset_size=sampler.dataset_size,
         context="checkpoint builder result",
     )
+    runtime = _mapping(
+        payload["runtime_state"],
+        "checkpoint builder runtime state",
+    )
+    if runtime["resume_source_checkpoint_sha256"] != (
+        spec.resume_source_checkpoint_sha256
+    ):
+        raise ValueError("checkpoint builder resume lineage mismatch")
     if hash_state_dict(model.state_dict()) != payload["model_state_sha256"]:
         raise ValueError("checkpoint builder model state hash mismatch")
     comparisons = (
@@ -2186,6 +2320,7 @@ def _build_checkpoint(
         generator=generator,
         validation_metrics=validation_metrics,
         input_hashes=dict(spec.input_hashes),
+        environment=dict(spec.environment),
         effective_batch=spec.batch_size,
         sampler_state=sampler.state_dict(),
         run_manifest=dict(spec.run_manifest),
@@ -2198,8 +2333,15 @@ def _build_checkpoint(
         "schema_version": 1,
         "epoch_complete": epoch_complete,
         "next_epoch": epoch + int(epoch_complete),
-        "optimizer_base_lr": (
-            1e-4 if optimizer_stage == "stage1" else 5e-5
+        "resume_source_checkpoint_sha256": (
+            spec.resume_source_checkpoint_sha256
+        ),
+        "optimizer_base_lr": float(
+            SCHEDULE[
+                "stage1_learning_rate"
+                if optimizer_stage == "stage1"
+                else "stage2_learning_rate"
+            ]
         ),
         "iterator_generator_state": (
             iterator_generator_state.detach().cpu().clone()
