@@ -488,6 +488,19 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _thaw_loaded_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("loaded JSON mappings require string keys")
+        return {
+            key: _thaw_loaded_json(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_thaw_loaded_json(child) for child in value]
+    return value
+
+
 def _validate_run_manifest(
     value: Mapping[str, object],
     *,
@@ -696,9 +709,10 @@ def _validate_score_identity(
             ],
         }
         for field, expected_value in runtime.items():
-            if artifact.metadata[field] != expected_value:
+            expected_json = _thaw_loaded_json(expected_value)
+            if _thaw_loaded_json(artifact.metadata[field]) != expected_json:
                 raise ValueError(f"BrainRW score runtime binding {field} mismatch")
-            if artifact.provenance[field] != expected_value:
+            if _thaw_loaded_json(artifact.provenance[field]) != expected_json:
                 raise ValueError(
                     f"BrainRW score provenance runtime binding {field} mismatch"
                 )

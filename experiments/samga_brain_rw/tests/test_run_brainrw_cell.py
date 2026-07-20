@@ -965,6 +965,22 @@ def test_score_identity_accepts_loaded_score_frozen_json_containers(
         MappingProxyType(dict(record)) for record in artifact.metadata["source_records"]
     )
     artifact.metadata["ordered_ids"] = tuple(artifact.metadata["ordered_ids"])
+    runtime_evidence = {
+        "accelerator_name": "NVIDIA A40",
+        "cuda_capability": [8, 6],
+    }
+    runtime_evidence_sha256 = sha256_json(runtime_evidence)
+    checkpoint.payload["runtime_evidence"] = runtime_evidence
+    checkpoint.payload["runtime_evidence_sha256"] = runtime_evidence_sha256
+    frozen_runtime_evidence = MappingProxyType(
+        {
+            "accelerator_name": "NVIDIA A40",
+            "cuda_capability": (8, 6),
+        }
+    )
+    for binding in (artifact.metadata, artifact.provenance):
+        binding["evaluation_runtime_evidence"] = frozen_runtime_evidence
+        binding["evaluation_runtime_evidence_sha256"] = runtime_evidence_sha256
 
     runner_module._validate_score_identity(
         artifact,
