@@ -254,7 +254,7 @@ def build_stage1_cost_rows(
             "completion_path": str(output_dir / "completion.json"),
             "config_id": _CONFIG_ID,
             "config_sha256": config_sha256,
-            "cpus": 16,
+            "cpus": 8,
             "expected_completion_schema": {
                 "payload_type": "samga_brain_rw.stage1_cost_completion",
                 "required_output_hashes": [

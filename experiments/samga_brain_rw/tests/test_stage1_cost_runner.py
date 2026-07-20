@@ -302,7 +302,7 @@ def test_cost_job_map_is_one_exact_low_partition_a40_benchmark(
     assert row["role"] == "cost-benchmark"
     assert row["partition"] == "i64m1tga40u"
     assert row["gres"] == "gpu:a40:1"
-    assert row["cpus"] == 16
+    assert row["cpus"] == 8
     assert row["memory"] == "64G"
     assert row["time"] == "12:00:00"
     assert (row["subject"], row["seed"]) == (1, 20260720)
