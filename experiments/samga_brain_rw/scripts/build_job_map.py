@@ -129,6 +129,17 @@ _GENERATION_RE = re.compile(r"^generation-(\d{6})$")
 _DEVELOPMENT_STAGE_RE = re.compile(
     r"^stage-(?P<stage>[02])-(?P<phase>smoke|pilot|full)$"
 )
+_BRAINRW_STAGE_RE = re.compile(
+    r"^stage-1-brainrw-(?P<phase>smoke|pilot)$"
+)
+_BRAINRW_TOPOLOGIES = {
+    "stage-1-brainrw-smoke": ((8, 42),),
+    "stage-1-brainrw-pilot": tuple(
+        (subject, seed)
+        for subject in (1, 5, 8)
+        for seed in (42, 43)
+    ),
+}
 _SLURM_ARRAY_JOB_RE = re.compile(
     r"^(?P<array_job_id>[1-9][0-9]*)_(?P<array_task_id>0|[1-9][0-9]*)$"
 )
@@ -518,6 +529,353 @@ def _validate_training_runner_argv(
         )
 
 
+def _validate_brainrw_runner_argv(
+    row: Mapping[str, object],
+    argv: Sequence[str],
+) -> None:
+    if len(argv) < 2:
+        raise ValueError("sealed BrainRW runner argv is incomplete")
+    executable = PurePosixPath(argv[1]).as_posix()
+    match = _BRAINRW_STAGE_RE.fullmatch(str(row["stage"]))
+    expected_suffix = (
+        "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
+    )
+    uses_runner = executable.endswith(expected_suffix)
+    if match is not None and not uses_runner:
+        raise ValueError("Stage 1 BrainRW stage requires the BrainRW runner")
+    if uses_runner and match is None:
+        raise ValueError(
+            "BrainRW runner requires stage-1-brainrw-smoke or pilot"
+        )
+    if match is None:
+        return
+    if argv[0] != "python":
+        raise ValueError("sealed BrainRW runner must use the python prefix")
+    argument_tokens = argv[2:]
+    if (
+        len(argument_tokens) % 2 != 0
+        or any(
+            not value.startswith("--")
+            for value in argument_tokens[::2]
+        )
+        or any(
+            value.startswith("--")
+            for value in argument_tokens[1::2]
+        )
+    ):
+        raise ValueError(
+            "sealed BrainRW runner argv must contain only flag/value pairs"
+        )
+    flags = list(argument_tokens[::2])
+    if len(flags) != len(set(flags)):
+        raise ValueError("sealed BrainRW runner argv contains a duplicate flag")
+    required = {
+        "--mode",
+        "--subject",
+        "--seed",
+        "--resume",
+        "--config",
+        "--manifest",
+        "--clip-path",
+        "--output-dir",
+        "--project-root",
+        "--config-id",
+        "--expected-config-sha256",
+        "--expected-input-bundle-sha256",
+        "--expected-semantic-environment-sha256",
+        "--run-key",
+        "--device",
+    }
+    phase = match.group("phase")
+    allowed = set(required)
+    if phase == "smoke":
+        allowed.add("--max-train-steps")
+    if set(flags) != allowed:
+        missing = sorted(allowed - set(flags))
+        extra = sorted(set(flags) - allowed)
+        raise ValueError(
+            "sealed BrainRW runner flags mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+    values = {flag: _flag_value(argv, flag) for flag in required}
+    expected_mode = "smoke" if phase == "smoke" else "full"
+    expected_run_key = make_run_key(
+        "brainrw-clip-lora",
+        str(row["config_id"]),
+        int(row["subject"]),
+        int(row["seed"]),
+        str(row["config_sha256"]),
+        str(row["input_bundle_sha256"]),
+    )
+    if row["run_key"] != expected_run_key:
+        raise ValueError("sealed BrainRW row run_key is not canonical")
+    expected = {
+        "--mode": expected_mode,
+        "--subject": str(row["subject"]),
+        "--seed": str(row["seed"]),
+        "--resume": "none",
+        "--config-id": str(row["config_id"]),
+        "--expected-config-sha256": str(row["config_sha256"]),
+        "--expected-input-bundle-sha256": str(
+            row["input_bundle_sha256"]
+        ),
+        "--run-key": str(row["run_key"]),
+        "--device": "cuda",
+    }
+    for flag, expected_value in expected.items():
+        if values[flag] != expected_value:
+            label = flag.removeprefix("--").replace("-", "_")
+            raise ValueError(
+                f"sealed BrainRW argv {label} does not match the row"
+            )
+    _require_sha256(
+        values["--expected-semantic-environment-sha256"],
+        "BrainRW semantic environment",
+    )
+    if row["role"] != "clip-branch":
+        raise ValueError("Stage 1 BrainRW role must be clip-branch")
+    if row["config_id"] != "brainrw_clip_lora_v1":
+        raise ValueError(
+            "Stage 1 BrainRW config_id must be brainrw_clip_lora_v1"
+        )
+    project_root = _validate_canonical_absolute_path(
+        values["--project-root"],
+        "sealed BrainRW project-root",
+    )
+    expected_runner = (project_root / expected_suffix).as_posix()
+    if executable != expected_runner:
+        raise ValueError(
+            "BrainRW runner path does not match the declared project-root"
+        )
+    config_path = _validate_canonical_absolute_path(
+        values["--config"],
+        "sealed BrainRW config",
+    )
+    expected_config = (
+        project_root
+        / "experiments/samga_brain_rw/configs/"
+        "brainrw_clip_lora_v1.json"
+    )
+    if config_path != expected_config:
+        raise ValueError("sealed BrainRW config path is not the locked config")
+    manifest_path = _validate_canonical_absolute_path(
+        values["--manifest"],
+        "sealed BrainRW manifest",
+    )
+    expected_manifest = (
+        project_root
+        / "artifacts/samga_brain_rw/protocol/manifests"
+        / f"sub-{int(row['subject']):02d}_protocol.json"
+    )
+    if manifest_path != expected_manifest:
+        raise ValueError(
+            "sealed BrainRW manifest is not the subject protocol manifest"
+        )
+    _validate_canonical_absolute_path(
+        values["--clip-path"],
+        "sealed BrainRW CLIP path",
+    )
+    output_dir = _validate_canonical_absolute_path(
+        values["--output-dir"],
+        "sealed BrainRW output directory",
+    )
+    completion_path = _validate_canonical_absolute_path(
+        row["completion_path"],
+        "completion_path",
+    )
+    expected_output_parent = (
+        project_root
+        / "artifacts/samga_brain_rw"
+        / str(row["stage"])
+    )
+    if (
+        output_dir.parent != expected_output_parent
+        or output_dir.name != row["run_key"]
+        or completion_path != output_dir / "completion.json"
+    ):
+        raise ValueError(
+            "sealed BrainRW output/completion does not match stage and run_key"
+        )
+    if phase == "smoke":
+        if _flag_value(argv, "--max-train-steps") != "1":
+            raise ValueError(
+                "Stage 1 BrainRW smoke requires exactly one training step"
+            )
+        expected_resource = {
+            "partition": "debug",
+            "gres": "gpu:a40:1",
+            "cpus": 8,
+            "memory": "64G",
+            "time": "00:30:00",
+            "stdout_path": (
+                "logs/samga_brain_rw/stage1_brainrw_%A_%a.out"
+            ),
+            "stderr_path": (
+                "logs/samga_brain_rw/stage1_brainrw_%A_%a.err"
+            ),
+        }
+        payload_type = "samga_brain_rw.brainrw_smoke_completion"
+        required_hashes = [
+            "final_checkpoint_sha256",
+            "in_loop_metadata_sha256",
+            "run_manifest_sha256",
+        ]
+    else:
+        expected_resource = {
+            "partition": "i64m1tga40u",
+            "gres": "gpu:a40:1",
+            "cpus": 8,
+            "memory": "64G",
+            "time": "02:00:00",
+            "stdout_path": (
+                "logs/samga_brain_rw/stage1_brainrw_%A_%a.out"
+            ),
+            "stderr_path": (
+                "logs/samga_brain_rw/stage1_brainrw_%A_%a.err"
+            ),
+        }
+        payload_type = "samga_brain_rw.brainrw_full_completion"
+        required_hashes = [
+            "final_checkpoint_sha256",
+            "run_manifest_sha256",
+            "score_envelope_sha256",
+            "score_payload_sha256",
+        ]
+    for field, expected_value in expected_resource.items():
+        if row[field] != expected_value:
+            raise ValueError(
+                f"Stage 1 BrainRW {phase} resource {field} mismatch"
+            )
+    schema = row["expected_completion_schema"]
+    if (
+        not isinstance(schema, Mapping)
+        or schema.get("schema_version") != 1
+        or schema.get("payload_type") != payload_type
+        or schema.get("required_output_hashes") != required_hashes
+    ):
+        raise ValueError(
+            "Stage 1 BrainRW completion schema does not match the phase"
+        )
+
+
+def _validate_brainrw_map_topology(
+    stage: str,
+    rows: Sequence[Mapping[str, object]],
+) -> None:
+    """Validate the sealed Stage 1 grid and its cross-row identity."""
+
+    expected_cells = _BRAINRW_TOPOLOGIES.get(stage)
+    if expected_cells is None:
+        return
+    cells = sorted(
+        (int(row["subject"]), int(row["seed"]))
+        for row in rows
+    )
+    if cells != list(expected_cells):
+        raise ValueError(
+            "Stage 1 BrainRW map topology differs from the sealed cell grid"
+        )
+    identity_fields = {
+        "config_id": lambda row, argv: str(row["config_id"]),
+        "config_sha256": lambda row, argv: str(row["config_sha256"]),
+        "semantic_environment": lambda row, argv: _flag_value(
+            argv,
+            "--expected-semantic-environment-sha256",
+        ),
+        "project_root": lambda row, argv: _flag_value(
+            argv,
+            "--project-root",
+        ),
+        "runner": lambda row, argv: str(argv[1]),
+        "config_path": lambda row, argv: _flag_value(
+            argv,
+            "--config",
+        ),
+        "clip_path": lambda row, argv: _flag_value(
+            argv,
+            "--clip-path",
+        ),
+    }
+    for field, extractor in identity_fields.items():
+        values: set[str] = set()
+        for row in rows:
+            argv = row["argv"]
+            if not isinstance(argv, list):
+                raise ValueError("Stage 1 BrainRW argv is invalid")
+            values.add(extractor(row, argv))
+        if len(values) != 1:
+            raise ValueError(
+                "Stage 1 BrainRW map identity is inconsistent for "
+                f"{field}"
+            )
+    for subject in sorted({int(row["subject"]) for row in rows}):
+        subject_rows = [
+            row for row in rows if int(row["subject"]) == subject
+        ]
+        bundles = {
+            str(row["input_bundle_sha256"])
+            for row in subject_rows
+        }
+        manifests = {
+            _flag_value(row["argv"], "--manifest")  # type: ignore[arg-type]
+            for row in subject_rows
+        }
+        if len(bundles) != 1 or len(manifests) != 1:
+            raise ValueError(
+                "Stage 1 BrainRW subject manifest/input bundle "
+                "identity is inconsistent across seeds"
+            )
+
+
+def brainrw_map_identity(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the comparable sealed identity of one Stage 1 map."""
+
+    stage = payload.get("stage")
+    rows = payload.get("rows")
+    if (
+        not isinstance(stage, str)
+        or stage not in _BRAINRW_TOPOLOGIES
+        or not isinstance(rows, list)
+        or not rows
+        or any(not isinstance(row, Mapping) for row in rows)
+    ):
+        raise ValueError("payload is not a sealed Stage 1 BrainRW map")
+    _validate_brainrw_map_topology(stage, rows)
+    first = rows[0]
+    argv = first["argv"]
+    if not isinstance(argv, list):
+        raise ValueError("Stage 1 BrainRW argv is invalid")
+    sub08 = [row for row in rows if row["subject"] == 8]
+    manifests = {
+        _flag_value(row["argv"], "--manifest")  # type: ignore[arg-type]
+        for row in sub08
+    }
+    bundles = {
+        str(row["input_bundle_sha256"])
+        for row in sub08
+    }
+    if len(manifests) != 1 or len(bundles) != 1:
+        raise ValueError(
+            "Stage 1 sub08 manifest/input identity is inconsistent"
+        )
+    return {
+        "project_root": _flag_value(argv, "--project-root"),
+        "runner": str(argv[1]),
+        "config_id": str(first["config_id"]),
+        "config_sha256": str(first["config_sha256"]),
+        "config_path": _flag_value(argv, "--config"),
+        "semantic_environment_sha256": _flag_value(
+            argv,
+            "--expected-semantic-environment-sha256",
+        ),
+        "clip_path": _flag_value(argv, "--clip-path"),
+        "sub08_manifest_path": next(iter(manifests)),
+        "sub08_input_bundle_sha256": next(iter(bundles)),
+    }
+
+
 def _validate_completion_schema(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("expected_completion_schema must be an object")
@@ -577,6 +935,7 @@ def _validate_row(
         raise ValueError("sealed argv seed does not match the job-map row")
     _require_nonempty_string(_flag_value(argv, "--config"), "argv config")
     _validate_training_runner_argv(row, argv)
+    _validate_brainrw_runner_argv(row, argv)
 
     partition = _require_nonempty_string(row["partition"], "partition")
     if partition not in ALLOWED_A40_PARTITIONS:
@@ -666,6 +1025,8 @@ def build_job_map(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     stages = {str(row["stage"]) for row in validated}
     if len(stages) != 1:
         raise ValueError("job map must contain one homogeneous stage")
+    stage = next(iter(stages))
+    _validate_brainrw_map_topology(stage, validated)
     resources = {_resource_key(row) for row in validated}
     if len(resources) != 1:
         raise ValueError("job map must contain one homogeneous resource class")
@@ -690,7 +1051,7 @@ def build_job_map(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "payload_type": JOB_MAP_TYPE,
-        "stage": next(iter(stages)),
+        "stage": stage,
         "array_bounds": [0, len(indexed) - 1],
         "row_count": len(indexed),
         "rows": indexed,
@@ -731,6 +1092,7 @@ def validate_job_map(payload: Mapping[str, object]) -> dict[str, object]:
     ]
     if any(row["stage"] != stage for row in validated):
         raise ValueError("job-map row stage mismatch")
+    _validate_brainrw_map_topology(stage, validated)
     indices = [row["array_index"] for row in validated]
     if indices != list(range(count)):
         raise ValueError("job-map array indices must be unique and contiguous")

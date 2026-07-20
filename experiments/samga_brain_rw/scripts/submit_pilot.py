@@ -11,10 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from build_job_map import (
+    brainrw_map_identity,
     completion_is_valid,
     completion_output_hashes,
     load_job_map,
     should_submit_row,
+)
+from run_brainrw_cell import (
+    validate_brainrw_command_outputs,
+    validate_brainrw_map_config,
 )
 from run_training_cell import validate_training_command_outputs
 
@@ -51,9 +56,32 @@ def _refuse_out_of_scope_submission(
         raise ValueError("the prerequisite job map must be a smoke stage")
     if "pilot" not in pilot_stage:
         raise ValueError("the submitted job map must be a current pilot stage")
+    smoke_family = re.sub(r"[-_]smoke$", "", smoke_stage)
+    pilot_family = re.sub(r"[-_]pilot$", "", pilot_stage)
+    if smoke_family != pilot_family:
+        raise ValueError(
+            "smoke and pilot job maps must belong to the same stage family"
+        )
     match = re.search(r"stage[-_]?(\d+)", pilot_stage)
     if match is not None and int(match.group(1)) >= 3:
         raise ValueError("Stage 3-5 submission is forbidden at the current stage")
+
+
+def _cross_bind_stage1_brainrw_maps(
+    smoke: Mapping[str, object],
+    pilot: Mapping[str, object],
+) -> None:
+    if _stage(smoke).lower() != "stage-1-brainrw-smoke":
+        return
+    smoke_identity = brainrw_map_identity(smoke)
+    pilot_identity = brainrw_map_identity(pilot)
+    for field, smoke_value in smoke_identity.items():
+        if pilot_identity.get(field) != smoke_value:
+            raise ValueError(
+                "Stage 1 smoke/pilot identity differs for "
+                f"{field}"
+            )
+    validate_brainrw_map_config(_rows(smoke)[0]["argv"])
 
 
 def _rows(payload: Mapping[str, object]) -> list[dict[str, object]]:
@@ -76,6 +104,7 @@ def _incomplete_rows(
 def _revalidate_completed_smoke_outputs(
     payload: Mapping[str, object],
 ) -> None:
+    brainrw = _stage(payload).lower() == "stage-1-brainrw-smoke"
     expected_names = {
         "final_checkpoint_sha256",
         "in_loop_metadata_sha256",
@@ -91,15 +120,32 @@ def _revalidate_completed_smoke_outputs(
             raise ValueError(
                 "smoke completion hashes differ from the release gate schema"
             )
-        outputs = validate_training_command_outputs(
-            row["argv"],
-            expected_mode="smoke",
-        )
-        actual = {
-            "final_checkpoint_sha256": outputs.final_checkpoint_sha256,
-            "in_loop_metadata_sha256": outputs.in_loop_metadata_sha256,
-            "run_manifest_sha256": outputs.run_manifest_sha256,
-        }
+        if brainrw:
+            outputs = validate_brainrw_command_outputs(
+                row["argv"],
+                expected_mode="smoke",
+            )
+            actual = {
+                "final_checkpoint_sha256": outputs.checkpoint_sha256,
+                "in_loop_metadata_sha256": (
+                    outputs.in_loop_metadata_sha256
+                ),
+                "run_manifest_sha256": outputs.run_manifest_sha256,
+            }
+        else:
+            outputs = validate_training_command_outputs(
+                row["argv"],
+                expected_mode="smoke",
+            )
+            actual = {
+                "final_checkpoint_sha256": (
+                    outputs.final_checkpoint_sha256
+                ),
+                "in_loop_metadata_sha256": (
+                    outputs.in_loop_metadata_sha256
+                ),
+                "run_manifest_sha256": outputs.run_manifest_sha256,
+            }
         if actual != declared:
             raise ValueError(
                 "smoke artifact hashes differ from the sealed completion"
@@ -330,6 +376,7 @@ def submit_available_pilot(
     smoke = load_job_map(smoke_path, expected_sha256=smoke_sha256)
     pilot = load_job_map(pilot_path, expected_sha256=pilot_sha256)
     _refuse_out_of_scope_submission(smoke, pilot, script_path)
+    _cross_bind_stage1_brainrw_maps(smoke, pilot)
 
     smoke_incomplete = _incomplete_rows(smoke)
     if smoke_incomplete:

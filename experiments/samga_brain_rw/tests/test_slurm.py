@@ -77,6 +77,10 @@ def submit_module(
         experiment_root / "scripts" / "run_training_cell.py",
         "run_training_cell",
     )
+    _load_script(
+        experiment_root / "scripts" / "run_brainrw_cell.py",
+        "run_brainrw_cell",
+    )
     return _load_script(
         experiment_root / "scripts" / "submit_pilot.py",
         "submit_pilot",
@@ -232,9 +236,183 @@ def _output_hashes(
     return {str(name): _h(f"{label}:{name}") for name in names}
 
 
+def _brainrw_row(
+    tmp_path: Path,
+    *,
+    stage: str,
+    subject: int = 8,
+    seed: int = 42,
+    project_root: Path | None = None,
+) -> dict[str, object]:
+    phase = "smoke" if stage.endswith("-smoke") else "pilot"
+    mode = "smoke" if phase == "smoke" else "full"
+    selected_project_root = (
+        project_root or tmp_path / "project-root"
+    ).resolve()
+    selected_project_root.mkdir(parents=True, exist_ok=True)
+    config_sha256 = _h("brainrw-config")
+    input_bundle_sha256 = _h(f"brainrw-input:{subject}")
+    semantic_environment_sha256 = _h("brainrw-environment")
+    run_key = make_run_key(
+        "brainrw-clip-lora",
+        "brainrw_clip_lora_v1",
+        subject,
+        seed,
+        config_sha256,
+        input_bundle_sha256,
+    )
+    output_dir = (
+        selected_project_root
+        / "artifacts/samga_brain_rw"
+        / stage
+        / run_key
+    )
+    argv = [
+        "python",
+        str(
+            selected_project_root
+            / "experiments/samga_brain_rw/scripts/run_brainrw_cell.py"
+        ),
+        "--mode",
+        mode,
+        "--subject",
+        str(subject),
+        "--seed",
+        str(seed),
+        "--resume",
+        "none",
+        "--config",
+        str(
+            selected_project_root
+            / "experiments/samga_brain_rw/configs/"
+            "brainrw_clip_lora_v1.json"
+        ),
+        "--manifest",
+        str(
+            selected_project_root
+            / "artifacts/samga_brain_rw/protocol/manifests/"
+            f"sub-{subject:02d}_protocol.json"
+        ),
+        "--clip-path",
+        str((tmp_path / "models" / "clip").resolve()),
+        "--output-dir",
+        str(output_dir),
+        "--project-root",
+        str(selected_project_root),
+        "--config-id",
+        "brainrw_clip_lora_v1",
+        "--expected-config-sha256",
+        config_sha256,
+        "--expected-input-bundle-sha256",
+        input_bundle_sha256,
+        "--expected-semantic-environment-sha256",
+        semantic_environment_sha256,
+        "--run-key",
+        run_key,
+        "--device",
+        "cuda",
+    ]
+    if mode == "smoke":
+        argv.extend(["--max-train-steps", "1"])
+    required = (
+        [
+            "final_checkpoint_sha256",
+            "in_loop_metadata_sha256",
+            "run_manifest_sha256",
+        ]
+        if mode == "smoke"
+        else [
+            "final_checkpoint_sha256",
+            "run_manifest_sha256",
+            "score_envelope_sha256",
+            "score_payload_sha256",
+        ]
+    )
+    return {
+        "stage": stage,
+        "role": "clip-branch",
+        "config_id": "brainrw_clip_lora_v1",
+        "config_sha256": config_sha256,
+        "input_bundle_sha256": input_bundle_sha256,
+        "subject": subject,
+        "seed": seed,
+        "run_key": run_key,
+        "argv": argv,
+        "partition": "debug" if mode == "smoke" else "i64m1tga40u",
+        "gres": "gpu:a40:1",
+        "cpus": 8,
+        "memory": "64G",
+        "time": "00:30:00" if mode == "smoke" else "02:00:00",
+        "stdout_path": (
+            "logs/samga_brain_rw/stage1_brainrw_%A_%a.out"
+        ),
+        "stderr_path": (
+            "logs/samga_brain_rw/stage1_brainrw_%A_%a.err"
+        ),
+        "completion_path": str(output_dir / "completion.json"),
+        "expected_completion_schema": {
+            "schema_version": 1,
+            "payload_type": (
+                "samga_brain_rw.brainrw_smoke_completion"
+                if mode == "smoke"
+                else "samga_brain_rw.brainrw_full_completion"
+            ),
+            "required_output_hashes": required,
+        },
+    }
+
+
+def _rebind_brainrw_row_run_key(
+    row: dict[str, object],
+) -> None:
+    argv = row["argv"]
+    assert isinstance(argv, list)
+    run_key = make_run_key(
+        "brainrw-clip-lora",
+        str(row["config_id"]),
+        int(row["subject"]),
+        int(row["seed"]),
+        str(row["config_sha256"]),
+        str(row["input_bundle_sha256"]),
+    )
+    row["run_key"] = run_key
+    argv[argv.index("--run-key") + 1] = run_key
+    output = (
+        Path(argv[argv.index("--project-root") + 1])
+        / "artifacts/samga_brain_rw"
+        / str(row["stage"])
+        / run_key
+    )
+    argv[argv.index("--output-dir") + 1] = str(output)
+    row["completion_path"] = str(output / "completion.json")
+
+
 def _rehash(payload: dict[str, object]) -> None:
     body = {key: value for key, value in payload.items() if key != "payload_sha256"}
     payload["payload_sha256"] = sha256_json(body)
+
+
+def _replace_job_map_rows(
+    payload: dict[str, object],
+    rows: list[dict[str, object]],
+    jobmap_module: ModuleType,
+) -> None:
+    raw = [
+        {
+            key: copy.deepcopy(value)
+            for key, value in row.items()
+            if key != "array_index"
+        }
+        for row in rows
+    ]
+    ordered = sorted(raw, key=jobmap_module.job_row_sort_key)
+    payload["rows"] = [
+        {"array_index": index, **row}
+        for index, row in enumerate(ordered)
+    ]
+    payload["row_count"] = len(ordered)
+    payload["array_bounds"] = [0, len(ordered) - 1]
+    _rehash(payload)
 
 
 def _claimed_job_environment(
@@ -920,6 +1098,298 @@ def test_unified_training_row_rejects_missing_device_but_legacy_is_unchanged(
     legacy = _row(tmp_path, stage="confirmation", training_runner=False)
     assert "--device" not in legacy["argv"]
     assert jobmap_module.build_job_map([legacy])["row_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        (
+            lambda row: row.update({"role": "candidate"}),
+            "role|clip-branch",
+        ),
+        (
+            lambda row: row["argv"].__setitem__(
+                row["argv"].index("--mode") + 1,
+                "full",
+            ),
+            "mode|smoke",
+        ),
+        (
+            lambda row: row["argv"].__setitem__(
+                row["argv"].index("--resume") + 1,
+                "/tmp/checkpoint.pt",
+            ),
+            "resume|fresh|none",
+        ),
+        (
+            lambda row: row.update({"time": "00:29:59"}),
+            "resource|time|30",
+        ),
+        (
+            lambda row: row.update(
+                {
+                    "stdout_path": (
+                        "logs/samga_brain_rw/other_%A_%a.out"
+                    )
+                }
+            ),
+            "resource|stdout|log",
+        ),
+        (
+            lambda row: row.update(
+                {
+                    "stderr_path": (
+                        "logs/samga_brain_rw/other_%A_%a.err"
+                    )
+                }
+            ),
+            "resource|stderr|log",
+        ),
+        (
+            lambda row: row["expected_completion_schema"].update(
+                {"payload_type": "samga_brain_rw.job_completion"}
+            ),
+            "completion|payload_type|schema",
+        ),
+        (
+            lambda row: row["argv"].__setitem__(
+                1,
+                str(Path(row["argv"][1]).with_name("run_training_cell.py")),
+            ),
+            "BrainRW|brainrw|runner",
+        ),
+        (
+            lambda row: row["argv"].append("unexpected-positional"),
+            "argv|positional|flag",
+        ),
+    ),
+)
+def test_stage1_brainrw_row_rejects_unsealed_argv_resource_or_schema(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+    mutation: object,
+    match: str,
+) -> None:
+    row = _brainrw_row(
+        tmp_path,
+        stage="stage-1-brainrw-smoke",
+    )
+    mutation(row)  # type: ignore[operator]
+    with pytest.raises(ValueError, match=match):
+        jobmap_module.build_job_map([row])
+
+
+def test_stage1_brainrw_pilot_requires_exact_full_resource_contract(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _brainrw_row(
+            tmp_path,
+            stage="stage-1-brainrw-pilot",
+            subject=subject,
+            seed=seed,
+        )
+        for subject in (1, 5, 8)
+        for seed in (42, 43)
+    ]
+    assert jobmap_module.build_job_map(rows)["row_count"] == 6
+
+    for field, value in (
+        ("partition", "debug"),
+        ("time", "01:59:59"),
+        ("cpus", 7),
+        ("memory", "63G"),
+    ):
+        mutated = copy.deepcopy(rows[0])
+        mutated[field] = value
+        with pytest.raises(ValueError, match="resource|partition|time|cpu|memory"):
+            jobmap_module.build_job_map([mutated, *rows[1:]])
+
+
+def test_stage1_brainrw_topology_rejects_subsets_supersets_and_wrong_cells(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    pilot_rows = [
+        _brainrw_row(
+            tmp_path,
+            stage="stage-1-brainrw-pilot",
+            subject=subject,
+            seed=seed,
+        )
+        for subject in (1, 5, 8)
+        for seed in (42, 43)
+    ]
+    assert jobmap_module.build_job_map(pilot_rows)["row_count"] == 6
+
+    invalid_topologies = (
+        pilot_rows[:-1],
+        [
+            *pilot_rows,
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-pilot",
+                subject=9,
+                seed=42,
+            ),
+        ],
+        [
+            *pilot_rows[:-1],
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-pilot",
+                subject=9,
+                seed=42,
+            ),
+        ],
+    )
+    for rows in invalid_topologies:
+        with pytest.raises(ValueError, match="topology|grid|cell|subject|seed"):
+            jobmap_module.build_job_map(rows)
+
+    wrong_smoke = _brainrw_row(
+        tmp_path,
+        stage="stage-1-brainrw-smoke",
+        subject=1,
+        seed=42,
+    )
+    with pytest.raises(ValueError, match="topology|cell|subject|seed|8"):
+        jobmap_module.build_job_map([wrong_smoke])
+
+
+def test_validate_job_map_rejects_rehashed_stage1_topology_changes(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    pilot_rows = [
+        _brainrw_row(
+            tmp_path,
+            stage="stage-1-brainrw-pilot",
+            subject=subject,
+            seed=seed,
+        )
+        for subject in (1, 5, 8)
+        for seed in (42, 43)
+    ]
+    payload = jobmap_module.build_job_map(pilot_rows)
+
+    subset = copy.deepcopy(payload)
+    _replace_job_map_rows(
+        subset,
+        [dict(row) for row in subset["rows"][:-1]],
+        jobmap_module,
+    )
+    with pytest.raises(ValueError, match="topology|grid|cell|row"):
+        jobmap_module.validate_job_map(subset)
+
+    wrong_cell = copy.deepcopy(payload)
+    _replace_job_map_rows(
+        wrong_cell,
+        [
+            *[dict(row) for row in wrong_cell["rows"][:-1]],
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-pilot",
+                subject=9,
+                seed=42,
+            ),
+        ],
+        jobmap_module,
+    )
+    with pytest.raises(ValueError, match="topology|grid|cell|subject|seed"):
+        jobmap_module.validate_job_map(wrong_cell)
+
+    reordered = copy.deepcopy(payload)
+    reordered_rows = list(reversed(reordered["rows"]))
+    for index, row in enumerate(reordered_rows):
+        row["array_index"] = index
+    reordered["rows"] = reordered_rows
+    _rehash(reordered)
+    with pytest.raises(ValueError, match="order|sort|canonical|topology"):
+        jobmap_module.validate_job_map(reordered)
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "clip-path",
+        "semantic-environment",
+        "project-root",
+        "input-bundle",
+        "config-sha",
+    ),
+)
+def test_stage1_brainrw_map_requires_one_cross_row_identity(
+    jobmap_module: ModuleType,
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    rows = [
+        _brainrw_row(
+            tmp_path,
+            stage="stage-1-brainrw-pilot",
+            subject=subject,
+            seed=seed,
+        )
+        for subject in (1, 5, 8)
+        for seed in (42, 43)
+    ]
+    if drift == "project-root":
+        rows[-1] = _brainrw_row(
+            tmp_path,
+            stage="stage-1-brainrw-pilot",
+            subject=8,
+            seed=43,
+            project_root=(tmp_path / "different-project").resolve(),
+        )
+    elif drift == "clip-path":
+        argv = rows[-1]["argv"]
+        argv[argv.index("--clip-path") + 1] = str(
+            (tmp_path / "models" / "other-clip").resolve()
+        )
+    elif drift == "semantic-environment":
+        argv = rows[-1]["argv"]
+        argv[
+            argv.index("--expected-semantic-environment-sha256") + 1
+        ] = _h("other-environment")
+    else:
+        row = rows[-1]
+        argv = row["argv"]
+        if drift == "input-bundle":
+            row["input_bundle_sha256"] = _h("other-input-bundle")
+            argv[
+                argv.index("--expected-input-bundle-sha256") + 1
+            ] = row["input_bundle_sha256"]
+        else:
+            row["config_sha256"] = _h("other-config")
+            argv[
+                argv.index("--expected-config-sha256") + 1
+            ] = row["config_sha256"]
+        run_key = make_run_key(
+            "brainrw-clip-lora",
+            str(row["config_id"]),
+            int(row["subject"]),
+            int(row["seed"]),
+            str(row["config_sha256"]),
+            str(row["input_bundle_sha256"]),
+        )
+        row["run_key"] = run_key
+        argv[argv.index("--run-key") + 1] = run_key
+        output = (
+            Path(argv[argv.index("--project-root") + 1])
+            / "artifacts/samga_brain_rw"
+            / str(row["stage"])
+            / run_key
+        )
+        argv[argv.index("--output-dir") + 1] = str(output)
+        row["completion_path"] = str(output / "completion.json")
+
+    with pytest.raises(
+        ValueError,
+        match="identity|consistent|project|clip|semantic|input|bundle",
+    ):
+        jobmap_module.build_job_map(rows)
 
 
 def test_partial_retry_exports_full_map_bounds_and_uses_sealed_logs(
@@ -3107,6 +3577,325 @@ def test_submitter_rejects_missing_or_tampered_smoke_artifacts_before_queue(
             runner=lambda command, **_kwargs: commands.append(list(command)),
         )
     assert commands == []
+
+
+def test_submitter_dispatches_stage1_smoke_to_brainrw_validator(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    smoke_path = tmp_path / "stage1-smoke.json"
+    smoke = jobmap_module.write_job_map(
+        [
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-smoke",
+                project_root=project_root,
+            )
+        ],
+        smoke_path,
+    )
+    smoke_row = smoke["rows"][0]
+    declared = _output_hashes(smoke_row, "brainrw-smoke")
+    jobmap_module.claim_job_row(smoke, smoke_row)
+    jobmap_module.complete_job_row(smoke, smoke_row, declared)
+
+    pilot_path = tmp_path / "stage1-pilot.json"
+    pilot = jobmap_module.write_job_map(
+        [
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-pilot",
+                subject=subject,
+                seed=seed,
+                project_root=project_root,
+            )
+            for subject in (1, 5, 8)
+            for seed in (42, 43)
+        ],
+        pilot_path,
+    )
+    events: list[str] = []
+
+    def map_config_validator(argv: object) -> SimpleNamespace:
+        assert argv == smoke_row["argv"]
+        events.append("map-config-validator")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        submit_module,
+        "validate_brainrw_map_config",
+        map_config_validator,
+        raising=False,
+    )
+
+    def brainrw_validator(
+        argv: object,
+        *,
+        expected_mode: str,
+    ) -> SimpleNamespace:
+        assert argv == smoke_row["argv"]
+        assert expected_mode == "smoke"
+        events.append("brainrw-validator")
+        return SimpleNamespace(
+            checkpoint_sha256=declared["final_checkpoint_sha256"],
+            in_loop_metadata_sha256=declared[
+                "in_loop_metadata_sha256"
+            ],
+            run_manifest_sha256=declared["run_manifest_sha256"],
+        )
+
+    monkeypatch.setattr(
+        submit_module,
+        "validate_brainrw_command_outputs",
+        brainrw_validator,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        submit_module,
+        "validate_training_command_outputs",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Stage 1 smoke must not use the Stage 0/2 validator"
+        ),
+    )
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        events.append("queue" if command == QUEUE_COMMAND else "sbatch")
+        return SimpleNamespace(stdout="12345\n", returncode=0)
+
+    phase = submit_module.submit_available_pilot(
+        smoke_job_map=smoke_path,
+        smoke_sha256=smoke["payload_sha256"],
+        pilot_job_map=pilot_path,
+        pilot_sha256=pilot["payload_sha256"],
+        slurm_script=script,
+        log_dir=Path("logs/samga_brain_rw"),
+        runner=fake_runner,
+    )
+
+    assert phase == "pilot-submitted"
+    assert events == [
+        "map-config-validator",
+        "brainrw-validator",
+        "queue",
+        "sbatch",
+    ]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "project-root",
+        "clip-path",
+        "semantic-environment",
+        "config-sha",
+        "sub08-input-bundle",
+    ),
+)
+def test_submitter_rejects_stage1_cross_map_identity_drift(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    smoke = jobmap_module.write_job_map(
+        [
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-smoke",
+                project_root=project_root,
+            )
+        ],
+        tmp_path / f"{drift}-stage1-smoke.json",
+    )
+    pilot_root = (
+        (tmp_path / "other-project").resolve()
+        if drift == "project-root"
+        else project_root
+    )
+    pilot_rows = [
+        _brainrw_row(
+            tmp_path,
+            stage="stage-1-brainrw-pilot",
+            subject=subject,
+            seed=seed,
+            project_root=pilot_root,
+        )
+        for subject in (1, 5, 8)
+        for seed in (42, 43)
+    ]
+    for row in pilot_rows:
+        argv = row["argv"]
+        assert isinstance(argv, list)
+        if drift == "clip-path":
+            argv[argv.index("--clip-path") + 1] = str(
+                (tmp_path / "models" / "pilot-clip").resolve()
+            )
+        elif drift == "semantic-environment":
+            argv[
+                argv.index("--expected-semantic-environment-sha256") + 1
+            ] = _h("pilot-environment")
+        elif drift == "config-sha":
+            row["config_sha256"] = _h("pilot-config")
+            argv[
+                argv.index("--expected-config-sha256") + 1
+            ] = row["config_sha256"]
+            _rebind_brainrw_row_run_key(row)
+        elif drift == "sub08-input-bundle" and row["subject"] == 8:
+            row["input_bundle_sha256"] = _h("pilot-sub08-input")
+            argv[
+                argv.index("--expected-input-bundle-sha256") + 1
+            ] = row["input_bundle_sha256"]
+            _rebind_brainrw_row_run_key(row)
+    pilot = jobmap_module.write_job_map(
+        pilot_rows,
+        tmp_path / f"{drift}-stage1-pilot.json",
+    )
+    calls: list[list[str]] = []
+
+    with pytest.raises(
+        ValueError,
+        match="identity|project|runner|config|semantic|clip|manifest|input",
+    ):
+        submit_module.submit_available_pilot(
+            smoke_job_map=tmp_path / f"{drift}-stage1-smoke.json",
+            smoke_sha256=smoke["payload_sha256"],
+            pilot_job_map=tmp_path / f"{drift}-stage1-pilot.json",
+            pilot_sha256=pilot["payload_sha256"],
+            slurm_script=script,
+            log_dir=Path("logs/samga_brain_rw"),
+            runner=lambda command, **_kwargs: calls.append(list(command)),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    (
+        (
+            "runner",
+            "/sealed/other-project/scripts/run_brainrw_cell.py",
+        ),
+        (
+            "sub08_manifest_path",
+            "/sealed/other-project/manifests/sub-08_protocol.json",
+        ),
+    ),
+)
+def test_submitter_rejects_explicit_stage1_path_identity_drift(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    drifted_value: str,
+) -> None:
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    smoke_path = tmp_path / f"{field}-stage1-smoke.json"
+    pilot_path = tmp_path / f"{field}-stage1-pilot.json"
+    smoke = jobmap_module.write_job_map(
+        [
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-smoke",
+                project_root=project_root,
+            )
+        ],
+        smoke_path,
+    )
+    pilot = jobmap_module.write_job_map(
+        [
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-pilot",
+                subject=subject,
+                seed=seed,
+                project_root=project_root,
+            )
+            for subject in (1, 5, 8)
+            for seed in (42, 43)
+        ],
+        pilot_path,
+    )
+    real_identity = jobmap_module.brainrw_map_identity
+
+    def identity_with_pilot_path_drift(
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        identity = real_identity(payload)
+        if payload["stage"] == "stage-1-brainrw-pilot":
+            identity[field] = drifted_value
+        return identity
+
+    monkeypatch.setattr(
+        submit_module,
+        "brainrw_map_identity",
+        identity_with_pilot_path_drift,
+    )
+    calls: list[list[str]] = []
+
+    with pytest.raises(ValueError, match=field):
+        submit_module.submit_available_pilot(
+            smoke_job_map=smoke_path,
+            smoke_sha256=smoke["payload_sha256"],
+            pilot_job_map=pilot_path,
+            pilot_sha256=pilot["payload_sha256"],
+            slurm_script=script,
+            log_dir=Path("logs/samga_brain_rw"),
+            runner=lambda command, **_kwargs: calls.append(list(command)),
+        )
+    assert calls == []
+
+
+def test_submitter_rejects_mismatched_smoke_and_pilot_families(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    smoke = jobmap_module.write_job_map(
+        [
+            _brainrw_row(
+                tmp_path,
+                stage="stage-1-brainrw-smoke",
+                project_root=project_root,
+            )
+        ],
+        tmp_path / "stage1-smoke.json",
+    )
+    pilot = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                stage="stage-2-pilot",
+                partition="i64m1tga40u",
+                time="04:00:00",
+                project_root=project_root,
+            )
+        ],
+        tmp_path / "stage2-pilot.json",
+    )
+    calls: list[list[str]] = []
+
+    with pytest.raises(ValueError, match="family|stage|match"):
+        submit_module.submit_available_pilot(
+            smoke_job_map=tmp_path / "stage1-smoke.json",
+            smoke_sha256=smoke["payload_sha256"],
+            pilot_job_map=tmp_path / "stage2-pilot.json",
+            pilot_sha256=pilot["payload_sha256"],
+            slurm_script=script,
+            log_dir=Path("logs/samga_brain_rw"),
+            runner=lambda command, **_kwargs: calls.append(list(command)),
+        )
+    assert calls == []
 
 
 def test_submitter_rejects_stray_output_without_calling_sbatch(
