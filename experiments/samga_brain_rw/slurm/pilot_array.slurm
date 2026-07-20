@@ -24,8 +24,10 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
+set +u
 source /hpc2hdd/home/ckwong627/miniconda3/etc/profile.d/conda.sh
 conda activate test
+set -u
 
 python \
   "${PROJECT_ROOT}/experiments/samga_brain_rw/scripts/build_job_map.py" run-row \

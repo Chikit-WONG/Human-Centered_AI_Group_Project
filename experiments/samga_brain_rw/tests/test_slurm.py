@@ -313,7 +313,11 @@ def test_static_launchers_lock_gpu_logs_environment_and_conda(
         source = "source /hpc2hdd/home/ckwong627/miniconda3/etc/profile.d/conda.sh"
         assert source in text
         assert "conda activate test" in text
-        assert text.index(source) < text.index("conda activate test")
+        disable_nounset = text.index("set +u")
+        source_index = text.index(source)
+        activate_index = text.index("conda activate test")
+        restore_nounset = text.index("set -u", activate_index)
+        assert disable_nounset < source_index < activate_index < restore_nounset
         assert "formal-test" not in text.lower()
         assert "/test/" not in text.lower()
         assert "sub-01_test" not in text.lower()
