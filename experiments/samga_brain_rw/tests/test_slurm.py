@@ -4,8 +4,11 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
+import pwd
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -285,6 +288,87 @@ def _submission_project(
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_bytes(source.read_bytes())
     return project_root, script
+
+
+def _slurm_recovery_case(
+    *,
+    tmp_path: Path,
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    Path,
+    object,
+    list[str],
+    str,
+]:
+    project_root, script = _submission_project(tmp_path, experiment_root)
+    map_path = project_root / "artifacts/smoke-map.json"
+    map_path.parent.mkdir(parents=True)
+    payload = jobmap_module.write_job_map(
+        [
+            _row(
+                tmp_path,
+                stage="stage-0-smoke",
+                role="baseline",
+                project_root=project_root,
+            )
+        ],
+        map_path,
+    )
+    row = payload["rows"][0]
+    claim = jobmap_module.claim_job_row(payload, row)
+    claim_stat = claim.path.stat()
+    start = datetime.fromtimestamp(claim_stat.st_mtime) - timedelta(seconds=2)
+    end = datetime.fromtimestamp(claim_stat.st_mtime) + timedelta(seconds=2)
+    job_id = "12345_0"
+    command = submit_module._resource_command(
+        payload,
+        job_map_path=map_path,
+        job_map_sha256=str(payload["payload_sha256"]),
+        slurm_script=script,
+        log_dir=Path("logs/samga_brain_rw"),
+        indices=[0],
+    )
+    username = pwd.getpwuid(os.getuid()).pw_name
+    fields = jobmap_module.SLURM_RECOVERY_SACCT_FIELDS
+    values = {
+        "JobIDRaw": "12345",
+        "JobID": job_id,
+        "State": "FAILED",
+        "ExitCode": "2:0",
+        "DerivedExitCode": "0:0",
+        "Submit": (start - timedelta(seconds=1)).isoformat(timespec="seconds"),
+        "Eligible": start.isoformat(timespec="seconds"),
+        "Start": start.isoformat(timespec="seconds"),
+        "End": end.isoformat(timespec="seconds"),
+        "ElapsedRaw": "4",
+        "Partition": str(row["partition"]),
+        "Account": "root",
+        "QOS": "debug",
+        "UID": str(os.getuid()),
+        "User": username,
+        "JobName": "samga-pilot",
+        "NodeList": "gpu-test",
+        "AllocTRES": "billing=8,cpu=8,gres/gpu:a40=1,gres/gpu=1,mem=64G,node=1",
+        "ReqTRES": "billing=8,cpu=8,gres/gpu:a40=1,gres/gpu=1,mem=64G,node=1",
+        "TimelimitRaw": "30",
+        "WorkDir": str(project_root),
+        "SubmitLine": " ".join(command),
+        "Cluster": "test-cluster",
+    }
+    sacct_line = "|".join(values[field] for field in fields) + "\n"
+    for stream_name in ("stdout_path", "stderr_path"):
+        pattern = project_root / str(row[stream_name])
+        concrete = Path(
+            str(pattern).replace("%A", "12345").replace("%a", "0")
+        )
+        concrete.parent.mkdir(parents=True, exist_ok=True)
+        concrete.write_bytes(f"{stream_name}\n".encode())
+    Path(str(row["completion_path"])).parent.mkdir(parents=True)
+    return payload, row, map_path, claim, command, sacct_line
 
 
 def test_static_launchers_lock_gpu_logs_environment_and_conda(
@@ -1617,6 +1701,422 @@ def test_unverified_recovery_is_not_exposed_by_cli(
         )
 
     assert not first.recovery_path.exists()
+
+
+def test_slurm_recovery_publishes_typed_audit_and_fresh_retry(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload, row, map_path, first, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        calls.append(list(command))
+        stdout = sacct_line if command[0] == "sacct" else ""
+        return SimpleNamespace(stdout=stdout, returncode=0)
+
+    second = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=fake_runner,
+    )
+
+    assert [command[0] for command in calls] == [
+        "sacct",
+        "squeue",
+        "sacct",
+        "squeue",
+        "sacct",
+    ]
+    assert second.generation == 2
+    assert jobmap_module.should_submit_row(payload, row) is True
+    assert not second.attempt_path.exists()
+    audit_path = first.path.with_name("slurm-recovery-audit.json")
+    audit_bytes = audit_path.read_bytes()
+    audit = json.loads(audit_bytes)
+    assert audit["payload_type"] == "samga_brain_rw.slurm_recovery_audit"
+    assert audit["payload"]["binding_mode"] == "legacy_claim_scheduler_binding"
+    assert audit["payload"]["scheduler"]["job_id"] == "12345_0"
+    recovery = json.loads(first.recovery_path.read_text(encoding="utf-8"))
+    assert recovery["payload"]["recovery_audit_type"] == audit["payload_type"]
+    assert recovery["payload"]["recovery_audit_sha256"] == hashlib.sha256(
+        audit_bytes
+    ).hexdigest()
+    quarantine = recovery["payload"]["quarantine"]
+    assert quarantine["file_count"] == 0
+    assert not Path(str(row["completion_path"])).parent.exists()
+
+    repeated = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=fake_runner,
+    )
+    assert repeated.path == second.path
+    assert not (
+        second.path.parent.parent / "generation-000003"
+    ).exists()
+
+
+def test_slurm_recovery_resumes_after_typed_audit_publication_crash(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload, row, map_path, first, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=sacct_line if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    transition = jobmap_module._transition_to_recovered_claim_locked
+
+    def crash_after_audit(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected post-audit crash")
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_transition_to_recovered_claim_locked",
+        crash_after_audit,
+    )
+    with pytest.raises(RuntimeError, match="post-audit"):
+        jobmap_module.recover_job_row_from_slurm(
+            payload,
+            row,
+            job_map_path=map_path,
+            failed_slurm_job="12345_0",
+            runner=fake_runner,
+        )
+    audit_path = first.path.with_name("slurm-recovery-audit.json")
+    audit_bytes = audit_path.read_bytes()
+    assert not first.recovery_path.exists()
+
+    monkeypatch.setattr(
+        jobmap_module,
+        "_transition_to_recovered_claim_locked",
+        transition,
+    )
+    second = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=fake_runner,
+    )
+    assert second.generation == 2
+    assert audit_path.read_bytes() == audit_bytes
+
+
+def test_requeued_failed_job_cannot_consume_recovered_attempt(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload, row, map_path, _, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=sacct_line if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    second = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=fake_runner,
+    )
+    with pytest.raises(RuntimeError, match="failed|old|recovery|requeue"):
+        jobmap_module.consume_recovery_attempt(
+            payload,
+            row,
+            scheduler_job_id="12345_0",
+        )
+    assert not second.attempt_path.exists()
+
+    jobmap_module.consume_recovery_attempt(
+        payload,
+        row,
+        scheduler_job_id="12346_0",
+    )
+    attempt = json.loads(second.attempt_path.read_text(encoding="utf-8"))
+    assert attempt["payload"]["scheduler_job_id"] == "12346_0"
+
+
+def test_later_slurm_recovery_binds_consumed_attempt_scheduler_identity(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload, row, map_path, _, _, first_sacct = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+
+    def first_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=first_sacct if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    second = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=first_runner,
+    )
+    jobmap_module.consume_recovery_attempt(
+        payload,
+        row,
+        scheduler_job_id="12346_0",
+    )
+    attempt_mtime = second.attempt_path.stat().st_mtime
+    start = datetime.fromtimestamp(attempt_mtime) - timedelta(seconds=2)
+    end = datetime.fromtimestamp(attempt_mtime) + timedelta(seconds=2)
+    fields = list(jobmap_module.SLURM_RECOVERY_SACCT_FIELDS)
+    values = first_sacct.removesuffix("\n").split("|")
+    replacements = {
+        "JobIDRaw": "12346",
+        "JobID": "12346_0",
+        "Submit": (start - timedelta(seconds=1)).isoformat(timespec="seconds"),
+        "Eligible": start.isoformat(timespec="seconds"),
+        "Start": start.isoformat(timespec="seconds"),
+        "End": end.isoformat(timespec="seconds"),
+        "ElapsedRaw": "4",
+    }
+    for field, value in replacements.items():
+        values[fields.index(field)] = value
+    second_sacct = "|".join(values) + "\n"
+    project_root = Path(
+        str(row["argv"][row["argv"].index("--project-root") + 1])
+    )
+    for field in ("stdout_path", "stderr_path"):
+        concrete = project_root / str(row[field]).replace(
+            "%A", "12346"
+        ).replace("%a", "0")
+        concrete.write_bytes(f"second {field}\n".encode())
+    output_dir = Path(str(row["completion_path"])).parent
+    output_dir.mkdir()
+    (output_dir / "partial.bin").write_bytes(b"second failed attempt")
+
+    def second_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=second_sacct if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    third = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12346_0",
+        runner=second_runner,
+    )
+    assert third.generation == 3
+    audit = json.loads(
+        second.slurm_recovery_audit_path.read_text(encoding="utf-8")
+    )
+    assert audit["payload"]["binding_mode"] == (
+        "recovered_attempt_scheduler_binding"
+    )
+    assert audit["payload"]["attempt"]["scheduler_job_id"] == "12346_0"
+    assert jobmap_module.should_submit_row(payload, row) is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "match"),
+    [
+        ("live", "live|squeue"),
+        ("completed", "failed terminal|COMPLETED"),
+        ("drift", "changed|sacct"),
+        ("wrong-user", "user|UID"),
+        ("wrong-workdir", "WorkDir|work"),
+        ("wrong-submit", "SubmitLine|submission"),
+        ("multiple", "exactly one|ambiguous|sacct"),
+    ],
+)
+def test_slurm_recovery_rejects_untrusted_scheduler_evidence(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+    failure: str,
+    match: str,
+) -> None:
+    payload, row, map_path, first, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+    fields = list(jobmap_module.SLURM_RECOVERY_SACCT_FIELDS)
+
+    def changed_line(field: str, value: str) -> str:
+        values = sacct_line.removesuffix("\n").split("|")
+        values[fields.index(field)] = value
+        return "|".join(values) + "\n"
+
+    first_sacct = sacct_line
+    second_sacct = sacct_line
+    queue = ""
+    if failure == "live":
+        queue = "12345_0|user|RUNNING|debug|gpu-test\n"
+    elif failure == "completed":
+        first_sacct = second_sacct = changed_line("State", "COMPLETED")
+    elif failure == "drift":
+        second_sacct = changed_line("NodeList", "gpu-other")
+    elif failure == "wrong-user":
+        first_sacct = second_sacct = changed_line("UID", "999999")
+    elif failure == "wrong-workdir":
+        first_sacct = second_sacct = changed_line("WorkDir", str(tmp_path))
+    elif failure == "wrong-submit":
+        first_sacct = second_sacct = changed_line(
+            "SubmitLine",
+            sacct_line.split("|")[fields.index("SubmitLine")].replace(
+                str(payload["payload_sha256"]),
+                "0" * 64,
+            ),
+        )
+    elif failure == "multiple":
+        first_sacct = second_sacct = sacct_line + sacct_line
+    sacct_outputs = iter([first_sacct, second_sacct])
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        if command[0] == "squeue":
+            return SimpleNamespace(stdout=queue, returncode=0)
+        return SimpleNamespace(stdout=next(sacct_outputs), returncode=0)
+
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        jobmap_module.recover_job_row_from_slurm(
+            payload,
+            row,
+            job_map_path=map_path,
+            failed_slurm_job="12345_0",
+            runner=fake_runner,
+        )
+    assert not first.path.with_name("slurm-recovery-audit.json").exists()
+    assert not first.recovery_path.exists()
+    assert not (
+        first.path.parent.parent / "generation-000002"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("mtime", "missing-log", "symlink-log", "symlink-log-parent"),
+)
+def test_slurm_recovery_rejects_unbound_legacy_claim_or_logs(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    payload, row, map_path, first, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+    stderr = (
+        Path(str(row["stderr_path"]).replace("%A", "12345").replace("%a", "0"))
+    )
+    project_root = Path(str(row["argv"][row["argv"].index("--project-root") + 1]))
+    stderr = project_root / stderr
+    if failure == "mtime":
+        os.utime(first.path, ns=(1_000_000_000, 1_000_000_000))
+    elif failure == "missing-log":
+        stderr.unlink()
+    elif failure == "symlink-log":
+        outside = tmp_path / "outside-error.log"
+        outside.write_bytes(b"outside")
+        stderr.unlink()
+        stderr.symlink_to(outside)
+    else:
+        logs = project_root / "logs"
+        outside_logs = tmp_path / "outside-logs"
+        logs.rename(outside_logs)
+        logs.symlink_to(outside_logs, target_is_directory=True)
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=sacct_line if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    with pytest.raises(ValueError, match="mtime|time|log|regular|symbolic|sealed"):
+        jobmap_module.recover_job_row_from_slurm(
+            payload,
+            row,
+            job_map_path=map_path,
+            failed_slurm_job="12345_0",
+            runner=fake_runner,
+        )
+    assert not first.path.with_name("slurm-recovery-audit.json").exists()
+    assert not first.recovery_path.exists()
+
+
+def test_typed_slurm_recovery_audit_is_required_by_recovery_chain(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload, row, map_path, first, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=sacct_line if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=fake_runner,
+    )
+    audit_path = first.path.with_name("slurm-recovery-audit.json")
+    audit_path.unlink()
+
+    with pytest.raises(ValueError, match="audit|sealed|regular"):
+        jobmap_module.should_submit_row(payload, row)
 
 
 def test_stale_claim_recovery_is_audited_and_never_deletes_original(

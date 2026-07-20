@@ -9,13 +9,16 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -28,6 +31,8 @@ JOB_MAP_TYPE = "samga_brain_rw.job_map"
 CLAIM_TYPE = "samga_brain_rw.job_claim"
 RECOVERY_TYPE = "samga_brain_rw.job_claim_recovery"
 ATTEMPT_TYPE = "samga_brain_rw.job_attempt"
+SLURM_RECOVERY_AUDIT_TYPE = "samga_brain_rw.slurm_recovery_audit"
+TEST_ONLY_RECOVERY_AUDIT_TYPE = "samga_brain_rw.test_only_opaque_audit"
 LOG_ROOT = PurePosixPath("logs/samga_brain_rw")
 DEVELOPMENT_OUTPUT_ROOTS = (
     PurePosixPath("artifacts/samga_brain_rw"),
@@ -88,6 +93,8 @@ RECOVERY_PAYLOAD_KEYS = {
     "claim_sha256",
     "next_generation",
     "recovery_audit_sha256",
+    # Deliberately required: older opaque recovery records fail closed.
+    "recovery_audit_type",
     "attempt_record_sha256",
     "quarantine",
     "restart_mode",
@@ -98,6 +105,7 @@ ATTEMPT_PAYLOAD_KEYS = {
     "array_index",
     "generation",
     "claim_sha256",
+    "scheduler_job_id",
 }
 QUARANTINE_KEYS = {
     "file_count",
@@ -121,6 +129,57 @@ _GENERATION_RE = re.compile(r"^generation-(\d{6})$")
 _DEVELOPMENT_STAGE_RE = re.compile(
     r"^stage-(?P<stage>[02])-(?P<phase>smoke|pilot|full)$"
 )
+_SLURM_ARRAY_JOB_RE = re.compile(
+    r"^(?P<array_job_id>[1-9][0-9]*)_(?P<array_task_id>0|[1-9][0-9]*)$"
+)
+SLURM_RECOVERY_SACCT_FIELDS = (
+    "JobIDRaw",
+    "JobID",
+    "State",
+    "ExitCode",
+    "DerivedExitCode",
+    "Submit",
+    "Eligible",
+    "Start",
+    "End",
+    "ElapsedRaw",
+    "Partition",
+    "Account",
+    "QOS",
+    "UID",
+    "User",
+    "JobName",
+    "NodeList",
+    "AllocTRES",
+    "ReqTRES",
+    "TimelimitRaw",
+    "WorkDir",
+    "SubmitLine",
+    "Cluster",
+)
+_FAILED_SLURM_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "TIMEOUT",
+}
+_SLURM_AUDIT_PAYLOAD_KEYS = {
+    "binding_mode",
+    "job_map",
+    "row",
+    "claim",
+    "attempt",
+    "scheduler",
+    "sacct",
+    "squeue",
+    "submission",
+    "logs",
+}
 
 
 @dataclass(frozen=True)
@@ -139,6 +198,10 @@ class JobClaim:
     @property
     def attempt_path(self) -> Path:
         return self.path.with_name("attempt.json")
+
+    @property
+    def slurm_recovery_audit_path(self) -> Path:
+        return self.path.with_name("slurm-recovery-audit.json")
 
 
 @dataclass(frozen=True)
@@ -758,42 +821,38 @@ def _read_regular_file_at(
         os.close(fd)
 
 
+def _strict_json_bytes(
+    data: bytes,
+    path: Path,
+) -> dict[str, object]:
+    try:
+        result = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid sealed JSON: {path}") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"sealed JSON must contain an object: {path}")
+    if canonical_json_bytes(result) != data:
+        raise ValueError(f"sealed JSON bytes are not canonical: {path}")
+    return result
+
+
 def _strict_load_at(
     directory_fd: int,
     name: str,
     path: Path,
 ) -> dict[str, object]:
-    data = _read_regular_file_at(directory_fd, name, path)
-    try:
-        result = json.loads(
-            data.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_pairs,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"invalid sealed JSON: {path}") from exc
-    if not isinstance(result, dict):
-        raise ValueError(f"sealed JSON must contain an object: {path}")
-    if canonical_json_bytes(result) != data:
-        raise ValueError(f"sealed JSON bytes are not canonical: {path}")
-    return result
+    return _strict_json_bytes(
+        _read_regular_file_at(directory_fd, name, path),
+        path,
+    )
 
 
 def _strict_load(path: Path) -> dict[str, object]:
-    data = _read_regular_file(path)
-    try:
-        result = json.loads(
-            data.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_pairs,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"invalid sealed JSON: {path}") from exc
-    if not isinstance(result, dict):
-        raise ValueError(f"sealed JSON must contain an object: {path}")
-    if canonical_json_bytes(result) != data:
-        raise ValueError(f"sealed JSON bytes are not canonical: {path}")
-    return result
+    return _strict_json_bytes(_read_regular_file(path), path)
 
 
 def _exclusive_publish(path: Path, data: bytes) -> None:
@@ -1010,6 +1069,29 @@ def _open_directory_path_nofollow(
         os.close(current_fd)
         raise
     return current_fd
+
+
+def _read_regular_file_path_nofollow(path: Path) -> bytes:
+    checked = Path(path)
+    if not checked.is_absolute():
+        raise ValueError(f"sealed file path must be absolute: {checked}")
+    try:
+        directory_fd = _open_directory_path_nofollow(
+            checked.parent,
+            create=False,
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"sealed file parent contains a symbolic link: {checked}"
+        ) from exc
+    try:
+        return _read_regular_file_at(
+            directory_fd,
+            checked.name,
+            checked,
+        )
+    finally:
+        os.close(directory_fd)
 
 
 @contextlib.contextmanager
@@ -1770,6 +1852,20 @@ def _load_attempt(
         raise ValueError(
             "attempt does not match its recovered claim generation"
         )
+    scheduler_job_id = attempt["scheduler_job_id"]
+    if scheduler_job_id is not None:
+        scheduler_match = (
+            _SLURM_ARRAY_JOB_RE.fullmatch(scheduler_job_id)
+            if isinstance(scheduler_job_id, str)
+            else None
+        )
+        if (
+            scheduler_match is None
+            or int(scheduler_match.group("array_task_id")) != array_index
+        ):
+            raise ValueError(
+                "attempt scheduler job does not match its array row"
+            )
     return document, digest
 
 
@@ -1823,6 +1919,23 @@ def _load_recovery_record(
         recovery["recovery_audit_sha256"],
         "recovery_audit_sha256",
     )
+    audit_type = recovery["recovery_audit_type"]
+    if audit_type not in {
+        TEST_ONLY_RECOVERY_AUDIT_TYPE,
+        SLURM_RECOVERY_AUDIT_TYPE,
+    }:
+        raise ValueError("recovery audit type is not supported")
+    if audit_type == SLURM_RECOVERY_AUDIT_TYPE:
+        _, audit_sha256 = _read_record(
+            previous.slurm_recovery_audit_path,
+            payload_type=SLURM_RECOVERY_AUDIT_TYPE,
+            payload_keys=_SLURM_AUDIT_PAYLOAD_KEYS,
+            directory_fd=generation_fd,
+        )
+        if audit_sha256 != recovery["recovery_audit_sha256"]:
+            raise ValueError(
+                "typed SLURM recovery audit hash does not match recovery"
+            )
     return document, digest
 
 
@@ -2131,6 +2244,877 @@ def claim_job_row(
         return _claim_from_document(path, 1, document, digest)
 
 
+def _single_row_argv_value(
+    row: Mapping[str, object],
+    flag: str,
+) -> str:
+    argv = row["argv"]
+    if not isinstance(argv, list) or any(
+        not isinstance(value, str) for value in argv
+    ):
+        raise ValueError("job row argv must be a list of strings")
+    positions = [
+        index for index, value in enumerate(argv) if value == flag
+    ]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        raise ValueError(f"job row must contain {flag} exactly once")
+    return argv[positions[0] + 1]
+
+
+def _verified_submission_project_root(
+    row: Mapping[str, object],
+) -> Path:
+    raw = Path(_single_row_argv_value(row, "--project-root"))
+    if not raw.is_absolute() or ".." in raw.parts:
+        raise ValueError("project root must be absolute and normalized")
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("project root cannot be verified") from exc
+    if resolved != raw or not resolved.is_dir() or not (resolved / ".git").exists():
+        raise ValueError("project root is not a verified repository root")
+    return resolved
+
+
+def _compress_array_indices(indices: Sequence[int]) -> str:
+    if not indices:
+        raise ValueError("SLURM array cannot be empty")
+    ordered = sorted(set(indices))
+    if list(indices) != ordered:
+        raise ValueError("SLURM array indices must be unique and sorted")
+    ranges: list[str] = []
+    start = previous = ordered[0]
+    for index in ordered[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append(f"{start}-{previous}")
+        start = previous = index
+    ranges.append(f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def _parse_array_indices(
+    specification: str,
+    *,
+    allowed: set[int],
+    required: int,
+) -> list[int]:
+    if not specification:
+        raise ValueError("SLURM SubmitLine has an empty array specification")
+    indices: list[int] = []
+    for component in specification.split(","):
+        parts = component.split("-")
+        if len(parts) == 1:
+            start_text = end_text = parts[0]
+        elif len(parts) == 2:
+            start_text, end_text = parts
+        else:
+            raise ValueError("SLURM SubmitLine array is not canonical")
+        for value in (start_text, end_text):
+            if (
+                not value.isascii()
+                or not value.isdecimal()
+                or str(int(value)) != value
+            ):
+                raise ValueError("SLURM SubmitLine array is not canonical")
+        start, end = int(start_text), int(end_text)
+        if end < start:
+            raise ValueError("SLURM SubmitLine array range is reversed")
+        indices.extend(range(start, end + 1))
+    if _compress_array_indices(indices) != specification:
+        raise ValueError("SLURM SubmitLine array is not canonical")
+    if required not in indices or any(index not in allowed for index in indices):
+        raise ValueError(
+            "SLURM SubmitLine array is outside the sealed job map"
+        )
+    return indices
+
+
+def _expected_submission_command(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    *,
+    job_map_path: Path,
+    indices: Sequence[int],
+) -> list[str]:
+    project_root = _verified_submission_project_root(row)
+    try:
+        sealed_map = Path(job_map_path).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("job-map path cannot be verified") from exc
+    if sealed_map != Path(job_map_path) or not sealed_map.is_file():
+        raise ValueError("job-map path must be absolute and canonical")
+    bounds = payload["array_bounds"]
+    if (
+        not isinstance(bounds, list)
+        or len(bounds) != 2
+        or any(type(value) is not int for value in bounds)
+    ):
+        raise ValueError("job map has invalid immutable array bounds")
+    slurm_script = (
+        project_root
+        / "experiments/samga_brain_rw/slurm/pilot_array.slurm"
+    )
+    try:
+        verified_script = slurm_script.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("pilot SLURM script cannot be verified") from exc
+    if verified_script != slurm_script or not verified_script.is_file():
+        raise ValueError("pilot SLURM script is not canonical")
+    stdout_path = project_root / str(row["stdout_path"])
+    stderr_path = project_root / str(row["stderr_path"])
+    if stdout_path.parent != stderr_path.parent:
+        raise ValueError("sealed stdout and stderr directories differ")
+    for value in (str(project_root), str(sealed_map)):
+        if "," in value or "\n" in value:
+            raise ValueError("sealed path cannot be encoded in SLURM --export")
+    return [
+        "sbatch",
+        "--parsable",
+        f"--chdir={project_root}",
+        f"--partition={row['partition']}",
+        f"--gres={row['gres']}",
+        f"--cpus-per-task={row['cpus']}",
+        f"--mem={row['memory']}",
+        f"--time={row['time']}",
+        f"--array={_compress_array_indices(indices)}",
+        f"--output={stdout_path}",
+        f"--error={stderr_path}",
+        (
+            "--export=ALL,"
+            f"PROJECT_ROOT={project_root},"
+            f"JOB_MAP={sealed_map},"
+            f"JOB_MAP_SHA256={payload['payload_sha256']},"
+            f"JOB_MAP_ARRAY_MIN={bounds[0]},"
+            f"JOB_MAP_ARRAY_MAX={bounds[1]}"
+        ),
+        str(verified_script),
+    ]
+
+
+def _run_scheduler_query(
+    runner: Any,
+    command: list[str],
+) -> str:
+    result = runner(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str):
+        raise ValueError("scheduler command did not return text stdout")
+    return stdout
+
+
+def _parse_sacct_record(stdout: str) -> dict[str, str]:
+    lines = stdout.splitlines()
+    if len(lines) != 1 or not lines[0]:
+        raise ValueError(
+            "sacct must return exactly one unambiguous allocation record"
+        )
+    values = lines[0].split("|")
+    if len(values) != len(SLURM_RECOVERY_SACCT_FIELDS):
+        raise ValueError("sacct record does not match the fixed field schema")
+    return dict(zip(SLURM_RECOVERY_SACCT_FIELDS, values, strict=True))
+
+
+def _slurm_time_ns(value: str, label: str) -> int:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"sacct {label} is not an ISO timestamp") from exc
+    if parsed.tzinfo is not None or parsed.microsecond != 0:
+        raise ValueError(f"sacct {label} must use local whole seconds")
+    return int(parsed.timestamp()) * 1_000_000_000
+
+
+def _parse_tres(value: str, label: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in value.split(","):
+        key, separator, selected = item.partition("=")
+        if (
+            not separator
+            or not key
+            or not selected
+            or key in result
+        ):
+            raise ValueError(f"sacct {label} is not canonical")
+        result[key] = selected
+    return result
+
+
+def _validate_sacct_record(
+    record: Mapping[str, str],
+    *,
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    job_map_path: Path,
+    failed_slurm_job: str,
+    binding_mtime_ns: int,
+) -> tuple[list[str], Path, str, int]:
+    match = _SLURM_ARRAY_JOB_RE.fullmatch(failed_slurm_job)
+    if match is None:
+        raise ValueError("failed SLURM job must use <array-job>_<task-id>")
+    array_job_id = match.group("array_job_id")
+    array_task_id = int(match.group("array_task_id"))
+    if array_task_id != int(row["array_index"]):
+        raise ValueError("failed SLURM task does not match the sealed row")
+    username = pwd.getpwuid(os.getuid()).pw_name
+    expected = {
+        "JobIDRaw": array_job_id,
+        "JobID": failed_slurm_job,
+        "UID": str(os.getuid()),
+        "User": username,
+        "Partition": str(row["partition"]),
+    }
+    for field, value in expected.items():
+        if record[field] != value:
+            raise ValueError(f"sacct {field} does not match the sealed row")
+    if record["State"] not in _FAILED_SLURM_STATES:
+        raise ValueError(
+            f"sacct state is not a failed terminal state: {record['State']}"
+        )
+    start_ns = _slurm_time_ns(record["Start"], "Start")
+    end_ns = _slurm_time_ns(record["End"], "End")
+    submit_ns = _slurm_time_ns(record["Submit"], "Submit")
+    eligible_ns = _slurm_time_ns(record["Eligible"], "Eligible")
+    if not submit_ns <= eligible_ns <= start_ns <= end_ns:
+        raise ValueError("sacct timestamps are not ordered")
+    if not start_ns <= binding_mtime_ns <= end_ns + 999_999_999:
+        raise ValueError(
+            "scheduler binding record mtime is outside the SLURM run"
+        )
+    if record["ElapsedRaw"] != str((end_ns - start_ns) // 1_000_000_000):
+        raise ValueError("sacct ElapsedRaw does not match Start and End")
+    project_root = _verified_submission_project_root(row)
+    if record["WorkDir"] != str(project_root):
+        raise ValueError("sacct WorkDir does not match the project root")
+    expected_minutes = (_time_seconds(row["time"]) + 59) // 60
+    if record["TimelimitRaw"] != str(expected_minutes):
+        raise ValueError("sacct TimelimitRaw does not match the sealed row")
+    for field in ("AllocTRES", "ReqTRES"):
+        tres = _parse_tres(record[field], field)
+        required = {
+            "cpu": str(row["cpus"]),
+            "mem": str(row["memory"]),
+            "gres/gpu:a40": "1",
+        }
+        for key, value in required.items():
+            if tres.get(key) != value:
+                raise ValueError(
+                    f"sacct {field} does not match sealed resources"
+                )
+    submit_argv = shlex.split(record["SubmitLine"])
+    array_tokens = [
+        token for token in submit_argv if token.startswith("--array=")
+    ]
+    if len(array_tokens) != 1:
+        raise ValueError("sacct SubmitLine has no unique array argument")
+    rows = payload["rows"]
+    if not isinstance(rows, list):
+        raise ValueError("job map rows must be a list")
+    allowed = {
+        int(selected["array_index"])
+        for selected in rows
+        if isinstance(selected, Mapping)
+    }
+    array_indices = _parse_array_indices(
+        array_tokens[0].removeprefix("--array="),
+        allowed=allowed,
+        required=int(row["array_index"]),
+    )
+    expected_argv = _expected_submission_command(
+        payload,
+        row,
+        job_map_path=job_map_path,
+        indices=array_indices,
+    )
+    if submit_argv != expected_argv:
+        raise ValueError(
+            "sacct SubmitLine does not match the sealed submission"
+        )
+    cluster = _require_nonempty_string(record["Cluster"], "sacct Cluster")
+    return array_indices, project_root, cluster, array_task_id
+
+
+def _concrete_log_identity(
+    row: Mapping[str, object],
+    *,
+    project_root: Path,
+    field: str,
+    array_job_id: str,
+    array_task_id: int,
+) -> dict[str, object]:
+    pattern = str(row[field])
+    if pattern.count("%A") != 1 or pattern.count("%a") != 1:
+        raise ValueError("sealed SLURM log pattern is not canonical")
+    relative = pattern.replace("%A", array_job_id).replace(
+        "%a", str(array_task_id)
+    )
+    path = project_root / relative
+    data = _read_regular_file_path_nofollow(path)
+    return {
+        "path": str(path),
+        "byte_count": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _claim_mtime_ns(
+    claim: JobClaim,
+    *,
+    state_fd: int,
+) -> int:
+    with _open_generation_directory(
+        state_fd,
+        claim.path.parent.parent,
+        claim.generation,
+    ) as generation_fd:
+        return _state_record_mtime_ns(
+            generation_fd,
+            claim.path.name,
+            claim.path,
+        )
+
+
+def _state_record_mtime_ns(
+    generation_fd: int,
+    name: str,
+    path: Path,
+) -> int:
+    try:
+        identity = os.stat(
+            name,
+            dir_fd=generation_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot inspect sealed state record: {path}") from exc
+    if not stat.S_ISREG(identity.st_mode):
+        raise ValueError(f"state record is not a sealed regular file: {path}")
+    return identity.st_mtime_ns
+
+
+def _collect_slurm_recovery_audit(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    claim: JobClaim,
+    *,
+    state_fd: int,
+    job_map_path: Path,
+    failed_slurm_job: str,
+    runner: Any,
+) -> dict[str, object]:
+    match = _SLURM_ARRAY_JOB_RE.fullmatch(failed_slurm_job)
+    if match is None:
+        raise ValueError("failed SLURM job must use <array-job>_<task-id>")
+    claim_mtime_ns = _claim_mtime_ns(claim, state_fd=state_fd)
+    attempt_identity: dict[str, object] | None = None
+    binding_mtime_ns = claim_mtime_ns
+    if claim.generation > 1:
+        claim_payload = claim.document["payload"]
+        if not isinstance(claim_payload, dict):
+            raise ValueError("claim payload must be an object")
+        with _open_generation_directory(
+            state_fd,
+            claim.path.parent.parent,
+            claim.generation,
+        ) as generation_fd:
+            attempt = _load_attempt(
+                claim,
+                generation_fd=generation_fd,
+                map_sha256=str(claim_payload["job_map_sha256"]),
+                row_sha256=str(claim_payload["row_sha256"]),
+                array_index=int(claim_payload["array_index"]),
+            )
+            if attempt is None:
+                raise RuntimeError(
+                    "recovered claim has no scheduler binding attempt"
+                )
+            attempt_payload = attempt[0]["payload"]
+            if (
+                not isinstance(attempt_payload, dict)
+                or attempt_payload["scheduler_job_id"]
+                != failed_slurm_job
+            ):
+                raise ValueError(
+                    "failed SLURM job does not match the consumed attempt"
+                )
+            binding_mtime_ns = _state_record_mtime_ns(
+                generation_fd,
+                claim.attempt_path.name,
+                claim.attempt_path,
+            )
+            attempt_identity = {
+                "path": str(claim.attempt_path),
+                "sha256": attempt[1],
+                "payload_sha256": attempt[0]["payload_sha256"],
+                "mtime_ns": binding_mtime_ns,
+                "scheduler_job_id": failed_slurm_job,
+            }
+    sacct_command = [
+        "sacct",
+        "-X",
+        "-D",
+        "-j",
+        failed_slurm_job,
+        "--noheader",
+        "--parsable2",
+        f"--format={','.join(SLURM_RECOVERY_SACCT_FIELDS)}",
+    ]
+    first_stdout = _run_scheduler_query(runner, sacct_command)
+    first_record = _parse_sacct_record(first_stdout)
+    array_indices, project_root, cluster, array_task_id = (
+        _validate_sacct_record(
+            first_record,
+            payload=payload,
+            row=row,
+            job_map_path=job_map_path,
+            failed_slurm_job=failed_slurm_job,
+            binding_mtime_ns=binding_mtime_ns,
+        )
+    )
+    squeue_command = [
+        "squeue",
+        "-h",
+        "-j",
+        failed_slurm_job,
+        "-o",
+        "%i|%u|%T|%P|%N",
+    ]
+    squeue_stdout = _run_scheduler_query(runner, squeue_command)
+    if squeue_stdout != "":
+        raise RuntimeError("SLURM job still has a live squeue record")
+    second_stdout = _run_scheduler_query(runner, sacct_command)
+    if second_stdout != first_stdout:
+        raise RuntimeError("sacct terminal record changed during recovery audit")
+    second_record = _parse_sacct_record(second_stdout)
+    if second_record != first_record:
+        raise RuntimeError("sacct terminal record changed during recovery audit")
+    map_path = Path(job_map_path)
+    map_data = _read_regular_file_path_nofollow(map_path)
+    map_document = _strict_json_bytes(map_data, map_path)
+    if (
+        map_document != payload
+        or canonical_json_bytes(map_document) != map_data
+    ):
+        raise ValueError("job-map file differs from the loaded sealed map")
+    claim_payload = claim.document["payload"]
+    if not isinstance(claim_payload, dict):
+        raise ValueError("claim payload must be an object")
+    array_job_id = match.group("array_job_id")
+    submission_argv = shlex.split(first_record["SubmitLine"])
+    logs = {
+        "stdout": _concrete_log_identity(
+            row,
+            project_root=project_root,
+            field="stdout_path",
+            array_job_id=array_job_id,
+            array_task_id=array_task_id,
+        ),
+        "stderr": _concrete_log_identity(
+            row,
+            project_root=project_root,
+            field="stderr_path",
+            array_job_id=array_job_id,
+            array_task_id=array_task_id,
+        ),
+    }
+    final_squeue_stdout = _run_scheduler_query(runner, squeue_command)
+    if final_squeue_stdout != "":
+        raise RuntimeError(
+            "SLURM job regained a live squeue record during recovery audit"
+        )
+    final_sacct_stdout = _run_scheduler_query(runner, sacct_command)
+    if final_sacct_stdout != first_stdout:
+        raise RuntimeError("sacct terminal record changed before audit publication")
+    if _parse_sacct_record(final_sacct_stdout) != first_record:
+        raise RuntimeError("sacct terminal record changed before audit publication")
+    audit_payload: dict[str, object] = {
+        "binding_mode": (
+            "legacy_claim_scheduler_binding"
+            if attempt_identity is None
+            else "recovered_attempt_scheduler_binding"
+        ),
+        "job_map": {
+            "path": str(map_path),
+            "payload_sha256": payload["payload_sha256"],
+            "file_sha256": hashlib.sha256(map_data).hexdigest(),
+        },
+        "row": {
+            "array_index": row["array_index"],
+            "row_sha256": sha256_json(row),
+        },
+        "claim": {
+            "path": str(claim.path),
+            "generation": claim.generation,
+            "sha256": claim.sha256,
+            "payload_sha256": claim.document["payload_sha256"],
+            "mtime_ns": claim_mtime_ns,
+        },
+        "attempt": attempt_identity,
+        "scheduler": {
+            "cluster": cluster,
+            "array_job_id": array_job_id,
+            "array_task_id": array_task_id,
+            "job_id": failed_slurm_job,
+            "job_id_raw": first_record["JobIDRaw"],
+            "uid": os.getuid(),
+            "user": first_record["User"],
+        },
+        "sacct": {
+            "argv": sacct_command,
+            "fields": list(SLURM_RECOVERY_SACCT_FIELDS),
+            "record": first_record,
+            "stdout_sha256": hashlib.sha256(
+                first_stdout.encode("utf-8")
+            ).hexdigest(),
+            "repeat_stdout_sha256": hashlib.sha256(
+                final_sacct_stdout.encode("utf-8")
+            ).hexdigest(),
+            "sample_count": 3,
+        },
+        "squeue": {
+            "argv": squeue_command,
+            "rows": [],
+            "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+            "repeat_stdout_sha256": hashlib.sha256(
+                final_squeue_stdout.encode("utf-8")
+            ).hexdigest(),
+            "sample_count": 2,
+        },
+        "submission": {
+            "argv": submission_argv,
+            "argv_sha256": sha256_json(submission_argv),
+            "array_indices": array_indices,
+            "project_root": str(project_root),
+            "slurm_script": submission_argv[-1],
+        },
+        "logs": logs,
+    }
+    return audit_payload
+
+
+def _publish_or_reuse_slurm_audit(
+    claim: JobClaim,
+    payload: dict[str, object],
+    *,
+    generation_fd: int,
+) -> str:
+    expected_document = _record_document(
+        SLURM_RECOVERY_AUDIT_TYPE,
+        payload,
+    )
+    expected_bytes = canonical_json_bytes(expected_document)
+    expected_sha256 = hashlib.sha256(expected_bytes).hexdigest()
+    if _entry_lexists_at(
+        generation_fd,
+        claim.slurm_recovery_audit_path.name,
+        claim.slurm_recovery_audit_path,
+    ):
+        actual = _read_regular_file_at(
+            generation_fd,
+            claim.slurm_recovery_audit_path.name,
+            claim.slurm_recovery_audit_path,
+        )
+        if actual != expected_bytes:
+            raise ValueError(
+                "existing SLURM recovery audit differs from verified evidence"
+            )
+        return expected_sha256
+    _, digest = _create_record(
+        claim.slurm_recovery_audit_path,
+        SLURM_RECOVERY_AUDIT_TYPE,
+        payload,
+        directory_fd=generation_fd,
+    )
+    return digest
+
+
+def _idempotent_slurm_recovery_successor(
+    claims: Sequence[JobClaim],
+    *,
+    checked_row: Mapping[str, object],
+    state_fd: int,
+    map_sha256: str,
+    row_sha256: str,
+    failed_slurm_job: str,
+) -> JobClaim | None:
+    if len(claims) < 2:
+        return None
+    current = claims[-1]
+    previous = claims[-2]
+    with _open_generation_directory(
+        state_fd,
+        previous.path.parent.parent,
+        previous.generation,
+    ) as previous_fd:
+        if not _entry_lexists_at(
+            previous_fd,
+            previous.slurm_recovery_audit_path.name,
+            previous.slurm_recovery_audit_path,
+        ):
+            return None
+        audit_document, _ = _read_record(
+            previous.slurm_recovery_audit_path,
+            payload_type=SLURM_RECOVERY_AUDIT_TYPE,
+            payload_keys=_SLURM_AUDIT_PAYLOAD_KEYS,
+            directory_fd=previous_fd,
+        )
+        audit_payload = audit_document["payload"]
+        if not isinstance(audit_payload, dict):
+            raise ValueError("SLURM recovery audit payload must be an object")
+        scheduler = audit_payload["scheduler"]
+        if not isinstance(scheduler, dict):
+            raise ValueError("SLURM recovery scheduler payload is invalid")
+        if scheduler.get("job_id") != failed_slurm_job:
+            return None
+    if _path_lexists(_output_dir(checked_row)):
+        raise RuntimeError(
+            "idempotent recovery cannot reuse a claim with output"
+        )
+    with _open_generation_directory(
+        state_fd,
+        current.path.parent.parent,
+        current.generation,
+    ) as current_fd:
+        attempt = _load_attempt(
+            current,
+            generation_fd=current_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+            array_index=int(checked_row["array_index"]),
+        )
+    if attempt is not None:
+        raise RuntimeError(
+            "failed SLURM job cannot be reused after the retry attempt"
+        )
+    return current
+
+
+def recover_job_row_from_slurm(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    *,
+    job_map_path: Path,
+    failed_slurm_job: str,
+    runner: Any = subprocess.run,
+) -> JobClaim:
+    """Recover one failed row only after verifying live SLURM evidence."""
+
+    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    map_path = Path(job_map_path)
+    if not map_path.is_absolute():
+        raise ValueError("job-map path must be absolute")
+    base = _state_dir(checked_row)
+    with _transition_lock(base) as state_fd:
+        if _path_lexists(Path(str(checked_row["completion_path"]))):
+            _load_completion(payload, checked_row, state_fd=state_fd)
+            raise RuntimeError("cannot recover a completed job row")
+        claims = _load_claim_chain(
+            checked_row,
+            state_fd=state_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+            allow_pending_recovery=True,
+        )
+        if not claims:
+            raise RuntimeError("no stale claim exists to recover")
+        idempotent = _idempotent_slurm_recovery_successor(
+            claims,
+            checked_row=checked_row,
+            state_fd=state_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+            failed_slurm_job=failed_slurm_job,
+        )
+        if idempotent is not None:
+            return idempotent
+        current = claims[-1]
+        with _open_generation_directory(
+            state_fd,
+            base,
+            current.generation,
+        ) as current_fd:
+            current_attempt = _load_attempt(
+                current,
+                generation_fd=current_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(checked_row["array_index"]),
+            )
+        if current.generation > 1 and current_attempt is None:
+            raise RuntimeError(
+                "recovered claim has not consumed its retry attempt"
+            )
+        audit_payload = _collect_slurm_recovery_audit(
+            payload,
+            checked_row,
+            current,
+            state_fd=state_fd,
+            job_map_path=map_path,
+            failed_slurm_job=failed_slurm_job,
+            runner=runner,
+        )
+        with _open_generation_directory(
+            state_fd,
+            base,
+            current.generation,
+        ) as generation_fd:
+            audit_sha256 = _publish_or_reuse_slurm_audit(
+                current,
+                audit_payload,
+                generation_fd=generation_fd,
+            )
+        return _transition_to_recovered_claim_locked(
+            payload,
+            checked_row=checked_row,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+            state_fd=state_fd,
+            recovery_audit_sha256=audit_sha256,
+            recovery_audit_type=SLURM_RECOVERY_AUDIT_TYPE,
+        )
+
+
+def _transition_to_recovered_claim_locked(
+    payload: Mapping[str, object],
+    *,
+    checked_row: Mapping[str, object],
+    map_sha256: str,
+    row_sha256: str,
+    state_fd: int,
+    recovery_audit_sha256: str,
+    recovery_audit_type: str,
+) -> JobClaim:
+    audit_sha256 = _require_sha256(
+        recovery_audit_sha256,
+        "recovery_audit_sha256",
+    )
+    if recovery_audit_type not in {
+        TEST_ONLY_RECOVERY_AUDIT_TYPE,
+        SLURM_RECOVERY_AUDIT_TYPE,
+    }:
+        raise ValueError("recovery audit type is not supported")
+    base = _state_dir(checked_row)
+    if _path_lexists(
+        Path(str(checked_row["completion_path"]))
+    ):
+        _load_completion(
+            payload,
+            checked_row,
+            state_fd=state_fd,
+        )
+        raise RuntimeError("cannot recover a completed job row")
+    claims = _load_claim_chain(
+        checked_row,
+        state_fd=state_fd,
+        map_sha256=map_sha256,
+        row_sha256=row_sha256,
+        allow_pending_recovery=True,
+    )
+    if not claims:
+        raise RuntimeError("no stale claim exists to recover")
+    previous = claims[-1]
+    next_generation = previous.generation + 1
+    with _open_generation_directory(
+        state_fd,
+        base,
+        previous.generation,
+    ) as previous_fd:
+        attempt = _load_attempt(
+            previous,
+            generation_fd=previous_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+            array_index=int(checked_row["array_index"]),
+        )
+        if previous.generation > 1 and attempt is None:
+            raise RuntimeError(
+                "recovered claim must consume its attempt before recovery"
+            )
+        if _entry_lexists_at(
+            previous_fd,
+            previous.recovery_path.name,
+            previous.recovery_path,
+        ):
+            recovery_document, recovery_sha256 = _load_recovery_record(
+                previous,
+                generation_fd=previous_fd,
+                state_fd=state_fd,
+                row=checked_row,
+                base=base,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+            )
+            recovery_payload = recovery_document["payload"]
+            if not isinstance(recovery_payload, dict):
+                raise ValueError("recovery payload must be an object")
+            if (
+                recovery_payload["recovery_audit_sha256"]
+                != audit_sha256
+                or recovery_payload["recovery_audit_type"]
+                != recovery_audit_type
+            ):
+                raise ValueError(
+                    "requested audit does not match the pending recovery"
+                )
+        else:
+            quarantine = _quarantine_output(
+                checked_row,
+                base=base,
+                generation=previous.generation,
+                state_fd=state_fd,
+            )
+            recovery_payload = {
+                "claim_sha256": previous.sha256,
+                "next_generation": next_generation,
+                "recovery_audit_sha256": audit_sha256,
+                "recovery_audit_type": recovery_audit_type,
+                "attempt_record_sha256": (
+                    attempt[1] if attempt is not None else None
+                ),
+                "quarantine": quarantine,
+                "restart_mode": "fresh",
+            }
+            _, recovery_sha256 = _create_record(
+                previous.recovery_path,
+                RECOVERY_TYPE,
+                recovery_payload,
+                directory_fd=previous_fd,
+            )
+    claim_payload: dict[str, object] = {
+        "job_map_sha256": map_sha256,
+        "row_sha256": row_sha256,
+        "array_index": checked_row["array_index"],
+        "generation": next_generation,
+        "recovered_from_claim_sha256": previous.sha256,
+        "recovery_record_sha256": recovery_sha256,
+    }
+    path = (
+        base
+        / f"generation-{next_generation:06d}"
+        / "claim.json"
+    )
+    document, digest = _create_record(
+        path,
+        CLAIM_TYPE,
+        claim_payload,
+        state_fd=state_fd,
+        generation=next_generation,
+        create_generation=True,
+    )
+    return _claim_from_document(
+        path,
+        next_generation,
+        document,
+        digest,
+    )
+
+
 def _recover_job_row_unverified_for_testing(
     payload: Mapping[str, object],
     row: Mapping[str, object],
@@ -2142,132 +3126,39 @@ def _recover_job_row_unverified_for_testing(
     This helper is intentionally internal and is not exposed by the CLI.
     """
 
-    audit_sha256 = _require_sha256(
-        recovery_audit_sha256,
-        "recovery_audit_sha256",
-    )
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
     base = _state_dir(checked_row)
     with _transition_lock(base) as state_fd:
-        if _path_lexists(
-            Path(str(checked_row["completion_path"]))
-        ):
-            _load_completion(
-                payload,
-                checked_row,
-                state_fd=state_fd,
-            )
-            raise RuntimeError("cannot recover a completed job row")
-        claims = _load_claim_chain(
-            checked_row,
-            state_fd=state_fd,
+        return _transition_to_recovered_claim_locked(
+            payload,
+            checked_row=checked_row,
             map_sha256=map_sha256,
             row_sha256=row_sha256,
-            allow_pending_recovery=True,
-        )
-        if not claims:
-            raise RuntimeError("no stale claim exists to recover")
-        previous = claims[-1]
-        next_generation = previous.generation + 1
-        with _open_generation_directory(
-            state_fd,
-            base,
-            previous.generation,
-        ) as previous_fd:
-            attempt = _load_attempt(
-                previous,
-                generation_fd=previous_fd,
-                map_sha256=map_sha256,
-                row_sha256=row_sha256,
-                array_index=int(checked_row["array_index"]),
-            )
-            if previous.generation > 1 and attempt is None:
-                raise RuntimeError(
-                    "recovered claim must consume its attempt before recovery"
-                )
-            if _entry_lexists_at(
-                previous_fd,
-                previous.recovery_path.name,
-                previous.recovery_path,
-            ):
-                recovery_document, recovery_sha256 = _load_recovery_record(
-                    previous,
-                    generation_fd=previous_fd,
-                    state_fd=state_fd,
-                    row=checked_row,
-                    base=base,
-                    map_sha256=map_sha256,
-                    row_sha256=row_sha256,
-                )
-                recovery_payload = recovery_document["payload"]
-                if not isinstance(recovery_payload, dict):
-                    raise ValueError("recovery payload must be an object")
-                if (
-                    recovery_payload["recovery_audit_sha256"]
-                    != audit_sha256
-                ):
-                    raise ValueError(
-                        "requested audit does not match the pending recovery"
-                    )
-            else:
-                quarantine = _quarantine_output(
-                    checked_row,
-                    base=base,
-                    generation=previous.generation,
-                    state_fd=state_fd,
-                )
-                recovery_payload = {
-                    "claim_sha256": previous.sha256,
-                    "next_generation": next_generation,
-                    "recovery_audit_sha256": audit_sha256,
-                    "attempt_record_sha256": (
-                        attempt[1] if attempt is not None else None
-                    ),
-                    "quarantine": quarantine,
-                    "restart_mode": "fresh",
-                }
-                _, recovery_sha256 = _create_record(
-                    previous.recovery_path,
-                    RECOVERY_TYPE,
-                    recovery_payload,
-                    directory_fd=previous_fd,
-                )
-        claim_payload: dict[str, object] = {
-            "job_map_sha256": map_sha256,
-            "row_sha256": row_sha256,
-            "array_index": checked_row["array_index"],
-            "generation": next_generation,
-            "recovered_from_claim_sha256": previous.sha256,
-            "recovery_record_sha256": recovery_sha256,
-        }
-        path = (
-            base
-            / f"generation-{next_generation:06d}"
-            / "claim.json"
-        )
-        document, digest = _create_record(
-            path,
-            CLAIM_TYPE,
-            claim_payload,
             state_fd=state_fd,
-            generation=next_generation,
-            create_generation=True,
-        )
-        return _claim_from_document(
-            path,
-            next_generation,
-            document,
-            digest,
+            recovery_audit_sha256=recovery_audit_sha256,
+            recovery_audit_type=TEST_ONLY_RECOVERY_AUDIT_TYPE,
         )
 
 
 def consume_recovery_attempt(
     payload: Mapping[str, object],
     row: Mapping[str, object],
+    *,
+    scheduler_job_id: str | None = None,
 ) -> Path:
     """Atomically consume the current recovered generation's sole attempt."""
 
     _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    if scheduler_job_id is not None:
+        scheduler_match = _SLURM_ARRAY_JOB_RE.fullmatch(scheduler_job_id)
+        if (
+            scheduler_match is None
+            or int(scheduler_match.group("array_task_id"))
+            != int(checked_row["array_index"])
+        ):
+            raise ValueError(
+                "attempt scheduler job does not match the selected row"
+            )
     base = _state_dir(checked_row)
     with _transition_lock(base) as state_fd:
         claims = _load_claim_chain(
@@ -2283,6 +3174,52 @@ def consume_recovery_attempt(
         if not claims or claims[-1].generation == 1:
             raise RuntimeError("no recovered claim is available to attempt")
         current = claims[-1]
+        previous = claims[-2]
+        with _open_generation_directory(
+            state_fd,
+            base,
+            previous.generation,
+        ) as previous_fd:
+            recovery_document, _ = _load_recovery_record(
+                previous,
+                generation_fd=previous_fd,
+                state_fd=state_fd,
+                row=checked_row,
+                base=base,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+            )
+            recovery_payload = recovery_document["payload"]
+            if not isinstance(recovery_payload, dict):
+                raise ValueError("recovery payload must be an object")
+            if (
+                recovery_payload["recovery_audit_type"]
+                == SLURM_RECOVERY_AUDIT_TYPE
+            ):
+                if scheduler_job_id is None:
+                    raise RuntimeError(
+                        "typed SLURM recovery requires a new scheduler job"
+                    )
+                audit_document, _ = _read_record(
+                    previous.slurm_recovery_audit_path,
+                    payload_type=SLURM_RECOVERY_AUDIT_TYPE,
+                    payload_keys=_SLURM_AUDIT_PAYLOAD_KEYS,
+                    directory_fd=previous_fd,
+                )
+                audit_payload = audit_document["payload"]
+                if not isinstance(audit_payload, dict):
+                    raise ValueError(
+                        "SLURM recovery audit payload must be an object"
+                    )
+                scheduler = audit_payload["scheduler"]
+                if not isinstance(scheduler, dict):
+                    raise ValueError(
+                        "SLURM recovery scheduler payload is invalid"
+                    )
+                if scheduler.get("job_id") == scheduler_job_id:
+                    raise RuntimeError(
+                        "failed/requeued SLURM job cannot consume its recovery"
+                    )
         with _open_generation_directory(
             state_fd,
             base,
@@ -2305,6 +3242,7 @@ def consume_recovery_attempt(
                 "array_index": checked_row["array_index"],
                 "generation": current.generation,
                 "claim_sha256": current.sha256,
+                "scheduler_job_id": scheduler_job_id,
             }
             _create_record(
                 current.attempt_path,
@@ -2419,6 +3357,25 @@ def complete_job_row(
         )
 
 
+def _slurm_job_id_for_attempt(array_index: int) -> str | None:
+    array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+    array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    if array_job_id is None and array_task_id is None:
+        return None
+    if array_job_id is None or array_task_id is None:
+        raise ValueError("incomplete SLURM array scheduler identity")
+    candidate = f"{array_job_id}_{array_task_id}"
+    match = _SLURM_ARRAY_JOB_RE.fullmatch(candidate)
+    if (
+        match is None
+        or int(match.group("array_task_id")) != array_index
+    ):
+        raise ValueError(
+            "SLURM scheduler identity does not match the selected row"
+        )
+    return candidate
+
+
 def _run_selected_row(args: argparse.Namespace) -> int:
     job_map = load_job_map(
         args.job_map,
@@ -2469,7 +3426,11 @@ def _run_selected_row(args: argparse.Namespace) -> int:
         claim = claim_job_row(job_map, row)
 
     if claim.generation > 1:
-        consume_recovery_attempt(job_map, row)
+        consume_recovery_attempt(
+            job_map,
+            row,
+            scheduler_job_id=_slurm_job_id_for_attempt(args.array_index),
+        )
     if _path_lexists(_output_dir(row)):
         raise RuntimeError(
             "unaudited output appeared before the sealed job attempt"
@@ -2620,6 +3581,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     complete_env.add_argument("--output-hashes", required=True)
 
+    recover_slurm = subparsers.add_parser(
+        "recover-slurm",
+        help="recover one failed row from verified SLURM evidence",
+    )
+    _add_selection_arguments(recover_slurm)
+    recover_slurm.add_argument("--failed-slurm-job", required=True)
+
     run_row = subparsers.add_parser("run-row", help="run one exact array row")
     _add_selection_arguments(run_row)
     run_row.add_argument("--confirmation-seal", type=Path)
@@ -2679,7 +3647,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     payload, row = _load_selected(args)
-    if args.command == "select":
+    if args.command == "recover-slurm":
+        claim = recover_job_row_from_slurm(
+            payload,
+            row,
+            job_map_path=args.job_map,
+            failed_slurm_job=args.failed_slurm_job,
+        )
+        print(claim.path)
+    elif args.command == "select":
         print(canonical_json_bytes(row).decode("utf-8"))
     else:  # pragma: no cover - argparse enforces the command set.
         raise AssertionError(args.command)
