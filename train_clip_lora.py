@@ -35,7 +35,7 @@ from main.data import (
 )
 
 from main.models_clip import BrainCLIPModel, BrainCLIPConfig, BrainCLIPOutput
-from utils.utils_training import rotate_checkpoints
+from utils.utils_training import backward_and_clip_gradients, rotate_checkpoints
 
 wandb = None
 if is_wandb_available():
@@ -840,13 +840,12 @@ def main():
                 if args.report_to is not None:
                     total_loss += loss.detach().float()
 
-                if accelerator.sync_gradients:
-                    params_to_clip = [
-                        p for p in clip_model.parameters() if p.requires_grad
-                    ]
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
-                accelerator.backward(loss)
+                backward_and_clip_gradients(
+                    accelerator=accelerator,
+                    model=clip_model,
+                    loss=loss,
+                    max_grad_norm=args.max_grad_norm,
+                )
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()

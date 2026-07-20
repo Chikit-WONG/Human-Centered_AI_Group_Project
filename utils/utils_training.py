@@ -1,9 +1,27 @@
 import os
 from typing import Optional
 
+import torch
+from accelerate import Accelerator
 from accelerate.logging import get_logger
+from torch import nn
 
 logger = get_logger(__name__)
+
+
+def backward_and_clip_gradients(
+    *,
+    accelerator: Accelerator,
+    model: nn.Module,
+    loss: torch.Tensor,
+    max_grad_norm: float,
+) -> None:
+    accelerator.backward(loss)
+    if accelerator.sync_gradients:
+        params_to_clip = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
+        accelerator.clip_grad_norm_(params_to_clip, max_grad_norm)
 
 
 def rotate_checkpoints(output_dir: str, save_total_limit: Optional[int]) -> None:
