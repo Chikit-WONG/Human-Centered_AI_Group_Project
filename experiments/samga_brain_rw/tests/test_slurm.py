@@ -2445,6 +2445,84 @@ def test_slurm_recovery_rejects_noncanonical_child_job_id_raw(
     assert not (first.path.parent.parent / "generation-000002").exists()
 
 
+def test_slurm_recovery_accepts_cancelled_by_current_uid(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    payload, row, map_path, _, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+    fields = list(jobmap_module.SLURM_RECOVERY_SACCT_FIELDS)
+    values = sacct_line.removesuffix("\n").split("|")
+    values[fields.index("State")] = f"CANCELLED by {os.getuid()}"
+    cancelled_sacct_line = "|".join(values) + "\n"
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=cancelled_sacct_line if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    second = jobmap_module.recover_job_row_from_slurm(
+        payload,
+        row,
+        job_map_path=map_path,
+        failed_slurm_job="12345_0",
+        runner=fake_runner,
+    )
+    assert second.generation == 2
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        f"CANCELLED by {os.getuid() + 1}",
+        "CANCELLED by root",
+        f"CANCELLED by {os.getuid()} trailing",
+    ),
+)
+def test_slurm_recovery_rejects_untrusted_cancelled_by_state(
+    experiment_root: Path,
+    jobmap_module: ModuleType,
+    submit_module: ModuleType,
+    tmp_path: Path,
+    state: str,
+) -> None:
+    payload, row, map_path, first, _, sacct_line = _slurm_recovery_case(
+        tmp_path=tmp_path,
+        experiment_root=experiment_root,
+        jobmap_module=jobmap_module,
+        submit_module=submit_module,
+    )
+    fields = list(jobmap_module.SLURM_RECOVERY_SACCT_FIELDS)
+    values = sacct_line.removesuffix("\n").split("|")
+    values[fields.index("State")] = state
+    invalid_sacct_line = "|".join(values) + "\n"
+
+    def fake_runner(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=invalid_sacct_line if command[0] == "sacct" else "",
+            returncode=0,
+        )
+
+    with pytest.raises(ValueError, match="state|State|UID"):
+        jobmap_module.recover_job_row_from_slurm(
+            payload,
+            row,
+            job_map_path=map_path,
+            failed_slurm_job="12345_0",
+            runner=fake_runner,
+        )
+    assert not first.slurm_recovery_audit_path.exists()
+    assert not first.recovery_path.exists()
+    assert not (first.path.parent.parent / "generation-000002").exists()
+
+
 def test_slurm_recovery_resumes_after_typed_audit_publication_crash(
     experiment_root: Path,
     jobmap_module: ModuleType,

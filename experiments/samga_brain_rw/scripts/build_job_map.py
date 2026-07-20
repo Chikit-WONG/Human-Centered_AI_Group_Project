@@ -2957,9 +2957,14 @@ def _validate_sacct_record(
     for field, value in expected.items():
         if record[field] != value:
             raise ValueError(f"sacct {field} does not match the sealed row")
-    if record["State"] not in _FAILED_SLURM_STATES:
+    failed_state = record["State"]
+    cancelled_by_current_uid = f"CANCELLED by {os.getuid()}"
+    if (
+        failed_state not in _FAILED_SLURM_STATES
+        and failed_state != cancelled_by_current_uid
+    ):
         raise ValueError(
-            f"sacct state is not a failed terminal state: {record['State']}"
+            f"sacct state is not a failed terminal state: {failed_state}"
         )
     start_ns = _slurm_time_ns(record["Start"], "Start")
     end_ns = _slurm_time_ns(record["End"], "End")
