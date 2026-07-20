@@ -80,6 +80,14 @@ _STATE_KEYS = frozenset(
         "state_sha256",
     }
 )
+_STAGE_STATE_KEYS = frozenset({"candidates", "confirmed", "survivor"})
+_STATE_REFERENCE_KEYS = frozenset(
+    {
+        "candidate_id",
+        "decision_sha256",
+        "frozen_identity_sha256",
+    }
+)
 
 
 class RegistryIntegrityError(ValueError):
@@ -327,9 +335,12 @@ class CandidateDecision:
             _DECISION_DOCUMENT_KEYS,
             "candidate decision document",
         )
-        if document["schema_version"] != 1:
+        if (
+            type(document["schema_version"]) is not int
+            or document["schema_version"] != 1
+        ):
             raise RegistryIntegrityError(
-                "candidate decision schema_version must be 1"
+                "candidate decision schema_version must be integer 1"
             )
         if document["artifact_type"] != CANDIDATE_DECISION_TYPE:
             raise RegistryIntegrityError(
@@ -359,6 +370,200 @@ def _state_with_hash(state_body: Mapping[str, object]) -> dict[str, object]:
     document = dict(state_body)
     document["state_sha256"] = sha256_json(state_body)
     return document
+
+
+def _require_state_sha256(value: object, field: str) -> str:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+        raise RegistryIntegrityError(
+            f"{field} must be a 64-character lowercase SHA-256"
+        )
+    return value
+
+
+def _require_state_candidate_id(value: object, field: str) -> str:
+    try:
+        return _require_safe_id(value, field)
+    except ValueError as exc:
+        raise RegistryIntegrityError(f"{field} is invalid") from exc
+
+
+def _validate_state_reference(
+    value: object,
+    context: str,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if type(value) is not dict:
+        raise RegistryIntegrityError(f"{context} must be an object or null")
+    _require_exact_keys(value, _STATE_REFERENCE_KEYS, context)
+    _require_state_candidate_id(
+        value["candidate_id"],
+        f"{context} candidate_id",
+    )
+    _require_state_sha256(
+        value["decision_sha256"],
+        f"{context} decision_sha256",
+    )
+    _require_state_sha256(
+        value["frozen_identity_sha256"],
+        f"{context} frozen_identity_sha256",
+    )
+    return value
+
+
+def _validate_stored_state_document(state: dict[str, object]) -> int:
+    _require_exact_keys(state, _STATE_KEYS, "registry state")
+    if (
+        type(state["artifact_type"]) is not str
+        or state["artifact_type"] != REGISTRY_STATE_TYPE
+    ):
+        raise RegistryIntegrityError(
+            f"registry state artifact_type must be {REGISTRY_STATE_TYPE}"
+        )
+    if (
+        type(state["schema_version"]) is not int
+        or state["schema_version"] != 1
+    ):
+        raise RegistryIntegrityError(
+            "registry state schema_version must be integer 1"
+        )
+    sequence = state["sequence"]
+    if type(sequence) is not int or sequence < 0:
+        raise RegistryIntegrityError(
+            "compact registry state sequence is invalid"
+        )
+
+    state_sha256 = _require_state_sha256(
+        state["state_sha256"],
+        "registry state state_sha256",
+    )
+    state_body = {
+        key: value
+        for key, value in state.items()
+        if key != "state_sha256"
+    }
+    if sha256_json(state_body) != state_sha256:
+        raise RegistryIntegrityError("registry state SHA-256 mismatch")
+
+    head_record = state["head_record_sha256"]
+    previous_state = state["previous_state_sha256"]
+    if sequence == 0:
+        if head_record is not None or previous_state is not None:
+            raise RegistryIntegrityError(
+                "empty registry state must have null hash-chain heads"
+            )
+    else:
+        _require_state_sha256(
+            head_record,
+            "registry state head_record_sha256",
+        )
+        if sequence == 1:
+            if previous_state is not None:
+                raise RegistryIntegrityError(
+                    "first registry state previous_state_sha256 must be null"
+                )
+        else:
+            _require_state_sha256(
+                previous_state,
+                "registry state previous_state_sha256",
+            )
+
+    stages = state["stages"]
+    if type(stages) is not dict:
+        raise RegistryIntegrityError("registry state stages must be an object")
+    if (sequence == 0) != (not stages):
+        raise RegistryIntegrityError(
+            "registry state sequence/stages emptiness mismatch"
+        )
+    for stage_key, raw_stage in stages.items():
+        if (
+            type(stage_key) is not str
+            or stage_key not in {"1", "2", "3", "4", "5"}
+        ):
+            raise RegistryIntegrityError(
+                "registry state stage key must be one of 1..5"
+            )
+        if type(raw_stage) is not dict:
+            raise RegistryIntegrityError(
+                f"registry state stage {stage_key} must be an object"
+            )
+        _require_exact_keys(
+            raw_stage,
+            _STAGE_STATE_KEYS,
+            f"registry state stage {stage_key}",
+        )
+        candidates = raw_stage["candidates"]
+        if type(candidates) is not dict or not candidates:
+            raise RegistryIntegrityError(
+                f"registry state stage {stage_key} candidates must be "
+                "a nonempty object"
+            )
+        for candidate_id, raw_scopes in candidates.items():
+            candidate_id = _require_state_candidate_id(
+                candidate_id,
+                f"registry state stage {stage_key} candidate_id",
+            )
+            if type(raw_scopes) is not dict:
+                raise RegistryIntegrityError(
+                    f"registry state candidate {candidate_id} scopes "
+                    "must be an object"
+                )
+            if (
+                "val-dev" not in raw_scopes
+                or not set(raw_scopes) <= {"val-dev", "val-confirm"}
+            ):
+                raise RegistryIntegrityError(
+                    f"registry state candidate {candidate_id} scopes are invalid"
+                )
+            for scope, decision_sha256 in raw_scopes.items():
+                _require_state_sha256(
+                    decision_sha256,
+                    f"registry state candidate {candidate_id} {scope}",
+                )
+
+        survivor = _validate_state_reference(
+            raw_stage["survivor"],
+            f"registry state stage {stage_key} survivor",
+        )
+        confirmed = _validate_state_reference(
+            raw_stage["confirmed"],
+            f"registry state stage {stage_key} confirmed",
+        )
+        if survivor is not None:
+            survivor_id = survivor["candidate_id"]
+            if survivor_id not in candidates:
+                raise RegistryIntegrityError(
+                    "registry state survivor is absent from candidates"
+                )
+        if confirmed is not None:
+            confirmed_id = confirmed["candidate_id"]
+            if (
+                survivor is None
+                or confirmed_id != survivor["candidate_id"]
+                or confirmed["frozen_identity_sha256"]
+                != survivor["frozen_identity_sha256"]
+            ):
+                raise RegistryIntegrityError(
+                    "registry state confirmed/survivor identity mismatch"
+                )
+            confirmed_scopes = candidates[confirmed_id]
+            if (
+                type(confirmed_scopes) is not dict
+                or confirmed_scopes.get("val-confirm")
+                != confirmed["decision_sha256"]
+            ):
+                raise RegistryIntegrityError(
+                    "registry state confirmed decision mismatch"
+                )
+        elif any(
+            "val-confirm" in scopes
+            for scopes in candidates.values()
+            if type(scopes) is dict
+        ):
+            raise RegistryIntegrityError(
+                "registry state val-confirm lacks confirmed state"
+            )
+    return sequence
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -683,7 +888,7 @@ class CandidateRegistry:
         )
         if journal_bytes is None and state_bytes is None:
             return _blank_state(), []
-        if journal_bytes is None or state_bytes is None:
+        if journal_bytes is None:
             raise RegistryIntegrityError(
                 "registry journal/state existence mismatch"
             )
@@ -692,7 +897,28 @@ class CandidateRegistry:
                 "append-only registry journal lacks a final newline"
             )
 
+        # The journal is the WAL: its fsync precedes compact-state publication.
+        # Record a possible stored prefix, but do not recover it until the
+        # complete journal and every hash/transition have been validated.
+        stored_state: dict[str, object] | None = None
+        stored_sequence: int | None = None
+        if state_bytes is not None:
+            stored_state = _decode_object(
+                state_bytes.rstrip(b"\n"),
+                "registry state",
+            )
+            if state_bytes != canonical_json_bytes(stored_state) + b"\n":
+                raise RegistryIntegrityError(
+                    "compact registry state is not canonical JSON"
+                )
+            stored_sequence = _validate_stored_state_document(stored_state)
+
         state: dict[str, object] = _blank_state()
+        stored_prefix_state = (
+            _state_with_hash(state)
+            if stored_sequence == 0
+            else None
+        )
         decisions: list[CandidateDecision] = []
         decisions_by_sha256: dict[str, CandidateDecision] = {}
         expected_record_sha256: str | None = None
@@ -712,15 +938,25 @@ class CandidateRegistry:
                 )
             _require_exact_keys(record, _RECORD_KEYS, "registry record")
             if (
-                record["schema_version"] != 1
+                type(record["schema_version"]) is not int
+                or record["schema_version"] != 1
+            ):
+                raise RegistryIntegrityError(
+                    "registry record schema_version must be integer 1"
+                )
+            if (
+                type(record["artifact_type"]) is not str
                 or record["artifact_type"] != REGISTRY_RECORD_TYPE
             ):
                 raise RegistryIntegrityError(
-                    "registry record type/version mismatch"
+                    f"registry record artifact_type must be {REGISTRY_RECORD_TYPE}"
                 )
-            if record["sequence"] != expected_sequence:
+            if (
+                type(record["sequence"]) is not int
+                or record["sequence"] != expected_sequence
+            ):
                 raise RegistryIntegrityError(
-                    "registry record sequence is not contiguous"
+                    "registry record sequence must be a contiguous integer"
                 )
             if record["previous_record_sha256"] != expected_record_sha256:
                 raise RegistryIntegrityError(
@@ -763,20 +999,32 @@ class CandidateRegistry:
                 raise RegistryIntegrityError(
                     "registry state SHA-256 chain mismatch"
                 )
+            if stored_sequence == expected_sequence:
+                stored_prefix_state = next_state
             state = next_state_body
             expected_record_sha256 = record_sha256
             expected_state_sha256 = next_state["state_sha256"]  # type: ignore[assignment]
             decisions.append(decision)
             decisions_by_sha256[decision_sha256] = decision
 
-        stored_state = _decode_object(state_bytes.rstrip(b"\n"), "registry state")
-        if state_bytes != canonical_json_bytes(stored_state) + b"\n":
-            raise RegistryIntegrityError(
-                "compact registry state is not canonical JSON"
-            )
-        _require_exact_keys(stored_state, _STATE_KEYS, "registry state")
         expected_state = _state_with_hash(state)
-        if stored_state != expected_state:
+        expected_state_bytes = canonical_json_bytes(expected_state)
+        stored_state_bytes = (
+            canonical_json_bytes(stored_state)
+            if stored_state is not None
+            else None
+        )
+        if stored_state is None:
+            self._publish_state_unlocked(expected_state)
+        elif stored_state_bytes == expected_state_bytes:
+            pass
+        elif (
+            stored_prefix_state is not None
+            and stored_state_bytes
+            == canonical_json_bytes(stored_prefix_state)
+        ):
+            self._publish_state_unlocked(expected_state)
+        else:
             raise RegistryIntegrityError(
                 "compact registry state differs from the journal reduction"
             )
@@ -949,6 +1197,39 @@ class CandidateRegistry:
             state, decisions = self._load_verified_unlocked()
             self._commit_unlocked(state, decisions, decision)
 
+    def append_or_reuse_exact(
+        self,
+        decision: CandidateDecision,
+    ) -> CandidateDecision:
+        if not isinstance(decision, CandidateDecision):
+            raise ValueError("decision must be a CandidateDecision")
+        if decision.locked:
+            raise RegistryStateError(
+                "locked survivor records may only be created by the registry"
+            )
+        with self._exclusive_lock():
+            state, decisions = self._load_verified_unlocked()
+            for existing in decisions:
+                if (
+                    existing.stage == decision.stage
+                    and existing.candidate_id == decision.candidate_id
+                    and existing.scope == decision.scope
+                    and existing.locked == decision.locked
+                ):
+                    if (
+                        canonical_json_bytes(existing.to_payload())
+                        == canonical_json_bytes(decision.to_payload())
+                        and existing.frozen_identity_sha256
+                        == decision.frozen_identity_sha256
+                    ):
+                        return existing
+                    raise RegistryStateError(
+                        f"divergent duplicate {decision.scope} decision "
+                        f"for {decision.candidate_id}"
+                    )
+            self._commit_unlocked(state, decisions, decision)
+            return decision
+
     def lock_stage_survivor(self, stage: int) -> CandidateDecision:
         stage = _require_stage(stage)
         with self._exclusive_lock():
@@ -981,6 +1262,106 @@ class CandidateRegistry:
                     "a stage-specific selector must preselect exactly one"
                 )
             chosen = eligible[0]
+            locked = replace(chosen, locked=True)
+            self._commit_unlocked(state, decisions, locked)
+            return locked
+
+    def lock_stage_survivor_or_reuse_exact(
+        self,
+        stage: int,
+        expected_development_decision_sha256: str,
+    ) -> CandidateDecision:
+        stage = _require_stage(stage)
+        expected_sha256 = _require_sha256(
+            expected_development_decision_sha256,
+            "expected_development_decision_sha256",
+        )
+        with self._exclusive_lock():
+            state, decisions = self._load_verified_unlocked()
+            stages = state["stages"]
+            if not isinstance(stages, dict):
+                raise RegistryIntegrityError("registry stages state is invalid")
+            stage_state = stages.get(str(stage))
+            survivor = (
+                stage_state.get("survivor")
+                if isinstance(stage_state, dict)
+                else None
+            )
+
+            if survivor is not None:
+                development = next(
+                    (
+                        decision
+                        for decision in decisions
+                        if (
+                            decision.decision_sha256 == expected_sha256
+                            and decision.stage == stage
+                            and decision.scope == "val-dev"
+                            and not decision.locked
+                            and decision.gate.passed
+                        )
+                    ),
+                    None,
+                )
+                if development is None:
+                    raise RegistryStateError(
+                        f"stage {stage} does not contain the expected passing "
+                        "val-dev decision"
+                    )
+                if not isinstance(survivor, dict):
+                    raise RegistryIntegrityError(
+                        "registry survivor state is invalid"
+                    )
+                survivor_sha256 = survivor.get("decision_sha256")
+                locked = next(
+                    (
+                        decision
+                        for decision in decisions
+                        if decision.decision_sha256 == survivor_sha256
+                    ),
+                    None,
+                )
+                expected_locked = replace(development, locked=True)
+                if (
+                    locked is None
+                    or survivor.get("candidate_id")
+                    != development.candidate_id
+                    or survivor.get("frozen_identity_sha256")
+                    != expected_locked.frozen_identity_sha256
+                    or canonical_json_bytes(locked.to_payload())
+                    != canonical_json_bytes(expected_locked.to_payload())
+                ):
+                    raise RegistryStateError(
+                        f"stage {stage} survivor is divergent from the "
+                        "expected val-dev decision"
+                    )
+                return locked
+
+            eligible = [
+                decision
+                for decision in decisions
+                if (
+                    decision.stage == stage
+                    and decision.scope == "val-dev"
+                    and not decision.locked
+                    and decision.gate.passed
+                )
+            ]
+            if not eligible:
+                raise RegistryStateError(
+                    f"stage {stage} has no passing val-dev candidate"
+                )
+            if len(eligible) != 1:
+                raise RegistryStateError(
+                    f"stage {stage} has multiple passing val-dev candidates; "
+                    "a stage-specific selector must preselect exactly one"
+                )
+            chosen = eligible[0]
+            if chosen.decision_sha256 != expected_sha256:
+                raise RegistryStateError(
+                    f"stage {stage} passing val-dev decision does not match "
+                    "the expected decision SHA-256"
+                )
             locked = replace(chosen, locked=True)
             self._commit_unlocked(state, decisions, locked)
             return locked

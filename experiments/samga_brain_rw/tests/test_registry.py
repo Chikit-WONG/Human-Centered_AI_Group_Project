@@ -144,6 +144,73 @@ def test_registry_chain_links_multiple_records(tmp_path: Path) -> None:
     registry.verify()
 
 
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("schema_version", True),
+        ("schema_version", 1.0),
+        ("sequence", True),
+        ("sequence", 1.0),
+    ],
+    ids=[
+        "schema-boolean-true",
+        "schema-float-one",
+        "sequence-boolean-true",
+        "sequence-float-one",
+    ],
+)
+def test_registry_rejects_type_changed_record_integer_fields(
+    tmp_path: Path,
+    field: str,
+    bad_value: object,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.append(_decision("candidate-a"))
+    record = json.loads(registry.journal_path.read_text("utf-8"))
+    state = json.loads(registry.state_path.read_text("utf-8"))
+
+    record[field] = bad_value
+    record_body = {
+        key: value
+        for key, value in record.items()
+        if key not in {"record_sha256", "state_sha256"}
+    }
+    record["record_sha256"] = sha256_json(record_body)
+    state["head_record_sha256"] = record["record_sha256"]
+    state_body = {
+        key: value
+        for key, value in state.items()
+        if key != "state_sha256"
+    }
+    state["state_sha256"] = sha256_json(state_body)
+    record["state_sha256"] = state["state_sha256"]
+    registry.journal_path.write_bytes(canonical_json_bytes(record) + b"\n")
+    registry.state_path.write_bytes(canonical_json_bytes(state) + b"\n")
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+
+    with pytest.raises(RegistryIntegrityError, match=field):
+        registry.verify()
+
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+
+
+@pytest.mark.parametrize(
+    "bad_schema_version",
+    [True, 1.0],
+    ids=["boolean-true", "float-one"],
+)
+def test_candidate_decision_document_requires_integer_schema_version(
+    bad_schema_version: object,
+) -> None:
+    document = _decision("candidate-a").to_document()
+    document["schema_version"] = bad_schema_version
+
+    with pytest.raises(RegistryIntegrityError, match="schema_version"):
+        CandidateDecision.from_document(document)
+
+
 def test_registry_refuses_duplicate_decision_without_mutating_files(
     tmp_path: Path,
 ) -> None:
@@ -158,6 +225,231 @@ def test_registry_refuses_duplicate_decision_without_mutating_files(
 
     assert registry.journal_path.read_bytes() == journal_before
     assert registry.state_path.read_bytes() == state_before
+
+
+def test_append_or_reuse_exact_is_idempotent_without_new_record(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    decision = _decision("candidate-a")
+
+    appended = registry.append_or_reuse_exact(decision)
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+    reused = registry.append_or_reuse_exact(decision)
+
+    assert appended == decision
+    assert reused == decision
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+    assert registry.load_state()["sequence"] == 1
+
+
+def test_append_or_reuse_exact_rejects_divergent_duplicate_without_mutation(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    decision = _decision("candidate-a")
+    registry.append_or_reuse_exact(decision)
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+    divergent = replace(
+        decision,
+        candidate_matrix_sha256=_h("divergent-candidate-matrix"),
+    )
+
+    with pytest.raises(RegistryStateError, match="duplicate"):
+        registry.append_or_reuse_exact(divergent)
+
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+
+
+def test_append_or_reuse_exact_serializes_concurrent_exact_retries(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "decisions.jsonl"
+    state = tmp_path / "state.json"
+    decision = _decision("candidate-a")
+
+    def append(_: int) -> CandidateDecision:
+        return CandidateRegistry(journal, state).append_or_reuse_exact(decision)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        returned = list(pool.map(append, range(16)))
+
+    assert returned == [decision] * 16
+    registry = CandidateRegistry(journal, state)
+    registry.verify()
+    assert len(journal.read_text("utf-8").splitlines()) == 1
+    assert registry.load_state()["sequence"] == 1
+
+
+def test_append_or_reuse_exact_recovers_missing_state_after_publish_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry(tmp_path)
+    decision = _decision("candidate-a")
+    publish = registry._publish_state_unlocked
+
+    def crash_after_journal_fsync(_: object) -> None:
+        raise OSError("injected compact-state publish crash")
+
+    monkeypatch.setattr(
+        registry,
+        "_publish_state_unlocked",
+        crash_after_journal_fsync,
+    )
+    with pytest.raises(OSError, match="injected"):
+        registry.append_or_reuse_exact(decision)
+
+    assert len(registry.journal_path.read_text("utf-8").splitlines()) == 1
+    assert not registry.state_path.exists()
+
+    monkeypatch.setattr(registry, "_publish_state_unlocked", publish)
+    reused = registry.append_or_reuse_exact(decision)
+
+    assert reused == decision
+    state = registry.load_state()
+    record = json.loads(registry.journal_path.read_text("utf-8"))
+    assert state["sequence"] == 1
+    assert state["state_sha256"] == record["state_sha256"]
+    registry.verify()
+
+
+def test_append_or_reuse_exact_recovers_prefix_state_after_publish_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.append_or_reuse_exact(_decision("candidate-a"))
+    prefix_state = registry.state_path.read_bytes()
+    decision = _decision("candidate-b")
+    publish = registry._publish_state_unlocked
+
+    def crash_after_journal_fsync(_: object) -> None:
+        raise OSError("injected compact-state publish crash")
+
+    monkeypatch.setattr(
+        registry,
+        "_publish_state_unlocked",
+        crash_after_journal_fsync,
+    )
+    with pytest.raises(OSError, match="injected"):
+        registry.append_or_reuse_exact(decision)
+
+    assert len(registry.journal_path.read_text("utf-8").splitlines()) == 2
+    assert registry.state_path.read_bytes() == prefix_state
+
+    monkeypatch.setattr(registry, "_publish_state_unlocked", publish)
+    reused = registry.append_or_reuse_exact(decision)
+
+    assert reused == decision
+    state = registry.load_state()
+    records = [
+        json.loads(line)
+        for line in registry.journal_path.read_text("utf-8").splitlines()
+    ]
+    assert state["sequence"] == 2
+    assert state["state_sha256"] == records[-1]["state_sha256"]
+    registry.verify()
+
+
+def test_missing_state_recovery_validates_full_journal_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry(tmp_path)
+
+    def crash_after_journal_fsync(_: object) -> None:
+        raise OSError("injected compact-state publish crash")
+
+    monkeypatch.setattr(
+        registry,
+        "_publish_state_unlocked",
+        crash_after_journal_fsync,
+    )
+    with pytest.raises(OSError, match="injected"):
+        registry.append_or_reuse_exact(_decision("candidate-a"))
+
+    record = json.loads(registry.journal_path.read_text("utf-8"))
+    record["decision"]["absolute_top1"] = 0.79
+    registry.journal_path.write_bytes(canonical_json_bytes(record) + b"\n")
+    corrupted = registry.journal_path.read_bytes()
+
+    with pytest.raises(RegistryIntegrityError):
+        _registry(tmp_path).append_or_reuse_exact(_decision("candidate-a"))
+
+    assert registry.journal_path.read_bytes() == corrupted
+    assert not registry.state_path.exists()
+
+
+def test_recovery_rejects_canonical_state_that_is_not_a_journal_prefix(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path / "target")
+    registry.append_or_reuse_exact(_decision("candidate-a"))
+    other = _registry(tmp_path / "other")
+    other.append_or_reuse_exact(_decision("candidate-b"))
+    registry.state_path.write_bytes(other.state_path.read_bytes())
+    divergent = registry.state_path.read_bytes()
+
+    with pytest.raises(RegistryIntegrityError, match="state"):
+        registry.append_or_reuse_exact(_decision("candidate-a"))
+
+    assert registry.state_path.read_bytes() == divergent
+    assert len(registry.journal_path.read_text("utf-8").splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_schema_version",
+    [True, 1.0],
+    ids=["boolean-true", "float-one"],
+)
+@pytest.mark.parametrize(
+    "state_position",
+    ["current", "lagging-prefix"],
+)
+def test_recovery_rejects_type_changed_schema_version_with_stale_state_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_schema_version: object,
+    state_position: str,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.append_or_reuse_exact(_decision("candidate-a"))
+    retry = _decision("candidate-a")
+
+    if state_position == "lagging-prefix":
+        retry = _decision("candidate-b")
+        publish = registry._publish_state_unlocked
+
+        def crash_after_journal_fsync(_: object) -> None:
+            raise OSError("injected compact-state publish crash")
+
+        monkeypatch.setattr(
+            registry,
+            "_publish_state_unlocked",
+            crash_after_journal_fsync,
+        )
+        with pytest.raises(OSError, match="injected"):
+            registry.append_or_reuse_exact(retry)
+        monkeypatch.setattr(registry, "_publish_state_unlocked", publish)
+
+    stored_state = json.loads(registry.state_path.read_text("utf-8"))
+    stored_state["schema_version"] = bad_schema_version
+    registry.state_path.write_bytes(
+        canonical_json_bytes(stored_state) + b"\n"
+    )
+    state_before = registry.state_path.read_bytes()
+    journal_before = registry.journal_path.read_bytes()
+
+    with pytest.raises(RegistryIntegrityError, match="schema|SHA-256"):
+        registry.append_or_reuse_exact(retry)
+
+    assert registry.state_path.read_bytes() == state_before
+    assert registry.journal_path.read_bytes() == journal_before
 
 
 @pytest.mark.parametrize("target_name", ["decisions.jsonl", "state.json"])
@@ -218,6 +510,163 @@ def test_lock_rejects_stage_without_passing_candidate(tmp_path: Path) -> None:
     registry.append(_decision("failed", passed=False))
     with pytest.raises(RegistryStateError, match="passing"):
         registry.lock_stage_survivor(1)
+
+
+def test_lock_stage_survivor_or_reuse_exact_is_idempotent_without_new_record(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    development = _decision("candidate-a")
+    registry.append(development)
+
+    locked = registry.lock_stage_survivor_or_reuse_exact(
+        1,
+        development.decision_sha256,
+    )
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+    reused = registry.lock_stage_survivor_or_reuse_exact(
+        1,
+        development.decision_sha256,
+    )
+
+    assert locked == replace(development, locked=True)
+    assert reused == locked
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+    assert registry.load_state()["sequence"] == 2
+
+
+def test_lock_stage_survivor_or_reuse_exact_rejects_wrong_expected_sha(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.append(_decision("candidate-a"))
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+
+    with pytest.raises(RegistryStateError, match="expected"):
+        registry.lock_stage_survivor_or_reuse_exact(1, _h("wrong-decision"))
+
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+
+
+def test_lock_stage_survivor_or_reuse_exact_rejects_divergent_existing_lock(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    development = _decision("candidate-a")
+    other = _decision("candidate-b", passed=False)
+    registry.append(development)
+    registry.append(other)
+    registry.lock_stage_survivor_or_reuse_exact(
+        1,
+        development.decision_sha256,
+    )
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+
+    with pytest.raises(RegistryStateError, match="expected|divergent"):
+        registry.lock_stage_survivor_or_reuse_exact(
+            1,
+            other.decision_sha256,
+        )
+
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+
+
+def test_lock_stage_survivor_or_reuse_exact_preserves_unique_passing_gate(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    selected = _decision("candidate-a")
+    registry.append(selected)
+    registry.append(_decision("candidate-b"))
+    journal_before = registry.journal_path.read_bytes()
+    state_before = registry.state_path.read_bytes()
+
+    with pytest.raises(RegistryStateError, match="multiple passing"):
+        registry.lock_stage_survivor_or_reuse_exact(
+            1,
+            selected.decision_sha256,
+        )
+
+    assert registry.journal_path.read_bytes() == journal_before
+    assert registry.state_path.read_bytes() == state_before
+
+
+def test_lock_stage_survivor_or_reuse_exact_serializes_concurrent_retries(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "decisions.jsonl"
+    state = tmp_path / "state.json"
+    development = _decision("candidate-a")
+    CandidateRegistry(journal, state).append(development)
+
+    def lock(_: int) -> CandidateDecision:
+        return CandidateRegistry(
+            journal,
+            state,
+        ).lock_stage_survivor_or_reuse_exact(
+            1,
+            development.decision_sha256,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        returned = list(pool.map(lock, range(16)))
+
+    expected = replace(development, locked=True)
+    assert returned == [expected] * 16
+    registry = CandidateRegistry(journal, state)
+    registry.verify()
+    assert len(journal.read_text("utf-8").splitlines()) == 2
+    assert registry.load_state()["sequence"] == 2
+
+
+def test_lock_stage_survivor_or_reuse_exact_recovers_prefix_state_after_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry(tmp_path)
+    development = _decision("candidate-a")
+    registry.append_or_reuse_exact(development)
+    prefix_state = registry.state_path.read_bytes()
+    publish = registry._publish_state_unlocked
+
+    def crash_after_journal_fsync(_: object) -> None:
+        raise OSError("injected compact-state publish crash")
+
+    monkeypatch.setattr(
+        registry,
+        "_publish_state_unlocked",
+        crash_after_journal_fsync,
+    )
+    with pytest.raises(OSError, match="injected"):
+        registry.lock_stage_survivor_or_reuse_exact(
+            1,
+            development.decision_sha256,
+        )
+
+    assert len(registry.journal_path.read_text("utf-8").splitlines()) == 2
+    assert registry.state_path.read_bytes() == prefix_state
+
+    monkeypatch.setattr(registry, "_publish_state_unlocked", publish)
+    reused = registry.lock_stage_survivor_or_reuse_exact(
+        1,
+        development.decision_sha256,
+    )
+
+    assert reused == replace(development, locked=True)
+    state = registry.load_state()
+    records = [
+        json.loads(line)
+        for line in registry.journal_path.read_text("utf-8").splitlines()
+    ]
+    assert state["sequence"] == 2
+    assert state["state_sha256"] == records[-1]["state_sha256"]
+    registry.verify()
 
 
 def test_confirmation_requires_locked_survivor_and_identical_frozen_identity(
