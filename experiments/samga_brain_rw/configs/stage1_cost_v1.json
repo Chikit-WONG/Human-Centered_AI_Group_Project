@@ -1,0 +1,512 @@
+{
+  "schema_version": 1,
+  "config_type": "stage1_cost",
+  "config_id": "stage1_cost_v1",
+  "scope": "stage1-cost",
+  "branch_ids": [
+    "internvit",
+    "brainrw"
+  ],
+  "benchmark": {
+    "same_process": true,
+    "interleave_order": "alternate_each_round",
+    "warmup_runs": 10,
+    "measured_runs": 50,
+    "timer": "perf_counter_ns",
+    "cuda_synchronize": "before_and_after",
+    "statistic": "median",
+    "dispersion": [
+      "mad",
+      "iqr"
+    ],
+    "raw_unit": "nanoseconds",
+    "reported_unit": "milliseconds_per_query"
+  },
+  "quality_gate": {
+    "mad_over_median_max": 0.05,
+    "comparison_when_gate_fails": "abort_without_selection"
+  },
+  "synthetic_workload": {
+    "schema_version": 1,
+    "input_kind": "synthetic_preprocessed",
+    "generator": "torch.Generator.manual_seed",
+    "seed": 20260720,
+    "query_count": 200,
+    "gallery_count": 200,
+    "labels_present": false,
+    "metrics_computed": false,
+    "timing_boundary": "preloaded_branch_callable",
+    "includes": [
+      "image_encoder",
+      "eeg_task_encoder",
+      "projection_and_normalization",
+      "200x200_similarity"
+    ],
+    "excludes": [
+      "filesystem_io",
+      "model_loading",
+      "image_preprocessing",
+      "metric_computation"
+    ],
+    "branches": {
+      "internvit": {
+        "image_shape": [
+          200,
+          3,
+          448,
+          448
+        ],
+        "image_dtype": "bfloat16",
+        "eeg_shape": [
+          200,
+          17,
+          250
+        ],
+        "eeg_dtype": "float32"
+      },
+      "brainrw": {
+        "image_shape": [
+          200,
+          3,
+          224,
+          224
+        ],
+        "image_dtype": "bfloat16",
+        "eeg_shape": [
+          200,
+          17,
+          250
+        ],
+        "eeg_dtype": "bfloat16"
+      }
+    }
+  },
+  "synthetic_workload_sha256": "690e8e91f08ab5e64afa1abfb34ad7e271d4594c5ffe04e1f97a70de3596efd7",
+  "operator_cost_kind": "deterministic_operator_complexity_key",
+  "fusion_config_sha256": "27cd33027c2fa322121f0c42732d2ecbe62f2544d6497652ae40f90b7dd8dc78",
+  "fusion_operator_complexity": [
+    {
+      "config_id": "s1-z-a000",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a010",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a020",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a030",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a040",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a050",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a060",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a070",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a080",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a090",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-z-a100",
+      "family": "zscore_convex",
+      "operator_complexity_key": [
+        0,
+        6,
+        9
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc050-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc050-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc050-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc100-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc100-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc100-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc200-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc200-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti050-tc200-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc050-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc050-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc050-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc100-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc100-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc100-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc200-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc200-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti100-tc200-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc050-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc050-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc050-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc100-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc100-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc100-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc200-a025",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc200-a050",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-temp-ti200-tc200-a075",
+      "family": "temperature_convex",
+      "operator_complexity_key": [
+        0,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k010-w025",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k010-w050",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k010-w075",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k030-w025",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k030-w050",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k030-w075",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k060-w025",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k060-w050",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    },
+    {
+      "config_id": "s1-rrf-k060-w075",
+      "family": "rrf",
+      "operator_complexity_key": [
+        2,
+        0,
+        5
+      ]
+    }
+  ]
+}
