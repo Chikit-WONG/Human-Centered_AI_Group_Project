@@ -155,7 +155,7 @@ _MODEL_BRANCH_KEYS = frozenset(
         "model_code_sha256",
         "model_config_sha256",
         "model_id",
-        "parameter_dtype",
+        "parameter_dtypes",
         "weights_sha256",
     }
 )
@@ -185,6 +185,8 @@ _INPUT_BRANCH_KEYS = frozenset(
 )
 _JOB_CLAIM_REFERENCE_KEYS = frozenset(
     {
+        "authority_execution_file_sha256",
+        "authority_execution_payload_sha256",
         "attempt_id",
         "attempt_index",
         "claim_id",
@@ -586,6 +588,7 @@ def benchmark_alternating_branches(
     *,
     clock_ns: Callable[[], int] = perf_counter_ns,
     synchronize: Callable[[], object],
+    result_validator: Callable[[str, object], object] | None = None,
 ) -> dict[str, object]:
     """Benchmark two preloaded branches in one alternating process.
 
@@ -605,7 +608,14 @@ def benchmark_alternating_branches(
     }
     if any(not callable(workload) for workload in callables.values()):
         raise TypeError("every branch workload must be callable")
-    if not callable(clock_ns) or not callable(synchronize):
+    if (
+        not callable(clock_ns)
+        or not callable(synchronize)
+        or (
+            result_validator is not None
+            and not callable(result_validator)
+        )
+    ):
         raise TypeError("clock_ns and synchronize must be callable")
 
     for round_index in range(protocol.warmup_runs):
@@ -618,6 +628,7 @@ def benchmark_alternating_branches(
             synchronize()
 
     samples: dict[str, list[int]] = {branch_id: [] for branch_id in protocol.branch_ids}
+    last_results: dict[str, object] = {}
     measurement_order: list[str] = []
     for measured_index in range(protocol.measured_runs):
         round_index = protocol.warmup_runs + measured_index
@@ -627,7 +638,7 @@ def benchmark_alternating_branches(
         ):
             synchronize()
             started_ns = clock_ns()
-            callables[branch_id]()
+            result = callables[branch_id]()
             synchronize()
             finished_ns = clock_ns()
             if (
@@ -638,8 +649,13 @@ def benchmark_alternating_branches(
                 raise ValueError(
                     "clock_ns must produce positive integer nanosecond intervals"
                 )
+            last_results[branch_id] = result
             samples[branch_id].append(finished_ns - started_ns)
             measurement_order.append(branch_id)
+
+    if result_validator is not None:
+        for branch_id in protocol.branch_ids:
+            result_validator(branch_id, last_results[branch_id])
 
     query_count = protocol.synthetic_workload["query_count"]
     if type(query_count) is not int or query_count <= 0:
@@ -750,8 +766,19 @@ def _validate_self_attested_model_reference(value: object) -> dict[str, object]:
             f"{branch_id} cost model binding",
         )
         _safe_id(branch["model_id"], f"{branch_id} model_id")
-        if branch["parameter_dtype"] != "bfloat16":
-            raise ValueError(f"{branch_id} cost model parameter_dtype must be bfloat16")
+        parameter_dtypes = _mapping(
+            branch["parameter_dtypes"],
+            f"{branch_id} cost model parameter dtypes",
+        )
+        expected_parameter_dtypes = (
+            {"foundation": "bfloat16", "task": "float32"}
+            if branch_id == "internvit"
+            else {"model": "bfloat16"}
+        )
+        if parameter_dtypes != expected_parameter_dtypes:
+            raise ValueError(
+                f"{branch_id} cost model parameter dtypes mismatch"
+            )
         for field_name in (
             "checkpoint_sha256",
             "model_code_sha256",
@@ -762,9 +789,18 @@ def _validate_self_attested_model_reference(value: object) -> dict[str, object]:
                 branch[field_name],
                 f"{branch_id} {field_name}",
             )
+        branch["parameter_dtypes"] = parameter_dtypes
         branches[branch_id] = branch
     binding["branches"] = branches
     return binding
+
+
+def validate_self_attested_model_reference(
+    value: object,
+) -> dict[str, object]:
+    """Validate the exact mixed-precision two-model identity declaration."""
+
+    return _validate_self_attested_model_reference(value)
 
 
 def _validate_self_attested_job_claim_reference(
@@ -779,9 +815,20 @@ def _validate_self_attested_job_claim_reference(
     )
     if claim["schema_version"] != 1:
         raise ValueError("cost job claim schema_version mismatch")
+    _sha256(
+        claim["authority_execution_file_sha256"],
+        "authority execution file SHA-256",
+    )
+    _sha256(
+        claim["authority_execution_payload_sha256"],
+        "authority execution payload SHA-256",
+    )
     _safe_id(claim["slurm_job_id"], "SLURM job ID")
-    if claim["slurm_partition"] != "debug":
-        raise ValueError("self-attested job reference must declare the debug partition")
+    if claim["slurm_partition"] not in {"debug", "i64m1tga40u"}:
+        raise ValueError(
+            "self-attested job reference must declare debug or the sealed "
+            "i64m1tga40u cost partition"
+        )
     _safe_id(claim["claim_id"], "cost claim_id")
     _sha256(
         claim["unverified_claim_sha256"],
@@ -1219,5 +1266,6 @@ __all__ = [
     "operator_complexity_key",
     "publish_raw_cost_record_exclusive",
     "validate_self_attested_input_reference",
+    "validate_self_attested_model_reference",
     "validate_self_attested_runtime_reference",
 ]

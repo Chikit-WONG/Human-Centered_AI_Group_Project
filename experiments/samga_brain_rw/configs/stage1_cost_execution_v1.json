@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "config_type": "stage1_cost_execution",
+  "config_id": "stage1_cost_execution_v1",
+  "scope": "stage1-cost",
+  "runtime": {
+    "accelerator": "NVIDIA A40",
+    "accelerator_count": 1,
+    "device": "cuda:0",
+    "process_mode": "single_process",
+    "inference_mode": true,
+    "synchronize": "protocol_before_and_after_branch_callable"
+  },
+  "coverage": {
+    "seed": 20260720,
+    "query_count": 200,
+    "gallery_count": 200,
+    "full_query_coverage": true,
+    "full_gallery_coverage": true,
+    "synthetic_generation_device": "cpu",
+    "synthetic_distribution": "standard_normal_float32_then_cast",
+    "synthetic_tensor_order": [
+      "internvit.eeg",
+      "internvit.image",
+      "brainrw.eeg",
+      "brainrw.image"
+    ],
+    "similarity_shape": [
+      200,
+      200
+    ]
+  },
+  "observations": {
+    "labels_present": false,
+    "metrics_computed": false,
+    "predictions_persisted": false,
+    "test_data_access": false
+  },
+  "branch_order": [
+    "internvit",
+    "brainrw"
+  ],
+  "branches": {
+    "internvit": {
+      "factory": "internvit_v2_5_plus_samga",
+      "representative_subject": 1,
+      "representative_seed": 42,
+      "image_shape": [
+        200,
+        3,
+        448,
+        448
+      ],
+      "image_dtype": "bfloat16",
+      "image_microbatch_size": 16,
+      "image_chunk_order": "ascending_contiguous_no_shuffle",
+      "eeg_shape": [
+        200,
+        17,
+        250
+      ],
+      "eeg_dtype": "float32",
+      "eeg_microbatch_size": 200,
+      "eeg_chunk_order": "ascending_contiguous_no_shuffle",
+      "foundation_parameter_dtype": "bfloat16",
+      "task_parameter_dtype": "float32",
+      "foundation_autocast": "cuda_bfloat16_enabled",
+      "task_autocast": "disabled",
+      "feature_layer_ids": [
+        20,
+        24,
+        28,
+        32,
+        36
+      ],
+      "feature_pooling": "patch_mean",
+      "feature_dtype_at_task_boundary": "float32",
+      "embedding_normalization": "l2_float32",
+      "similarity_dtype": "float32"
+    },
+    "brainrw": {
+      "factory": "brainrw_clip_lora",
+      "representative_subject": 1,
+      "representative_seed": 42,
+      "image_shape": [
+        200,
+        3,
+        224,
+        224
+      ],
+      "image_dtype": "bfloat16",
+      "image_microbatch_size": 64,
+      "image_chunk_order": "ascending_contiguous_no_shuffle",
+      "eeg_shape": [
+        200,
+        17,
+        250
+      ],
+      "eeg_dtype": "bfloat16",
+      "eeg_microbatch_size": 200,
+      "eeg_chunk_order": "ascending_contiguous_no_shuffle",
+      "model_parameter_dtype": "bfloat16",
+      "autocast": "disabled",
+      "embedding_normalization": "model_l2_then_float32",
+      "similarity_dtype": "float32"
+    }
+  }
+}

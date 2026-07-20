@@ -275,6 +275,50 @@ def test_alternating_benchmark_records_raw_ns_and_robust_statistics(
         assert branch_result["milliseconds_per_query"] == 0.005
 
 
+def test_alternating_benchmark_validates_last_results_after_timing(
+    experiment_root: Path,
+) -> None:
+    protocol = inference_cost.load_cost_protocol(_cost_config(experiment_root))
+    events: list[tuple[str, object]] = []
+    clock = _DurationClock([1_000_000] * 100)
+
+    def traced_clock() -> int:
+        value = clock()
+        events.append(("clock", value))
+        return value
+
+    def branch(branch_id: str) -> object:
+        def run() -> str:
+            return f"{branch_id}-result"
+
+        return run
+
+    inference_cost.benchmark_alternating_branches(
+        protocol,
+        {
+            "internvit": branch("internvit"),
+            "brainrw": branch("brainrw"),
+        },
+        clock_ns=traced_clock,
+        synchronize=lambda: None,
+        result_validator=lambda branch_id, value: events.append(
+            ("validate", (branch_id, value))
+        ),
+    )
+
+    validation_indexes = [
+        index for index, event in enumerate(events) if event[0] == "validate"
+    ]
+    assert len(validation_indexes) == 2
+    assert min(validation_indexes) > max(
+        index for index, event in enumerate(events) if event[0] == "clock"
+    )
+    assert [events[index][1] for index in validation_indexes] == [
+        ("internvit", "internvit-result"),
+        ("brainrw", "brainrw-result"),
+    ]
+
+
 def test_alternating_benchmark_rejects_wrong_branch_set_before_calling(
     experiment_root: Path,
 ) -> None:
@@ -361,7 +405,11 @@ def _model_reference() -> dict[str, object]:
                 "model_code_sha256": _digest(f"{branch_id}-model-code"),
                 "model_config_sha256": _digest(f"{branch_id}-model-config"),
                 "model_id": f"{branch_id}_stage1_cost_model",
-                "parameter_dtype": "bfloat16",
+                "parameter_dtypes": (
+                    {"foundation": "bfloat16", "task": "float32"}
+                    if branch_id == "internvit"
+                    else {"model": "bfloat16"}
+                ),
                 "weights_sha256": _digest(f"{branch_id}-weights"),
             }
             for branch_id in ("internvit", "brainrw")
@@ -420,6 +468,12 @@ def _input_reference() -> dict[str, object]:
 
 def _job_claim_reference() -> dict[str, object]:
     return {
+        "authority_execution_file_sha256": _digest(
+            "stage1-cost-authority-execution"
+        ),
+        "authority_execution_payload_sha256": _digest(
+            "stage1-cost-authority-execution-payload"
+        ),
         "attempt_id": "attempt-0000",
         "attempt_index": 0,
         "claim_id": "stage1-cost-a40",

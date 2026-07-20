@@ -32,6 +32,7 @@ JOB_MAP_TYPE = "samga_brain_rw.job_map"
 CLAIM_TYPE = "samga_brain_rw.job_claim"
 RECOVERY_TYPE = "samga_brain_rw.job_claim_recovery"
 ATTEMPT_TYPE = "samga_brain_rw.job_attempt"
+COST_EXECUTION_TYPE = "samga_brain_rw.cost_execution_authority"
 SLURM_RECOVERY_AUDIT_TYPE = "samga_brain_rw.slurm_recovery_audit"
 TEST_ONLY_RECOVERY_AUDIT_TYPE = "samga_brain_rw.test_only_opaque_audit"
 LOG_ROOT = PurePosixPath("logs/samga_brain_rw")
@@ -107,6 +108,16 @@ ATTEMPT_PAYLOAD_KEYS = {
     "generation",
     "claim_sha256",
     "scheduler_job_id",
+}
+COST_EXECUTION_PAYLOAD_KEYS = {
+    "job_map_sha256",
+    "row_sha256",
+    "array_index",
+    "generation",
+    "claim_sha256",
+    "scheduler_job_id",
+    "attempt_record_sha256",
+    "attempt_payload_sha256",
 }
 QUARANTINE_KEYS = {
     "file_count",
@@ -214,6 +225,10 @@ class JobClaim:
     @property
     def attempt_path(self) -> Path:
         return self.path.with_name("attempt.json")
+
+    @property
+    def cost_execution_path(self) -> Path:
+        return self.path.with_name("execution.json")
 
     @property
     def slurm_recovery_audit_path(self) -> Path:
@@ -2384,6 +2399,276 @@ def _load_claim_chain(
         return claims
 
 
+def _require_cost_execution_row(row: Mapping[str, object]) -> None:
+    if (
+        row.get("array_index") != 0
+        or row.get("stage") != "stage-1-cost-benchmark"
+        or row.get("role") != "cost-benchmark"
+        or row.get("config_id") != "stage1_cost_v1"
+        or row.get("subject") != 1
+        or row.get("seed") != 20260720
+        or row.get("partition") != "i64m1tga40u"
+        or row.get("gres") != "gpu:a40:1"
+    ):
+        raise ValueError(
+            "scheduler execution authority is restricted to the sealed "
+            "Stage 1 cost row"
+        )
+
+
+def _cost_execution_identity(
+    claim: JobClaim,
+    document: Mapping[str, object],
+    digest: str,
+) -> dict[str, object]:
+    payload = document["payload"]
+    if not isinstance(payload, Mapping):
+        raise ValueError("cost execution authority payload is invalid")
+    return {
+        "array_index": payload["array_index"],
+        "attempt_payload_sha256": payload["attempt_payload_sha256"],
+        "attempt_record_sha256": payload["attempt_record_sha256"],
+        "claim_sha256": payload["claim_sha256"],
+        "generation": payload["generation"],
+        "job_map_sha256": payload["job_map_sha256"],
+        "path": str(claim.cost_execution_path),
+        "payload_sha256": document["payload_sha256"],
+        "row_sha256": payload["row_sha256"],
+        "scheduler_job_id": payload["scheduler_job_id"],
+        "sha256": digest,
+    }
+
+
+def _load_cost_execution_at(
+    claim: JobClaim,
+    *,
+    generation_fd: int,
+    map_sha256: str,
+    row_sha256: str,
+    array_index: int,
+) -> dict[str, object]:
+    document, digest = _read_record(
+        claim.cost_execution_path,
+        payload_type=COST_EXECUTION_TYPE,
+        payload_keys=COST_EXECUTION_PAYLOAD_KEYS,
+        directory_fd=generation_fd,
+    )
+    execution = document["payload"]
+    if not isinstance(execution, dict):
+        raise ValueError("cost execution authority payload must be an object")
+    scheduler_job_id = execution["scheduler_job_id"]
+    scheduler_match = (
+        _SLURM_ARRAY_JOB_RE.fullmatch(scheduler_job_id)
+        if isinstance(scheduler_job_id, str)
+        else None
+    )
+    if (
+        execution["job_map_sha256"] != map_sha256
+        or execution["row_sha256"] != row_sha256
+        or execution["array_index"] != array_index
+        or execution["generation"] != claim.generation
+        or execution["claim_sha256"] != claim.sha256
+        or scheduler_match is None
+        or int(scheduler_match.group("array_task_id")) != array_index
+    ):
+        raise ValueError(
+            "cost execution authority does not match its current claim row"
+        )
+    attempt = _load_attempt(
+        claim,
+        generation_fd=generation_fd,
+        map_sha256=map_sha256,
+        row_sha256=row_sha256,
+        array_index=array_index,
+    )
+    if claim.generation == 1:
+        expected_attempt_record_sha256 = None
+        expected_attempt_payload_sha256 = None
+    else:
+        if attempt is None:
+            raise ValueError(
+                "recovered cost execution lacks its scheduler attempt"
+            )
+        attempt_payload = attempt[0]["payload"]
+        if (
+            not isinstance(attempt_payload, dict)
+            or attempt_payload["scheduler_job_id"] != scheduler_job_id
+        ):
+            raise ValueError(
+                "cost execution scheduler differs from its recovered attempt"
+            )
+        expected_attempt_record_sha256 = attempt[1]
+        expected_attempt_payload_sha256 = attempt[0]["payload_sha256"]
+    if (
+        execution["attempt_record_sha256"]
+        != expected_attempt_record_sha256
+        or execution["attempt_payload_sha256"]
+        != expected_attempt_payload_sha256
+    ):
+        raise ValueError(
+            "cost execution authority attempt identity mismatch"
+        )
+    return _cost_execution_identity(claim, document, digest)
+
+
+def load_cost_execution_authority(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    *,
+    expected_generation: int,
+    expected_claim_sha256: str,
+) -> dict[str, object]:
+    """Reload the authority-published scheduler identity for a cost run."""
+
+    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    _require_cost_execution_row(checked_row)
+    if type(expected_generation) is not int or expected_generation <= 0:
+        raise ValueError("expected cost execution generation is invalid")
+    checked_claim_sha256 = _require_sha256(
+        expected_claim_sha256,
+        "expected cost execution claim SHA-256",
+    )
+    base = _state_dir(checked_row)
+    with _transition_lock(base) as state_fd:
+        claims = _load_claim_chain(
+            checked_row,
+            state_fd=state_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+        )
+        if not claims:
+            raise ValueError("cost execution authority has no current claim")
+        current = claims[-1]
+        if (
+            current.generation != expected_generation
+            or current.sha256 != checked_claim_sha256
+        ):
+            raise ValueError(
+                "cost execution authority current claim identity changed"
+            )
+        with _open_generation_directory(
+            state_fd,
+            base,
+            current.generation,
+        ) as generation_fd:
+            if not _entry_lexists_at(
+                generation_fd,
+                current.cost_execution_path.name,
+                current.cost_execution_path,
+            ):
+                raise ValueError(
+                    "cost execution authority record is missing"
+                )
+            return _load_cost_execution_at(
+                current,
+                generation_fd=generation_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(checked_row["array_index"]),
+            )
+
+
+def publish_cost_execution_authority(
+    payload: Mapping[str, object],
+    row: Mapping[str, object],
+    *,
+    claim: JobClaim,
+    scheduler_job_id: str,
+) -> dict[str, object]:
+    """Exclusively publish the scheduler identity before the cost child."""
+
+    _, checked_row, map_sha256, row_sha256 = _row_context(payload, row)
+    _require_cost_execution_row(checked_row)
+    scheduler_match = (
+        _SLURM_ARRAY_JOB_RE.fullmatch(scheduler_job_id)
+        if isinstance(scheduler_job_id, str)
+        else None
+    )
+    if (
+        scheduler_match is None
+        or int(scheduler_match.group("array_task_id"))
+        != int(checked_row["array_index"])
+    ):
+        raise ValueError(
+            "cost execution scheduler job does not match its array row"
+        )
+    base = _state_dir(checked_row)
+    with _transition_lock(base) as state_fd:
+        claims = _load_claim_chain(
+            checked_row,
+            state_fd=state_fd,
+            map_sha256=map_sha256,
+            row_sha256=row_sha256,
+        )
+        if not claims:
+            raise ValueError("cost execution authority has no current claim")
+        current = claims[-1]
+        if (
+            current.path != claim.path
+            or current.generation != claim.generation
+            or current.sha256 != claim.sha256
+        ):
+            raise ValueError(
+                "cost execution authority claim changed before publication"
+            )
+        with _open_generation_directory(
+            state_fd,
+            base,
+            current.generation,
+        ) as generation_fd:
+            if _entry_lexists_at(
+                generation_fd,
+                current.cost_execution_path.name,
+                current.cost_execution_path,
+            ):
+                raise RuntimeError(
+                    "cost execution authority already exists; rewrite refused"
+                )
+            attempt = _load_attempt(
+                current,
+                generation_fd=generation_fd,
+                map_sha256=map_sha256,
+                row_sha256=row_sha256,
+                array_index=int(checked_row["array_index"]),
+            )
+            if current.generation == 1:
+                attempt_record_sha256 = None
+                attempt_payload_sha256 = None
+            else:
+                if attempt is None:
+                    raise ValueError(
+                        "recovered cost execution lacks an attempt record"
+                    )
+                attempt_payload = attempt[0]["payload"]
+                if (
+                    not isinstance(attempt_payload, dict)
+                    or attempt_payload["scheduler_job_id"]
+                    != scheduler_job_id
+                ):
+                    raise ValueError(
+                        "cost execution scheduler differs from its attempt"
+                    )
+                attempt_record_sha256 = attempt[1]
+                attempt_payload_sha256 = attempt[0]["payload_sha256"]
+            execution_payload: dict[str, object] = {
+                "job_map_sha256": map_sha256,
+                "row_sha256": row_sha256,
+                "array_index": checked_row["array_index"],
+                "generation": current.generation,
+                "claim_sha256": current.sha256,
+                "scheduler_job_id": scheduler_job_id,
+                "attempt_record_sha256": attempt_record_sha256,
+                "attempt_payload_sha256": attempt_payload_sha256,
+            }
+            document, digest = _create_record(
+                current.cost_execution_path,
+                COST_EXECUTION_TYPE,
+                execution_payload,
+                directory_fd=generation_fd,
+            )
+            return _cost_execution_identity(current, document, digest)
+
+
 def _validate_output_hashes(
     row: Mapping[str, object],
     output_hashes: Mapping[str, str],
@@ -3896,6 +4181,12 @@ def _run_selected_row(args: argparse.Namespace) -> int:
         print(f"row {row['array_index']} already complete; skipping")
         return 0
 
+    is_cost_benchmark = row.get("role") == "cost-benchmark"
+    scheduler_job_id = (
+        _slurm_job_id_for_attempt(args.array_index)
+        if is_cost_benchmark
+        else None
+    )
     _, _, _, row_sha256 = _row_context(job_map, row)
     with _open_state_directory(
         _state_dir(row),
@@ -3921,14 +4212,28 @@ def _run_selected_row(args: argparse.Namespace) -> int:
         claim = claim_job_row(job_map, row)
 
     if claim.generation > 1:
+        if scheduler_job_id is None:
+            scheduler_job_id = _slurm_job_id_for_attempt(args.array_index)
         consume_recovery_attempt(
             job_map,
             row,
-            scheduler_job_id=_slurm_job_id_for_attempt(args.array_index),
+            scheduler_job_id=scheduler_job_id,
         )
     if _path_lexists(_output_dir(row)):
         raise RuntimeError(
             "unaudited output appeared before the sealed job attempt"
+        )
+    cost_execution: dict[str, object] | None = None
+    if is_cost_benchmark:
+        if scheduler_job_id is None:
+            raise ValueError(
+                "Stage 1 cost execution requires a SLURM scheduler identity"
+            )
+        cost_execution = publish_cost_execution_authority(
+            job_map,
+            row,
+            claim=claim,
+            scheduler_job_id=scheduler_job_id,
         )
     environment = os.environ.copy()
     environment.update(
@@ -3942,6 +4247,11 @@ def _run_selected_row(args: argparse.Namespace) -> int:
             "SAMGA_JOB_ARRAY_MAX": str(args.array_max),
         }
     )
+    if cost_execution is not None:
+        environment["SAMGA_JOB_EXECUTION"] = str(cost_execution["path"])
+        environment["SAMGA_JOB_EXECUTION_SHA256"] = str(
+            cost_execution["sha256"]
+        )
     if args.confirmation_seal is not None:
         environment["CONFIRMATION_SEAL"] = str(args.confirmation_seal)
     if args.cell_claim is not None:

@@ -225,6 +225,20 @@ def _row(
     }
 
 
+def _cost_benchmark_row(tmp_path: Path) -> dict[str, object]:
+    return _row(
+        tmp_path,
+        stage="stage-1-cost-benchmark",
+        training_runner=False,
+        role="cost-benchmark",
+        config_id="stage1_cost_v1",
+        subject=1,
+        seed=20260720,
+        partition="i64m1tga40u",
+        time="12:00:00",
+    )
+
+
 def _output_hashes(
     row: dict[str, object],
     label: str,
@@ -1623,6 +1637,181 @@ def test_run_row_exports_exact_array_context_to_child(
     }
     assert Path(observed["SAMGA_JOB_CLAIM"]).is_file()
     assert jobmap_module.completion_is_valid(payload, row)
+
+
+def test_cost_run_row_publishes_scheduler_authority_before_child_and_retains_it(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "cost-authority-map.json"
+    payload = jobmap_module.write_job_map(
+        [_cost_benchmark_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    observed: dict[str, str] = {}
+
+    def fail_after_inspection(
+        command: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        assert command == row["argv"]
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        observed["path"] = environment["SAMGA_JOB_EXECUTION"]
+        observed["sha256"] = environment["SAMGA_JOB_EXECUTION_SHA256"]
+        execution = jobmap_module.load_cost_execution_authority(
+            payload,
+            row,
+            expected_generation=1,
+            expected_claim_sha256=hashlib.sha256(
+                Path(environment["SAMGA_JOB_CLAIM"]).read_bytes()
+            ).hexdigest(),
+        )
+        assert execution["path"] == observed["path"]
+        assert execution["sha256"] == observed["sha256"]
+        assert execution["scheduler_job_id"] == "123456_0"
+        assert execution["attempt_record_sha256"] is None
+        assert execution["attempt_payload_sha256"] is None
+        return SimpleNamespace(returncode=17)
+
+    monkeypatch.setenv("SLURM_ARRAY_JOB_ID", "123456")
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "0")
+    monkeypatch.setattr(jobmap_module.subprocess, "run", fail_after_inspection)
+    run_argv = [
+        "run-row",
+        "--job-map",
+        str(map_path),
+        "--job-map-sha256",
+        str(payload["payload_sha256"]),
+        "--array-index",
+        "0",
+        "--array-min",
+        "0",
+        "--array-max",
+        "0",
+    ]
+
+    assert jobmap_module.main(run_argv) == 17
+    execution_path = Path(observed["path"])
+    execution_bytes = execution_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="claim|recovery"):
+        jobmap_module.main(run_argv)
+
+    assert execution_path.read_bytes() == execution_bytes
+
+
+def test_recovered_cost_execution_binds_exact_attempt_and_scheduler(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "recovered-cost-authority-map.json"
+    payload = jobmap_module.write_job_map(
+        [_cost_benchmark_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    jobmap_module.claim_job_row(payload, row)
+    recovered = jobmap_module._recover_job_row_unverified_for_testing(
+        payload,
+        row,
+        recovery_audit_sha256=_h("cost-generation-2-audit"),
+    )
+
+    def fail_after_inspection(
+        command: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        assert command == row["argv"]
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        execution = jobmap_module.load_cost_execution_authority(
+            payload,
+            row,
+            expected_generation=2,
+            expected_claim_sha256=recovered.sha256,
+        )
+        attempt_document = json.loads(
+            recovered.attempt_path.read_text(encoding="utf-8")
+        )
+        assert execution["scheduler_job_id"] == "123457_0"
+        assert execution["attempt_record_sha256"] == hashlib.sha256(
+            recovered.attempt_path.read_bytes()
+        ).hexdigest()
+        assert execution["attempt_payload_sha256"] == (
+            attempt_document["payload_sha256"]
+        )
+        assert environment["SAMGA_JOB_EXECUTION_SHA256"] == (
+            execution["sha256"]
+        )
+        return SimpleNamespace(returncode=19)
+
+    monkeypatch.setenv("SLURM_ARRAY_JOB_ID", "123457")
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "0")
+    monkeypatch.setattr(jobmap_module.subprocess, "run", fail_after_inspection)
+
+    assert (
+        jobmap_module.main(
+            [
+                "run-row",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+            ]
+        )
+        == 19
+    )
+
+
+def test_cost_scheduler_identity_fails_before_creating_claim(
+    jobmap_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    map_path = tmp_path / "invalid-cost-scheduler-map.json"
+    payload = jobmap_module.write_job_map(
+        [_cost_benchmark_row(tmp_path)],
+        map_path,
+    )
+    row = payload["rows"][0]
+    monkeypatch.delenv("SLURM_ARRAY_JOB_ID", raising=False)
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "0")
+    monkeypatch.setattr(
+        jobmap_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid scheduler identity must fail before child launch"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="SLURM.*identity|scheduler"):
+        jobmap_module.main(
+            [
+                "run-row",
+                "--job-map",
+                str(map_path),
+                "--job-map-sha256",
+                str(payload["payload_sha256"]),
+                "--array-index",
+                "0",
+                "--array-min",
+                "0",
+                "--array-max",
+                "0",
+            ]
+        )
+
+    assert not jobmap_module._state_dir(row).exists()
 
 
 def test_complete_env_reloads_and_completes_only_selected_claim(
