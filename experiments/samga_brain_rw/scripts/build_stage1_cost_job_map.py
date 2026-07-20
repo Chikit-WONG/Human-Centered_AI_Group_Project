@@ -275,7 +275,7 @@ def build_stage1_cost_rows(
             "stderr_path": "logs/samga_brain_rw/stage1_cost_%A_%a.err",
             "stdout_path": "logs/samga_brain_rw/stage1_cost_%A_%a.out",
             "subject": _SUBJECT,
-            "time": "12:00:00",
+            "time": "02:00:00",
         }
     ]
 
