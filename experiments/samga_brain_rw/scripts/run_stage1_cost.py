@@ -398,8 +398,6 @@ def _validate_brainrw_runtime_checkpoint(
         ),
         "runtime_contract": dict(getattr(runtime, "contract")),
         "runtime_contract_sha256": getattr(runtime, "contract_sha256"),
-        "runtime_evidence": dict(getattr(runtime, "evidence")),
-        "runtime_evidence_sha256": getattr(runtime, "evidence_sha256"),
     }
     for field_name, expected in expected_pairs.items():
         if payload.get(field_name) != expected:

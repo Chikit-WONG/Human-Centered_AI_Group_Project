@@ -1131,3 +1131,43 @@ def test_brainrw_runtime_checkpoint_binding_rejects_contract_mismatch(
             drifted,
             runtime,
         )
+
+
+def test_brainrw_runtime_checkpoint_allows_node_specific_memory_evidence(
+    cost_runner_module: ModuleType,
+) -> None:
+    environment = {"schema_version": 1, "torch": "2.10.0+cu126"}
+    contract = {
+        "accelerator": "NVIDIA A40",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "schema_version": 1,
+    }
+    checkpoint_evidence = {
+        "accelerator_name": "NVIDIA A40",
+        "bf16_supported": True,
+        "schema_version": 1,
+        "total_memory_bytes": 50_910_134_272,
+    }
+    current_evidence = {
+        **checkpoint_evidence,
+        "total_memory_bytes": 50_897_289_216,
+    }
+    runtime = SimpleNamespace(
+        semantic_environment=environment,
+        semantic_environment_sha256=sha256_json(environment),
+        contract=contract,
+        contract_sha256=sha256_json(contract),
+        evidence=current_evidence,
+        evidence_sha256=sha256_json(current_evidence),
+    )
+    payload = {
+        "semantic_environment": environment,
+        "semantic_environment_sha256": sha256_json(environment),
+        "runtime_contract": contract,
+        "runtime_contract_sha256": sha256_json(contract),
+        "runtime_evidence": checkpoint_evidence,
+        "runtime_evidence_sha256": sha256_json(checkpoint_evidence),
+    }
+
+    cost_runner_module._validate_brainrw_runtime_checkpoint(payload, runtime)
