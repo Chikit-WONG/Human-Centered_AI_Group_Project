@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+import matching_fairness.native_export as native_export_module
 from matching_fairness.artifacts import (
     ScoreArtifact,
     independent_ranks,
@@ -268,15 +269,54 @@ def _native_export_config(root: Path) -> NativeExportConfig:
         else:
             eeg[image_index, a_indices] = np.array([[[0.0, 1.0]]])
             eeg[image_index, b_indices] = np.array([[[0.2, 0.8]]])
-    test_eeg = root / "preprocessed_eeg_test.npy"
+    asset_root = root / "official_assets"
+    test_eeg = (
+        asset_root
+        / "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy"
+    )
+    test_eeg.parent.mkdir(parents=True)
     np.save(test_eeg, {"preprocessed_eeg_data": eeg}, allow_pickle=True)
-    test_features = root / "ViT-H-14_features_test.pt"
+    test_features = asset_root / "ViT-H-14_features_test.pt"
     torch.save(
         {
             "img_features": torch.eye(2),
             "text_features": torch.eye(2),
         },
         test_features,
+    )
+    training_eeg = (
+        asset_root
+        / "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy"
+    )
+    training_eeg.write_bytes(b"sealed training eeg")
+    training_features = asset_root / "ViT-H-14_features_train.pt"
+    training_features.write_bytes(b"sealed training features")
+    asset_files = {
+        str(path.relative_to(asset_root)): {
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in (
+            training_eeg,
+            test_eeg,
+            training_features,
+            test_features,
+        )
+    }
+    asset_lock = root / "assets_lock.json"
+    asset_lock.write_text(
+        json.dumps(
+            {
+                "repo_id": "LidongYang/EEG_Image_decode",
+                "repo_type": "dataset",
+                "asset_root": str(asset_root),
+                "files": asset_files,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     test_images = root / "test_images"
     (test_images / "class-a").mkdir(parents=True)
@@ -304,7 +344,36 @@ def _native_export_config(root: Path) -> NativeExportConfig:
     checkpoint_manifest = {
         "schema_version": 1,
         "model": "nice",
+        "encoder_type": "NICE",
         "subject": "sub-08",
+        "seed": 42,
+        "source": json.loads(source_lock.read_text(encoding="utf-8")),
+        "inputs": {
+            "training_eeg": {
+                "name": "preprocessed_eeg_training.npy",
+                "sha256": sha256_file(training_eeg),
+            },
+            "training_features": {
+                "name": "ViT-H-14_features_train.pt",
+                "sha256": sha256_file(training_features),
+            },
+        },
+        "hyperparameters": {
+            "epochs": 500,
+            "batch_size": 1024,
+            "learning_rate": 0.0003,
+            "val_ratio": 0.1,
+            "early_stopping_patience": 10,
+            "ema_decay": 0.999,
+            "logit_scale_type": "exp",
+            "avg_trials": True,
+            "n_chans": 1,
+            "n_times": 2,
+        },
+        "encoder_behavior": {
+            "use_subject_id": False,
+            "normalize_feats": False,
+        },
         "checkpoints": [
             {
                 "epoch": epoch,
@@ -323,7 +392,12 @@ def _native_export_config(root: Path) -> NativeExportConfig:
             "name": "best_val.pth",
             "sha256": sha256_file(checkpoints["best_val.pth"]),
         },
+        "history": {"name": "history.csv", "sha256": ""},
+        "stopped_early": True,
     }
+    history = checkpoint_dir / "history.csv"
+    history.write_text("epoch,val_loss\n1,0.2\n2,0.4\n", encoding="utf-8")
+    checkpoint_manifest["history"]["sha256"] = sha256_file(history)
     (checkpoint_dir / "checkpoint_manifest.json").write_text(
         json.dumps(checkpoint_manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -331,6 +405,8 @@ def _native_export_config(root: Path) -> NativeExportConfig:
     return NativeExportConfig(
         source_checkout=checkout,
         source_lock=source_lock,
+        asset_root=asset_root,
+        asset_lock=asset_lock,
         test_eeg=test_eeg,
         test_features=test_features,
         test_images=test_images,
@@ -344,6 +420,75 @@ def _native_export_config(root: Path) -> NativeExportConfig:
         n_chans=1,
         n_times=2,
     )
+
+
+def test_native_export_rejects_tampered_pickled_eeg_before_numpy_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _native_export_config(tmp_path)
+    tampered = bytearray(config.test_eeg.read_bytes())
+    tampered[-1] ^= 1
+    config.test_eeg.write_bytes(tampered)
+    called = False
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("untrusted pickle deserialization was reached")
+
+    monkeypatch.setattr(native_export_module.np, "load", forbidden_load)
+
+    with pytest.raises(ValueError, match="asset.*SHA-256 mismatch"):
+        export_native_scores(config)
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    "field_path,value,message",
+    (
+        (("source", "branch"), "wrong", "source provenance"),
+        (("hyperparameters", "batch_size"), 512, "hyperparameters"),
+        (("encoder_behavior", "normalize_feats"), True, "encoder behavior"),
+        (("selection", "val_loss"), 0.3, "selection"),
+        (("inputs", "training_eeg", "sha256"), "0" * 64, "training inputs"),
+    ),
+)
+def test_native_export_rejects_checkpoint_manifest_provenance_tampering(
+    tmp_path: Path,
+    field_path: tuple[str, ...],
+    value: object,
+    message: str,
+) -> None:
+    config = _native_export_config(tmp_path)
+    path = config.checkpoint_dir / "checkpoint_manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    target = manifest
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = value
+    path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        export_native_scores(config)
+
+
+def test_native_export_rejects_checkpoint_manifest_schema_extension(
+    tmp_path: Path,
+) -> None:
+    config = _native_export_config(tmp_path)
+    path = config.checkpoint_dir / "checkpoint_manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["unreviewed"] = True
+    path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exact Task 5 schema"):
+        export_native_scores(config)
 
 
 def _complete_formal_inventory(
@@ -423,6 +568,8 @@ def test_native_export_cli_maps_only_fixed_protocol_fields(tmp_path: Path) -> No
         protocol=protocol,
         source_checkout=tmp_path / "source",
         source_lock=tmp_path / "source.json",
+        asset_root=tmp_path / "assets",
+        asset_lock=tmp_path / "assets.json",
         test_eeg=tmp_path / "preprocessed_eeg_test.npy",
         test_features=tmp_path / "ViT-H-14_features_test.pt",
         test_images=tmp_path / "test_images",

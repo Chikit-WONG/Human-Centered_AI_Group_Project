@@ -42,6 +42,9 @@ from main.data import (  # noqa: E402
     merge_datasets_by_image_id,
 )
 from main.models_clip import BrainCLIPModel  # noqa: E402
+from matching_fairness.trial_splits import (  # noqa: E402
+    trial_indices_by_image as validated_trial_indices_by_image,
+)
 from matching_fairness.artifacts import (  # noqa: E402
     ScoreArtifact,
     independent_ranks,
@@ -122,62 +125,12 @@ def load_trial_indices_by_image(
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid trial split manifest: {path}") from error
-    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
-        raise ValueError("trial split manifest must use schema_version 1")
-    images = payload.get("images")
+    if not isinstance(payload, Mapping):
+        raise ValueError("trial split manifest must be a mapping")
     image_ids = payload.get("image_ids")
-    if (
-        not isinstance(images, Mapping)
-        or not isinstance(image_ids, list)
-        or not image_ids
-        or any(not isinstance(value, str) or not value for value in image_ids)
-        or len(set(image_ids)) != len(image_ids)
-        or set(images) != set(image_ids)
-    ):
-        raise ValueError("trial split manifest has invalid canonical image IDs")
-
-    result: dict[str, tuple[int, ...]] = {}
-    for image_id in image_ids:
-        sessions = images[image_id]
-        if not isinstance(sessions, Mapping) or len(sessions) != 4:
-            raise ValueError("each manifest image must contain exactly 4 sessions")
-        selected: list[int] = []
-        all_indices: list[int] = []
-        for split in sessions.values():
-            if not isinstance(split, Mapping):
-                raise ValueError("manifest session split must be a mapping")
-            halves: dict[str, tuple[int, ...]] = {}
-            for name in ("a", "b"):
-                value = split.get(name)
-                if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-                    raise ValueError("manifest trial indices must be sequences")
-                indices = tuple(value)
-                if (
-                    len(indices) != 10
-                    or any(
-                        isinstance(index, bool)
-                        or not isinstance(index, int)
-                        or not 0 <= index < 80
-                        for index in indices
-                    )
-                    or len(set(indices)) != len(indices)
-                ):
-                    raise ValueError(
-                        "each manifest session half must contain 10 unique "
-                        "in-range trial indices"
-                    )
-                halves[name] = indices
-            if set(halves["a"]).intersection(halves["b"]):
-                raise ValueError("manifest session halves must not overlap")
-            selected.extend(halves[half])
-            all_indices.extend(halves["a"])
-            all_indices.extend(halves["b"])
-        if len(selected) != 40 or len(set(selected)) != 40:
-            raise ValueError("manifest half must select exactly 40 unique trials")
-        if len(all_indices) != 80 or len(set(all_indices)) != 80:
-            raise ValueError("manifest sessions must account for 80 distinct trials")
-        result[image_id] = tuple(selected)
-    return result
+    if not isinstance(image_ids, list):
+        raise ValueError("trial split manifest image_ids must be a list")
+    return validated_trial_indices_by_image(payload, image_ids, half)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

@@ -29,7 +29,7 @@ from .native_training import (
     _validate_source_lock,
 )
 from .provenance import SourceLock, sha256_file
-from .trial_splits import average_trial_half
+from .trial_splits import average_trial_half, validate_trial_manifest
 
 
 _ARTIFACT_HALVES = {
@@ -38,6 +38,13 @@ _ARTIFACT_HALVES = {
     "eeg_b": "b",
 }
 _FORMAL_MODELS = frozenset({"nice", "atm_s", "our_project"})
+_ASSET_REPO_ID = "LidongYang/EEG_Image_decode"
+_ASSET_RELATIVE_PATHS = (
+    "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy",
+    "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy",
+    "ViT-H-14_features_train.pt",
+    "ViT-H-14_features_test.pt",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,8 @@ class NativeCheckpointEvaluation:
 class NativeExportConfig:
     source_checkout: Path
     source_lock: Path
+    asset_root: Path
+    asset_lock: Path
     test_eeg: Path
     test_features: Path
     test_images: Path
@@ -83,6 +92,7 @@ class _NativeInputs:
 @dataclass(frozen=True)
 class _CheckpointRecord:
     epoch: int
+    val_loss: float
     path: Path
     sha256: str
 
@@ -268,8 +278,11 @@ def evaluate_native_checkpoint(
 def export_native_scores(config: NativeExportConfig) -> NativeExportResult:
     """Publish standard/EEG-A/EEG-B artifacts from only ``best_val.pth``."""
     source_lock = _validate_export_config(config, require_new_output=True)
+    asset_lock = _validate_asset_lock(config)
     inputs = _load_native_inputs(config)
-    records, best_checkpoint = _load_checkpoint_manifest(config)
+    records, best_checkpoint, checkpoint_manifest_hash = _load_checkpoint_manifest(
+        config, source_lock, asset_lock
+    )
     del records
     device = _resolve_device(config.device)
     subject_index = _subject_index(config.subject)
@@ -311,6 +324,9 @@ def export_native_scores(config: NativeExportConfig) -> NativeExportResult:
             query_embeddings=evaluation.eeg_embeddings,
             metadata={
                 "source_lock": source_lock.to_dict(),
+                "asset_lock_manifest_sha256": asset_lock["manifest_sha256"],
+                "asset_lock": asset_lock["provenance"],
+                "checkpoint_manifest_sha256": checkpoint_manifest_hash,
                 "input_sha256": dict(inputs.input_hashes),
             },
         )
@@ -338,12 +354,15 @@ def audit_native_checkpoints(
 ) -> Path:
     """Audit every epoch only after hashing the complete nine-artifact grid."""
     source_lock = _validate_export_config(config, require_new_output=False)
+    asset_lock = _validate_asset_lock(config)
     inventory = _formal_artifact_inventory(
         formal_artifact_directories,
         expected_image_count=config.expected_image_count,
     )
     inputs = _load_native_inputs(config)
-    records, _best_checkpoint = _load_checkpoint_manifest(config)
+    records, _best_checkpoint, _manifest_hash = _load_checkpoint_manifest(
+        config, source_lock, asset_lock
+    )
     device = _resolve_device(config.device)
     subject_index = _subject_index(config.subject)
 
@@ -431,6 +450,8 @@ def _validate_export_config(
     paths = {
         "source checkout": config.source_checkout,
         "source lock": config.source_lock,
+        "asset root": config.asset_root,
+        "asset lock": config.asset_lock,
         "test EEG": config.test_eeg,
         "test features": config.test_features,
         "test images": config.test_images,
@@ -441,10 +462,21 @@ def _validate_export_config(
         path = Path(path)
         if path.is_symlink():
             raise ValueError(f"{label} must not be a symbolic link: {path}")
-    for label in ("source checkout", "test images", "checkpoint directory"):
+    for label in (
+        "source checkout",
+        "asset root",
+        "test images",
+        "checkpoint directory",
+    ):
         if not Path(paths[label]).is_dir():
             raise ValueError(f"{label} must be a directory: {paths[label]}")
-    for label in ("source lock", "test EEG", "test features", "trial manifest"):
+    for label in (
+        "source lock",
+        "asset lock",
+        "test EEG",
+        "test features",
+        "trial manifest",
+    ):
         if not Path(paths[label]).is_file():
             raise ValueError(f"{label} must be a file: {paths[label]}")
     if config.test_eeg.name != "preprocessed_eeg_test.npy":
@@ -460,6 +492,78 @@ def _validate_export_config(
     if not require_new_output and not config.output_dir.is_dir():
         raise ValueError("native main artifacts must exist before audit")
     return _validate_source_lock(config.source_checkout, config.source_lock)
+
+
+def _validate_asset_lock(config: NativeExportConfig) -> dict[str, object]:
+    """Verify all four official assets before any pickle-capable load."""
+    lock_path = Path(config.asset_lock)
+    root = Path(config.asset_root)
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise ValueError("asset lock must be a regular file")
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("asset root must be a regular directory")
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid asset lock manifest") from error
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "repo_id",
+        "repo_type",
+        "asset_root",
+        "files",
+    }:
+        raise ValueError("asset lock must contain exactly the Task 2 schema")
+    if payload["repo_id"] != _ASSET_REPO_ID or payload["repo_type"] != "dataset":
+        raise ValueError("asset lock repository identity mismatch")
+    if payload["asset_root"] != str(root):
+        raise ValueError("asset lock root path mismatch")
+    files = payload["files"]
+    if not isinstance(files, Mapping) or set(files) != set(_ASSET_RELATIVE_PATHS):
+        raise ValueError("asset lock file paths do not match the four official assets")
+    root_resolved = root.resolve(strict=True)
+    expected_test_paths = {
+        "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy": Path(config.test_eeg),
+        "ViT-H-14_features_test.pt": Path(config.test_features),
+    }
+    for relative in _ASSET_RELATIVE_PATHS:
+        path = root / relative
+        if relative in expected_test_paths and path != expected_test_paths[relative]:
+            raise ValueError(f"configured official asset path mismatch: {relative}")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"official asset must be a regular file: {relative}")
+        resolved = path.resolve(strict=True)
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError as error:
+            raise ValueError(f"official asset escapes asset root: {relative}") from error
+        entry = files[relative]
+        if not isinstance(entry, Mapping) or set(entry) != {"bytes", "sha256"}:
+            raise ValueError(f"asset lock entry schema mismatch: {relative}")
+        expected_size = entry["bytes"]
+        expected_hash = entry["sha256"]
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+        ):
+            raise ValueError(f"asset lock byte count is invalid: {relative}")
+        if not isinstance(expected_hash, str) or re.fullmatch(
+            r"[0-9a-f]{64}", expected_hash
+        ) is None:
+            raise ValueError(f"asset lock SHA-256 is invalid: {relative}")
+        if path.stat().st_size != expected_size:
+            raise ValueError(f"asset byte count mismatch: {relative}")
+        if sha256_file(path) != expected_hash:
+            raise ValueError(f"asset SHA-256 mismatch: {relative}")
+    return {
+        "manifest_sha256": sha256_file(lock_path),
+        "provenance": {
+            "repo_id": payload["repo_id"],
+            "repo_type": payload["repo_type"],
+            "asset_root": payload["asset_root"],
+            "files": {key: dict(value) for key, value in files.items()},
+        },
+    }
 
 
 def _load_native_inputs(config: NativeExportConfig) -> _NativeInputs:
@@ -525,19 +629,7 @@ def _load_native_inputs(config: NativeExportConfig) -> _NativeInputs:
         raise ValueError("invalid trial manifest") from error
     if not isinstance(manifest, Mapping):
         raise ValueError("trial manifest must be a mapping")
-    manifest_ids = manifest.get("image_ids")
-    manifest_images = manifest.get("images")
-    if (
-        not isinstance(manifest_ids, list)
-        or any(not isinstance(value, str) or not value for value in manifest_ids)
-        or len(set(manifest_ids)) != len(manifest_ids)
-        or set(manifest_ids) != set(image_ids)
-        or not isinstance(manifest_images, Mapping)
-        or set(manifest_images) != set(image_ids)
-    ):
-        raise ValueError(
-            "trial manifest canonical image IDs must exactly match test images"
-        )
+    validate_trial_manifest(manifest, image_ids)
     averaged = {
         "standard": np.ascontiguousarray(eeg.mean(axis=1)),
         "a": np.ascontiguousarray(average_trial_half(eeg, image_ids, manifest, "a")),
@@ -557,7 +649,9 @@ def _load_native_inputs(config: NativeExportConfig) -> _NativeInputs:
 
 def _load_checkpoint_manifest(
     config: NativeExportConfig,
-) -> tuple[tuple[_CheckpointRecord, ...], Path]:
+    source_lock: SourceLock,
+    asset_lock: Mapping[str, object],
+) -> tuple[tuple[_CheckpointRecord, ...], Path, str]:
     manifest_path = config.checkpoint_dir / "checkpoint_manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise ValueError("checkpoint_manifest.json must be a regular file")
@@ -565,28 +659,98 @@ def _load_checkpoint_manifest(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("invalid checkpoint manifest") from error
+    expected_top_keys = {
+        "schema_version", "model", "encoder_type", "subject", "seed",
+        "source", "inputs", "hyperparameters", "encoder_behavior",
+        "checkpoints", "selection", "best_checkpoint", "history",
+        "stopped_early",
+    }
+    if not isinstance(manifest, Mapping) or set(manifest) != expected_top_keys:
+        raise ValueError("checkpoint manifest must use the exact Task 5 schema")
+    encoder = ENCODERS[config.model]
     if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("model") != config.model
-        or manifest.get("subject") != config.subject
+        manifest["schema_version"] != 1
+        or manifest["model"] != config.model
+        or manifest["encoder_type"] != encoder["encoder_type"]
+        or manifest["subject"] != config.subject
+        or manifest["seed"] != 42
     ):
-        raise ValueError("checkpoint manifest model or subject mismatch")
-    rows = manifest.get("checkpoints")
+        raise ValueError("checkpoint manifest formal identity mismatch")
+    if manifest["source"] != source_lock.to_dict():
+        raise ValueError("checkpoint manifest source provenance mismatch")
+
+    provenance = asset_lock.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise RuntimeError("validated asset provenance is malformed")
+    asset_files = provenance.get("files")
+    if not isinstance(asset_files, Mapping):
+        raise RuntimeError("validated asset file ledger is malformed")
+    training_eeg_entry = asset_files.get(
+        "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy"
+    )
+    training_features_entry = asset_files.get("ViT-H-14_features_train.pt")
+    if not isinstance(training_eeg_entry, Mapping) or not isinstance(
+        training_features_entry, Mapping
+    ):
+        raise RuntimeError("validated training asset entries are malformed")
+    expected_inputs = {
+        "training_eeg": {
+            "name": "preprocessed_eeg_training.npy",
+            "sha256": training_eeg_entry["sha256"],
+        },
+        "training_features": {
+            "name": "ViT-H-14_features_train.pt",
+            "sha256": training_features_entry["sha256"],
+        },
+    }
+    if manifest["inputs"] != expected_inputs:
+        raise ValueError("checkpoint manifest training inputs mismatch asset lock")
+    expected_hyperparameters = {
+        "epochs": 500,
+        "batch_size": 1024,
+        "learning_rate": 3e-4,
+        "val_ratio": 0.1,
+        "early_stopping_patience": 10,
+        "ema_decay": 0.999,
+        "logit_scale_type": "exp",
+        "avg_trials": True,
+        "n_chans": config.n_chans,
+        "n_times": config.n_times,
+    }
+    if manifest["hyperparameters"] != expected_hyperparameters:
+        raise ValueError("checkpoint manifest formal hyperparameters mismatch")
+    expected_behavior = {
+        "use_subject_id": encoder["use_subject_id"],
+        "normalize_feats": encoder["normalize_feats"],
+    }
+    if manifest["encoder_behavior"] != expected_behavior:
+        raise ValueError("checkpoint manifest encoder behavior mismatch")
+    if not isinstance(manifest["stopped_early"], bool):
+        raise ValueError("checkpoint manifest stopped_early must be boolean")
+
+    rows = manifest["checkpoints"]
     if not isinstance(rows, list) or not rows:
         raise ValueError("checkpoint manifest has no epoch checkpoints")
     records: list[_CheckpointRecord] = []
     for row in rows:
-        if not isinstance(row, Mapping):
-            raise ValueError("checkpoint manifest row must be a mapping")
+        if not isinstance(row, Mapping) or set(row) != {
+            "epoch", "val_loss", "checkpoint", "sha256"
+        }:
+            raise ValueError("checkpoint manifest row schema is invalid")
         epoch = row.get("epoch")
+        val_loss = row.get("val_loss")
         name = row.get("checkpoint")
         expected_hash = row.get("sha256")
         if (
             isinstance(epoch, bool)
             or not isinstance(epoch, int)
             or epoch <= 0
+            or isinstance(val_loss, bool)
+            or not isinstance(val_loss, (int, float))
+            or not math.isfinite(float(val_loss))
             or name != f"epoch_{epoch:04d}.pth"
             or not isinstance(expected_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
         ):
             raise ValueError("checkpoint manifest epoch row is invalid")
         path = config.checkpoint_dir / name
@@ -594,23 +758,29 @@ def _load_checkpoint_manifest(
             raise ValueError(f"epoch checkpoint is not a regular file: {path}")
         if sha256_file(path) != expected_hash:
             raise ValueError(f"epoch checkpoint SHA-256 mismatch: {name}")
-        records.append(_CheckpointRecord(epoch, path, expected_hash))
+        records.append(_CheckpointRecord(epoch, float(val_loss), path, expected_hash))
     if len({record.epoch for record in records}) != len(records):
         raise ValueError("checkpoint manifest epochs must be unique")
-    records.sort(key=lambda record: record.epoch)
+    if [record.epoch for record in records] != sorted(
+        record.epoch for record in records
+    ):
+        raise ValueError("checkpoint manifest rows must be ordered by epoch")
     actual_epoch_files = {
         path.name for path in config.checkpoint_dir.glob("epoch_*.pth")
     }
     if actual_epoch_files != {record.path.name for record in records}:
         raise ValueError("checkpoint manifest does not cover every epoch checkpoint")
 
-    best = manifest.get("best_checkpoint")
-    selection = manifest.get("selection")
+    best = manifest["best_checkpoint"]
+    selection = manifest["selection"]
     if (
         not isinstance(best, Mapping)
+        or set(best) != {"name", "sha256"}
         or best.get("name") != "best_val.pth"
         or not isinstance(best.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", best["sha256"]) is None
         or not isinstance(selection, Mapping)
+        or set(selection) != {"epoch", "val_loss", "checkpoint"}
     ):
         raise ValueError("checkpoint manifest best validation entry is invalid")
     best_path = config.checkpoint_dir / "best_val.pth"
@@ -619,14 +789,30 @@ def _load_checkpoint_manifest(
     best_hash = sha256_file(best_path)
     if best_hash != best["sha256"]:
         raise ValueError("best_val.pth SHA-256 mismatch")
-    selected_epoch = selection.get("epoch")
-    selected = next(
-        (record for record in records if record.epoch == selected_epoch),
-        None,
-    )
-    if selected is None or selected.sha256 != best_hash:
+    selected = min(records, key=lambda record: (record.val_loss, record.epoch))
+    if selection != {
+        "epoch": selected.epoch,
+        "val_loss": selected.val_loss,
+        "checkpoint": selected.path.name,
+    }:
+        raise ValueError("checkpoint manifest validation selection mismatch")
+    if selected.sha256 != best_hash:
         raise ValueError("best_val.pth does not match selected validation epoch")
-    return tuple(records), best_path
+    history = manifest["history"]
+    if (
+        not isinstance(history, Mapping)
+        or set(history) != {"name", "sha256"}
+        or history.get("name") != "history.csv"
+        or not isinstance(history.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", history["sha256"]) is None
+    ):
+        raise ValueError("checkpoint manifest history entry is invalid")
+    history_path = config.checkpoint_dir / "history.csv"
+    if history_path.is_symlink() or not history_path.is_file():
+        raise ValueError("history.csv must be a regular file")
+    if sha256_file(history_path) != history["sha256"]:
+        raise ValueError("history.csv SHA-256 mismatch")
+    return tuple(records), best_path, sha256_file(manifest_path)
 
 
 def _build_official_encoder(

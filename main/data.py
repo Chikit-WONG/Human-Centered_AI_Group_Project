@@ -450,9 +450,11 @@ def load_things_brain_dataset(
                 )
             if len(set(image_ids)) != len(image_ids):
                 raise ValueError("Brain test image IDs must be unique")
-            actual_ids = set(trial_indices_by_image)
-            expected_ids = set(image_ids)
-            if actual_ids != expected_ids:
+            actual_order = tuple(trial_indices_by_image)
+            expected_order = tuple(image_ids)
+            if actual_order != expected_order:
+                actual_ids = set(actual_order)
+                expected_ids = set(expected_order)
                 missing = sorted(expected_ids - actual_ids)
                 extra = sorted(actual_ids - expected_ids)
                 raise ValueError(

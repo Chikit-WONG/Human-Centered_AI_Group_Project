@@ -88,6 +88,109 @@ def build_trial_manifest(
     }
 
 
+def validate_trial_manifest(
+    manifest: Mapping[str, object],
+    image_ids: Sequence[str],
+) -> dict[str, dict[str, tuple[int, ...]]]:
+    """Validate the complete formal seed-42 trial manifest contract."""
+    image_ids = _validated_image_ids(image_ids)
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must be a mapping")
+    expected_top_keys = {
+        "schema_version",
+        "algorithm_version",
+        "seed",
+        "image_ids",
+        "images",
+    }
+    if set(manifest) != expected_top_keys:
+        raise ValueError(
+            "trial manifest must contain exactly the formal schema keys"
+        )
+    if manifest.get("schema_version") != 1:
+        raise ValueError("trial manifest schema_version must be 1")
+    if manifest.get("algorithm_version") != _TRIAL_ALGORITHM:
+        raise ValueError(
+            f"trial manifest algorithm_version must be {_TRIAL_ALGORITHM}"
+        )
+    if manifest.get("seed") != 42:
+        raise ValueError("formal trial manifest requires seed=42")
+    declared_ids = manifest.get("image_ids")
+    if not isinstance(declared_ids, list) or tuple(declared_ids) != image_ids:
+        raise ValueError(
+            "trial manifest ordered canonical image IDs do not match consumer"
+        )
+    images = manifest.get("images")
+    if not isinstance(images, Mapping) or set(images) != set(image_ids):
+        raise ValueError("trial manifest image keys do not match canonical image IDs")
+
+    expected_session_keys = {str(value) for value in range(_SESSIONS_PER_IMAGE)}
+    expected_trial_indices = set(range(_SESSIONS_PER_IMAGE * _TRIALS_PER_SESSION))
+    normalized: dict[str, dict[str, tuple[int, ...]]] = {}
+    for image_id in image_ids:
+        image_manifest = images[image_id]
+        if (
+            not isinstance(image_manifest, Mapping)
+            or set(image_manifest) != expected_session_keys
+        ):
+            raise ValueError("trial manifest session keys must be exactly 0,1,2,3")
+        selected = {"a": [], "b": []}
+        all_indices: list[int] = []
+        for session_id in range(_SESSIONS_PER_IMAGE):
+            split = image_manifest[str(session_id)]
+            if not isinstance(split, Mapping) or set(split) != {"a", "b", "sha256"}:
+                raise ValueError(
+                    "manifest session must contain exactly a, b, and sha256"
+                )
+            a = _validated_trial_indices(split["a"], len(expected_trial_indices))
+            b = _validated_trial_indices(split["b"], len(expected_trial_indices))
+            if len(a) != _TRIALS_PER_HALF_SESSION or len(b) != _TRIALS_PER_HALF_SESSION:
+                raise ValueError("each manifest session half must contain 10 trials")
+            if set(a).intersection(b):
+                raise ValueError("manifest session halves must not overlap")
+            session_indices = a + b
+            if len(set(session_indices)) != _TRIALS_PER_SESSION:
+                raise ValueError("manifest session must contain 20 distinct trials")
+            expected_hashes = {
+                str(index): _trial_digest(image_id, session_id, index, 42)
+                for index in session_indices
+            }
+            hashes = split["sha256"]
+            if not isinstance(hashes, Mapping) or dict(hashes) != expected_hashes:
+                raise ValueError("manifest per-trial SHA-256 ledger is invalid")
+            ordered = tuple(
+                sorted(
+                    session_indices,
+                    key=lambda index: (expected_hashes[str(index)], index),
+                )
+            )
+            if a != ordered[:_TRIALS_PER_HALF_SESSION] or b != ordered[_TRIALS_PER_HALF_SESSION:]:
+                raise ValueError("manifest halves do not follow the specified SHA-256 order")
+            selected["a"].extend(a)
+            selected["b"].extend(b)
+            all_indices.extend(session_indices)
+        if set(all_indices) != expected_trial_indices or len(all_indices) != len(
+            expected_trial_indices
+        ):
+            raise ValueError("manifest sessions must account for exactly trials 0..79")
+        normalized[image_id] = {
+            "a": tuple(selected["a"]),
+            "b": tuple(selected["b"]),
+        }
+    return normalized
+
+
+def trial_indices_by_image(
+    manifest: Mapping[str, object],
+    image_ids: Sequence[str],
+    half: str,
+) -> dict[str, tuple[int, ...]]:
+    if half not in {"a", "b"}:
+        raise ValueError("half must be a or b")
+    validated = validate_trial_manifest(manifest, image_ids)
+    return {image_id: validated[image_id][half] for image_id in image_ids}
+
+
 def average_trial_half(
     eeg: np.ndarray,
     image_ids: Sequence[str],
@@ -103,37 +206,13 @@ def average_trial_half(
         raise ValueError("eeg must be a NumPy array with image and trial axes")
     if eeg.shape[0] != len(image_ids):
         raise ValueError("eeg must have one image row per image ID")
-    if not isinstance(manifest, Mapping):
-        raise ValueError("manifest must be a mapping")
-    images = manifest.get("images")
-    if not isinstance(images, Mapping):
-        raise ValueError("manifest images must be a mapping")
+    selected_by_image = trial_indices_by_image(manifest, image_ids, half)
+    if eeg.shape[1] != _SESSIONS_PER_IMAGE * _TRIALS_PER_SESSION:
+        raise ValueError("formal EEG must contain exactly 80 trials per image")
 
     averages = []
     for image_index, image_id in enumerate(image_ids):
-        image_manifest = images.get(image_id)
-        if not isinstance(image_manifest, Mapping):
-            raise ValueError(f"manifest is missing image ID: {image_id}")
-        if len(image_manifest) != _SESSIONS_PER_IMAGE:
-            raise ValueError("each manifest image must contain exactly 4 sessions")
-
-        selected: list[int] = []
-        all_selected: list[int] = []
-        for split in image_manifest.values():
-            if not isinstance(split, Mapping):
-                raise ValueError("manifest session split must be a mapping")
-            a = _validated_trial_indices(split.get("a"), eeg.shape[1])
-            b = _validated_trial_indices(split.get("b"), eeg.shape[1])
-            if len(a) != _TRIALS_PER_HALF_SESSION or len(b) != _TRIALS_PER_HALF_SESSION:
-                raise ValueError("each manifest session half must contain 10 trials")
-            if set(a).intersection(b):
-                raise ValueError("manifest session halves must not overlap")
-            selected.extend(a if half == "a" else b)
-            all_selected.extend(a)
-            all_selected.extend(b)
-        if len(set(all_selected)) != _SESSIONS_PER_IMAGE * _TRIALS_PER_SESSION:
-            raise ValueError("manifest sessions must account for 80 distinct trials")
-        averages.append(np.mean(eeg[image_index, selected], axis=0))
+        averages.append(np.mean(eeg[image_index, selected_by_image[image_id]], axis=0))
 
     return np.stack(averages, axis=0)
 

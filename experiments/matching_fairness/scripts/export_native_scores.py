@@ -26,6 +26,8 @@ def native_export_config_from_protocol(
     protocol: Protocol,
     source_checkout: Path,
     source_lock: Path,
+    asset_root: Path,
+    asset_lock: Path,
     test_eeg: Path,
     test_features: Path,
     test_images: Path,
@@ -44,6 +46,8 @@ def native_export_config_from_protocol(
     return NativeExportConfig(
         source_checkout=source_checkout,
         source_lock=source_lock,
+        asset_root=asset_root,
+        asset_lock=asset_lock,
         test_eeg=test_eeg,
         test_features=test_features,
         test_images=test_images,
@@ -67,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--protocol", type=Path, default=DEFAULT_PROTOCOL)
     parser.add_argument("--source-checkout", type=Path, required=True)
     parser.add_argument("--source-lock", type=Path, required=True)
+    parser.add_argument("--asset-root", type=Path, required=True)
+    parser.add_argument("--asset-lock", type=Path, required=True)
     parser.add_argument("--test-eeg", type=Path, required=True)
     parser.add_argument("--test-features", type=Path, required=True)
     parser.add_argument("--test-images", type=Path, required=True)
@@ -93,6 +99,8 @@ def main() -> None:
         protocol=protocol,
         source_checkout=arguments.source_checkout,
         source_lock=arguments.source_lock,
+        asset_root=arguments.asset_root,
+        asset_lock=arguments.asset_lock,
         test_eeg=arguments.test_eeg,
         test_features=arguments.test_features,
         test_images=arguments.test_images,

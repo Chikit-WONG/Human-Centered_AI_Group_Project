@@ -7,6 +7,8 @@ from matching_fairness.trial_splits import (
     average_trial_half,
     build_trial_manifest,
     select_duplicate_image_ids,
+    trial_indices_by_image,
+    validate_trial_manifest,
 )
 
 
@@ -110,7 +112,7 @@ def test_manifest_validates_each_image_session_layout() -> None:
         build_trial_manifest(("a", "b"), sessions)
 
 
-def test_average_half_follows_image_ids_instead_of_manifest_order() -> None:
+def test_average_half_rejects_consumer_image_order_mismatch() -> None:
     sessions = _sessions()
     manifest = build_trial_manifest(("a", "b"), sessions)
     eeg = np.stack(
@@ -118,9 +120,8 @@ def test_average_half_follows_image_ids_instead_of_manifest_order() -> None:
         axis=0,
     )
 
-    averaged = average_trial_half(eeg, ("b", "a"), manifest, "a")
-
-    np.testing.assert_array_equal(averaged[:, 0], np.array([20.0, 10.0]))
+    with pytest.raises(ValueError, match="ordered canonical image IDs"):
+        average_trial_half(eeg, ("b", "a"), manifest, "a")
 
 
 def test_duplicate_selection_uses_exact_sha256_order_and_is_nested() -> None:
@@ -149,3 +150,60 @@ def test_duplicate_selection_uses_exact_sha256_order_and_is_nested() -> None:
 def test_duplicate_selection_requires_twenty_unique_image_ids() -> None:
     with pytest.raises(ValueError, match="at least 20 unique"):
         select_duplicate_image_ids(tuple(f"image-{index}" for index in range(19)))
+
+
+
+def test_strict_manifest_validator_returns_canonical_half_indices() -> None:
+    image_ids = ("img-0", "img-1")
+    manifest = build_trial_manifest(image_ids, _sessions(), seed=42)
+
+    validated = validate_trial_manifest(manifest, image_ids)
+    selected = trial_indices_by_image(manifest, image_ids, "a")
+
+    assert tuple(validated) == image_ids
+    assert all(len(indices) == 40 for indices in selected.values())
+
+
+@pytest.mark.parametrize(
+    "mutation,message",
+    (
+        ("extra_top_key", "exactly"),
+        ("algorithm", "algorithm_version"),
+        ("seed", "seed=42"),
+        ("ordered_ids", "ordered canonical image IDs"),
+        ("session_keys", "session keys"),
+        ("sha", "SHA-256"),
+        ("split_order", "SHA-256 order"),
+    ),
+)
+def test_strict_manifest_validator_rejects_tampering(
+    mutation: str,
+    message: str,
+) -> None:
+    image_ids = ("img-0", "img-1")
+    manifest = build_trial_manifest(image_ids, _sessions(), seed=42)
+    if mutation == "extra_top_key":
+        manifest["unexpected"] = True
+    elif mutation == "algorithm":
+        manifest["algorithm_version"] = "wrong"
+    elif mutation == "seed":
+        manifest["seed"] = 7
+    elif mutation == "ordered_ids":
+        manifest["image_ids"] = list(reversed(image_ids))
+    elif mutation == "session_keys":
+        manifest["images"]["img-0"]["4"] = manifest["images"]["img-0"].pop("3")
+    elif mutation == "sha":
+        manifest["images"]["img-0"]["0"]["sha256"]["0"] = "0" * 64
+    elif mutation == "split_order":
+        split = manifest["images"]["img-0"]["0"]
+        split["a"][0], split["a"][1] = split["a"][1], split["a"][0]
+
+    with pytest.raises(ValueError, match=message):
+        validate_trial_manifest(manifest, image_ids)
+
+
+def test_trial_manifest_requires_exact_consumer_image_order() -> None:
+    manifest = build_trial_manifest(("img-0", "img-1"), _sessions(), seed=42)
+
+    with pytest.raises(ValueError, match="ordered canonical image IDs"):
+        validate_trial_manifest(manifest, ("img-1", "img-0"))

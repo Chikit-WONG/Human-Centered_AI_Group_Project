@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from matching_fairness.trial_splits import build_trial_manifest
 from main.data import load_things_brain_dataset
 from scripts.evaluate_retrieval import (
     build_brainrw_score_artifact,
@@ -187,24 +188,10 @@ def test_existing_averaging_output_is_unchanged_without_selection(
 def _trial_manifest(path: Path) -> Path:
     import json
 
-    sessions = {}
-    for session in range(4):
-        start = session * 20
-        sessions[str(session)] = {
-            "a": list(range(start, start + 10)),
-            "b": list(range(start + 10, start + 20)),
-            "sha256": {},
-        }
+    sessions = np.tile(np.repeat(np.arange(4), 20), (2, 1))
+    manifest = build_trial_manifest(("image-0", "image-1"), sessions)
     path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "algorithm_version": "AIAA3800-DUPLICATE-EEG-v1",
-                "seed": 42,
-                "image_ids": ["image-0", "image-1"],
-                "images": {"image-0": sessions, "image-1": sessions},
-            }
-        ),
+        json.dumps(manifest),
         encoding="utf-8",
     )
     return path
@@ -236,12 +223,19 @@ def test_trial_manifest_loads_exact_canonical_half_mapping(tmp_path: Path) -> No
 
     selection = load_trial_indices_by_image(manifest, "a")
 
-    expected = tuple(
-        index
-        for session in range(4)
-        for index in range(session * 20, session * 20 + 10)
+    expected = build_trial_manifest(
+        ("image-0", "image-1"),
+        np.tile(np.repeat(np.arange(4), 20), (2, 1)),
     )
-    assert selection == {"image-0": expected, "image-1": expected}
+    expected_selection = {
+        image_id: tuple(
+            index
+            for session in expected["images"][image_id].values()
+            for index in session["a"]
+        )
+        for image_id in expected["image_ids"]
+    }
+    assert selection == expected_selection
 
 
 def test_standard_trial_half_rejects_manifest(tmp_path: Path) -> None:
@@ -292,3 +286,18 @@ def test_brainrw_score_artifact_uses_canonical_id_targets() -> None:
     assert artifact.metadata["model_slug"] == "our_project"
     assert artifact.metadata["trial_half"] == "a"
     assert len(artifact.metadata["query_embeddings_sha256"]) == 64
+
+
+
+def test_evaluator_rejects_trial_manifest_with_tampered_sha(tmp_path: Path) -> None:
+    import json
+
+    manifest_path = _trial_manifest(tmp_path / "trials.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["images"]["image-0"]["0"]["sha256"] = {
+        str(index): "0" * 64 for index in range(20)
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        load_trial_indices_by_image(manifest_path, "a")
