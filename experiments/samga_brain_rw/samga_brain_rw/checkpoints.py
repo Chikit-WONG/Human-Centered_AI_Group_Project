@@ -530,12 +530,12 @@ def _validate_source_records(
     value: object,
     *,
     provenance: Mapping[str, object],
+    expected_roles: tuple[str, ...],
 ) -> None:
-    if not isinstance(value, list) or len(value) != 2:
+    if not isinstance(value, list) or len(value) != len(expected_roles):
         raise ValueError(
-            "checkpoint sidecar source_records must contain train and val-dev"
+            "checkpoint sidecar source_records do not match observed scopes"
         )
-    expected_roles = ("train", "val-dev")
     shared: tuple[object, ...] | None = None
     for index, (raw, role) in enumerate(
         zip(value, expected_roles, strict=True)
@@ -646,12 +646,18 @@ def _validate_checkpoint_bundle(
         "retention",
     ):
         _require_mapping(payload[key], f"checkpoint {key}")
-    if (
-        payload["scope"] != "train"
-        or payload["validation_scope"] != "val-dev"
-        or payload["observed_scopes"] != ["train", "val-dev"]
-    ):
-        raise PermissionError("checkpoint is not development-only")
+    if payload["scope"] != "train":
+        raise PermissionError("checkpoint scope is not train")
+    observation = (
+        payload["validation_scope"],
+        tuple(payload["observed_scopes"]),
+    )
+    if observation == ("val-dev", ("train", "val-dev")):
+        expected_roles = ("train", "val-dev")
+    elif observation == ("none", ("train",)):
+        expected_roles = ("train",)
+    else:
+        raise PermissionError("checkpoint observation policy is invalid")
 
     provenance = _require_mapping(
         envelope.get("provenance"),
@@ -686,13 +692,14 @@ def _validate_checkpoint_bundle(
     )
     if (
         metadata["complete"] is not True
-        or metadata["observed_scopes"] != ["train", "val-dev"]
+        or metadata["observed_scopes"] != list(expected_roles)
         or metadata["retention"] != payload["retention"]
     ):
         raise ValueError("checkpoint sidecar metadata binding mismatch")
     _validate_source_records(
         metadata["source_records"],
         provenance=provenance,
+        expected_roles=expected_roles,
     )
     _reject_sealed_checkpoint_metadata(payload)
     return (

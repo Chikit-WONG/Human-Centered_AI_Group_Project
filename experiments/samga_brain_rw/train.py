@@ -776,14 +776,28 @@ def save_samga_checkpoint(
     if not isinstance(manifest, ManifestIdentity):
         raise TypeError("manifest must be a verified ManifestIdentity")
     value = _validated_samga_checkpoint_payload(payload)
+    train_only = value["validation_metrics"] == {
+        "performed": False,
+        "validation_scope": "none",
+    }
+    validation_scope = "none" if train_only else "val-dev"
+    observed_scopes = (
+        ["train"] if train_only else ["train", "val-dev"]
+    )
+    ordered_ids = list(manifest.train_ordered_ids)
+    val_dev_ordered_ids = (
+        [] if train_only else list(manifest.val_dev_ordered_ids)
+    )
+    if not train_only:
+        ordered_ids.extend(val_dev_ordered_ids)
     if value["subject"] != manifest.subject:
         raise ValueError("SAMGA checkpoint subject differs from manifest")
     serialized = dict(value)
     serialized.update(
         {
             "scope": "train",
-            "validation_scope": "val-dev",
-            "observed_scopes": ["train", "val-dev"],
+            "validation_scope": validation_scope,
+            "observed_scopes": observed_scopes,
         }
     )
     _reject_sealed_checkpoint_metadata(serialized)
@@ -818,6 +832,8 @@ def save_samga_checkpoint(
             "source_payload_sha256": manifest.source_payload_sha256,
         },
     ]
+    if train_only:
+        source_records = source_records[:1]
     provenance = {
         "config_sha256": value["config_sha256"],
         "manifest_sha256": manifest.manifest_sha256,
@@ -827,13 +843,10 @@ def save_samga_checkpoint(
     }
     metadata = {
         "complete": True,
-        "observed_scopes": ["train", "val-dev"],
-        "ordered_ids": [
-            *manifest.train_ordered_ids,
-            *manifest.val_dev_ordered_ids,
-        ],
+        "observed_scopes": observed_scopes,
+        "ordered_ids": ordered_ids,
         "train_ordered_ids": list(manifest.train_ordered_ids),
-        "val_dev_ordered_ids": list(manifest.val_dev_ordered_ids),
+        "val_dev_ordered_ids": val_dev_ordered_ids,
         "retention": value["retention"],
         "source_records": source_records,
     }
@@ -842,12 +855,7 @@ def save_samga_checkpoint(
         "payload_type": CHECKPOINT_PAYLOAD_TYPE,
         "scope": "train",
         "source_records_sha256": sha256_json(source_records),
-        "ordered_ids_sha256": ordered_ids_sha256(
-            [
-                *manifest.train_ordered_ids,
-                *manifest.val_dev_ordered_ids,
-            ]
-        ),
+        "ordered_ids_sha256": ordered_ids_sha256(ordered_ids),
         "payload_sha256": payload_sha256,
         "provenance": provenance,
         "provenance_sha256": sha256_json(provenance),
@@ -994,12 +1002,17 @@ def load_samga_checkpoint(
     )
     value = _validated_samga_checkpoint_payload(loaded.payload, transport=True)
     validate_epoch_checkpoint_identity(value, loaded.envelope)
-    if (
-        value.get("scope") != "train"
-        or value.get("validation_scope") != "val-dev"
-        or value.get("observed_scopes") != ["train", "val-dev"]
+    if value.get("scope") != "train":
+        raise PermissionError("SAMGA checkpoint scope is not train")
+    observation = (
+        value.get("validation_scope"),
+        tuple(value.get("observed_scopes", ())),
+    )
+    if observation not in (
+        ("val-dev", ("train", "val-dev")),
+        ("none", ("train",)),
     ):
-        raise PermissionError("SAMGA checkpoint is not development-only")
+        raise PermissionError("SAMGA checkpoint observation policy is invalid")
     resume_value = {
         key: child for key, child in value.items() if key not in _CHECKPOINT_SCOPE_KEYS
     }
@@ -1015,7 +1028,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validation-scope",
         required=True,
-        choices=("val-dev",),
+        choices=("val-dev", "none"),
     )
     parser.add_argument("--stage", required=True, type=int, choices=(0, 2))
     parser.add_argument("--subject", required=True, type=int, choices=range(1, 11))
@@ -1657,9 +1670,12 @@ def build_resolved_candidate_payload(
     adapter_lr_ratio: float | None,
     whitening_payload_sha256: str | None,
     environment_binding: Mapping[str, object],
+    validation_scope: str = "val-dev",
 ) -> dict[str, object]:
     if stage not in {0, 2} or not 1 <= subject <= 10 or seed < 0:
         raise ValueError("resolved candidate stage/subject/seed is invalid")
+    if validation_scope not in ("val-dev", "none"):
+        raise ValueError("validation_scope must be val-dev or none")
     if not isinstance(config_id, str) or not config_id:
         raise ValueError("resolved candidate config_id must be non-empty")
     _require_sha(baseline_config_sha256, "baseline config")
@@ -1697,7 +1713,7 @@ def build_resolved_candidate_payload(
             "schedule_sha256": SCHEDULE_SHA256,
             "batch_size": 512,
             "epochs": 60,
-            "force_global_validation": True,
+            "force_global_validation": validation_scope == "val-dev",
             "num_workers": 0,
             "environment": normalized_environment,
         },
@@ -1884,15 +1900,20 @@ def build_run_manifest(
 def _build_input_hashes(
     manifest: ManifestIdentity,
     config: TrainingConfig,
+    *,
+    validation_scope: str = "val-dev",
 ) -> dict[str, str]:
+    if validation_scope not in ("val-dev", "none"):
+        raise ValueError("validation_scope must be val-dev or none")
+    observed_ids = list(manifest.train_ordered_ids)
+    if validation_scope == "val-dev":
+        observed_ids.extend(manifest.val_dev_ordered_ids)
     return {
         "cache_sha256": config.cache_sha256,
         "checkpoint_sha256": _NO_INITIAL_CHECKPOINT_SHA256,
         "manifest_sha256": manifest.manifest_sha256,
         "model_sha256": config.model_sha256,
-        "ordered_ids_sha256": ordered_ids_sha256(
-            [*manifest.train_ordered_ids, *manifest.val_dev_ordered_ids]
-        ),
+        "ordered_ids_sha256": ordered_ids_sha256(observed_ids),
         "protocol_sha256": manifest.protocol_sha256,
         "records_sha256": manifest.records_sha256,
         "source_manifest_sha256": manifest.source_manifest_sha256,
@@ -2231,7 +2252,11 @@ def run_training(arguments: argparse.Namespace) -> int:
         adapter_lr_ratio=selection.adapter_lr_ratio,
         whitening=selection.whitening,
     )
-    input_hashes = _build_input_hashes(manifest, config)
+    input_hashes = _build_input_hashes(
+        manifest,
+        config,
+        validation_scope=arguments.validation_scope,
+    )
     whitening_payload_sha256 = (
         None if selection.whitening is None else selection.whitening.payload_sha256
     )
@@ -2250,6 +2275,7 @@ def run_training(arguments: argparse.Namespace) -> int:
         adapter_lr_ratio=selection.adapter_lr_ratio,
         whitening_payload_sha256=whitening_payload_sha256,
         environment_binding=runtime.environment_binding,
+        validation_scope=arguments.validation_scope,
     )
     resolved = resolve_run_config(
         config.protocol,
@@ -2349,6 +2375,7 @@ def run_training(arguments: argparse.Namespace) -> int:
         checkpoint_restorer=restore_training_checkpoint,
         checkpoint_sink=checkpoint_sink,
         dataset_factory=dataset_factory,
+        validation_scope=arguments.validation_scope,
         batch_size=config.batch_size,
         max_train_steps=arguments.max_train_steps,
         num_workers=arguments.num_workers,
@@ -2383,6 +2410,42 @@ def run_training(arguments: argparse.Namespace) -> int:
     except KeyError as exc:
         raise ValueError("final checkpoint was not durably published") from exc
 
+    if arguments.validation_scope == "none":
+        if result.final_validation is not None:
+            raise AssertionError("train-only run unexpectedly produced validation")
+        if "val-dev" in development_datasets:
+            raise AssertionError("train-only run constructed a val-dev dataset")
+        run_summary = {
+            **run_manifest,
+            "completed": result.completed,
+            "global_step": result.global_step,
+            "final_checkpoint": final_checkpoint.name,
+            "final_checkpoint_sha256": final_checkpoint_sha256,
+            "checkpoint_hashes": dict(
+                sorted(checkpoint_retention.hashes.items())
+            ),
+            "in_loop_score_directory": None,
+            "max_train_steps": arguments.max_train_steps,
+            "resume_source_checkpoint_sha256": (
+                resume_source_checkpoint_sha256
+            ),
+            "validation_scope": "none",
+            "observed_scopes": ["train"],
+            "validation_metrics": {
+                "performed": False,
+                "validation_scope": "none",
+            },
+            **_runtime_manifest_metadata(runtime),
+        }
+        write_development_file_exclusive(
+            paths.output_dir / "run_manifest.json",
+            canonical_json_bytes(run_summary) + b"\n",
+            context="SAMGA run manifest output",
+        )
+        return 0
+
+    if result.final_validation is None:
+        raise AssertionError("val-dev run produced no validation")
     try:
         validation_dataset = development_datasets["val-dev"]
     except KeyError as exc:

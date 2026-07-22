@@ -197,6 +197,7 @@ class TrainingCellSpec:
     checkpoint_restorer: CheckpointRestorer
     checkpoint_sink: CheckpointSink
     dataset_factory: DatasetFactory = ProtocolSubjectDataset
+    validation_scope: str = "val-dev"
     batch_size: int = 512
     max_train_steps: int | None = None
     num_workers: int = 0
@@ -253,6 +254,8 @@ class TrainingCellSpec:
                 raise TypeError(f"{name} must be callable")
         if not callable(self.checkpoint_sink):
             raise ValueError("checkpoint_sink is required and must be callable")
+        if self.validation_scope not in ("val-dev", "none"):
+            raise ValueError("validation_scope must be val-dev or none")
         if type(self.batch_size) is not int or self.batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         if self.max_train_steps is not None and (
@@ -365,7 +368,7 @@ class TrainingResult:
     model: "SAMGARuntimeModel"
     global_step: int
     completed: bool
-    final_validation: ValidationResult
+    final_validation: ValidationResult | None
     final_checkpoint: dict[str, object]
     sampler_state: dict[str, object]
     loader_generator_state: torch.Tensor
@@ -1095,9 +1098,15 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
     device = _resolve_device(spec.device)
     _seed_fresh_process(spec.seed, device)
     train_dataset = _build_dataset(spec, "train", 0.3)
-    validation_dataset = _build_dataset(spec, "val-dev", 0.0)
-    if len(train_dataset) <= 0 or len(validation_dataset) <= 0:
-        raise ValueError("train and val-dev datasets must be non-empty")
+    validation_dataset = (
+        _build_dataset(spec, "val-dev", 0.0)
+        if spec.validation_scope == "val-dev"
+        else None
+    )
+    if len(train_dataset) <= 0:
+        raise ValueError("train dataset must be non-empty")
+    if validation_dataset is not None and len(validation_dataset) <= 0:
+        raise ValueError("val-dev dataset must be non-empty")
 
     _validate_whitening_provenance(spec, train_dataset)
     model = SAMGARuntimeModel(spec).to(device)
@@ -1206,13 +1215,14 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
     final_validation: ValidationResult | None = None
 
     if start_epoch > TOTAL_EPOCHS:
-        final_validation = _validate_global(
-            model,
-            validation_dataset,
-            batch_size=spec.batch_size,
-            device=device,
-            seed=spec.seed,
-        )
+        if validation_dataset is not None:
+            final_validation = _validate_global(
+                model,
+                validation_dataset,
+                batch_size=spec.batch_size,
+                device=device,
+                seed=spec.seed,
+            )
         return TrainingResult(
             model=model,
             global_step=global_step,
@@ -1278,13 +1288,15 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
         epoch_complete = sampler.exhausted
         if not epoch_complete and not reached_limit:
             raise AssertionError("DataLoader stopped before sampler exhaustion")
-        final_validation = _validate_global(
-            model,
-            validation_dataset,
-            batch_size=spec.batch_size,
-            device=device,
-            seed=spec.seed,
-        )
+        final_validation = None
+        if validation_dataset is not None:
+            final_validation = _validate_global(
+                model,
+                validation_dataset,
+                batch_size=spec.batch_size,
+                device=device,
+                seed=spec.seed,
+            )
         retain = epoch_complete and epoch in LAST10_EPOCHS
         if epoch_complete and epoch not in prior_snapshot_epochs:
             prior_snapshot_epochs.append(epoch)
@@ -1322,8 +1334,10 @@ def run_training_cell(spec: TrainingCellSpec) -> TrainingResult:
         if reached_limit:
             break
 
-    if final_validation is None or not final_checkpoint:
+    if not final_checkpoint:
         raise AssertionError("training produced no checkpoint")
+    if spec.validation_scope == "val-dev" and final_validation is None:
+        raise AssertionError("development training produced no validation")
     completed = (
         int(final_checkpoint["epoch"]) == TOTAL_EPOCHS
         and bool(
@@ -1769,20 +1783,25 @@ def _validate_checkpoint_schema(
         payload["validation_metrics"],
         f"{context} validation metrics",
     )
-    _exact_keys(
-        validation,
-        {
-            "query_count",
-            "gallery_count",
-            "top1_count",
-            "top5_count",
-            "top1_rate",
-            "top5_rate",
-            "router_mode",
-            "similarity",
-        },
-        f"{context} validation metrics",
-    )
+    no_validation = {
+        "performed": False,
+        "validation_scope": "none",
+    }
+    if validation != no_validation:
+        _exact_keys(
+            validation,
+            {
+                "query_count",
+                "gallery_count",
+                "top1_count",
+                "top5_count",
+                "top1_rate",
+                "top5_rate",
+                "router_mode",
+                "similarity",
+            },
+            f"{context} validation metrics",
+        )
     _semantic_sha256(validation, f"{context} validation metrics")
     _validate_hash_mapping(payload["input_hashes"], f"{context} input_hashes")
     _mapping(payload["run_manifest"], f"{context} run_manifest")
@@ -1830,6 +1849,16 @@ def _validate_checkpoint_position(
     for name, expected in expected_values:
         if payload[name] != expected:
             raise ValueError(f"{context} {name} mismatch")
+    validation = _mapping(
+        payload["validation_metrics"],
+        f"{context} validation metrics",
+    )
+    is_train_only = validation == {
+        "performed": False,
+        "validation_scope": "none",
+    }
+    if is_train_only != (spec.validation_scope == "none"):
+        raise ValueError(f"{context} validation_scope mismatch")
     runtime = _mapping(payload["runtime_state"], f"{context} runtime state")
     if runtime["schema_version"] != 1:
         raise ValueError(f"{context} runtime state schema mismatch")
@@ -2286,7 +2315,7 @@ def _build_checkpoint(
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     generator: torch.Generator,
     sampler: StatefulEpochSampler,
-    validation: ValidationResult,
+    validation: ValidationResult | None,
     epoch: int,
     global_step: int,
     epoch_complete: bool,
@@ -2295,16 +2324,22 @@ def _build_checkpoint(
     optimizer_stage: str,
     retain_for_averaging: bool,
 ) -> dict[str, object]:
-    validation_metrics = {
-        "query_count": validation.metrics.query_count,
-        "gallery_count": validation.metrics.gallery_count,
-        "top1_count": validation.metrics.top1_count,
-        "top5_count": validation.metrics.top5_count,
-        "top1_rate": validation.metrics.top1_rate,
-        "top5_rate": validation.metrics.top5_rate,
-        "router_mode": "global",
-        "similarity": "cosine",
-    }
+    if validation is None:
+        validation_metrics = {
+            "performed": False,
+            "validation_scope": "none",
+        }
+    else:
+        validation_metrics = {
+            "query_count": validation.metrics.query_count,
+            "gallery_count": validation.metrics.gallery_count,
+            "top1_count": validation.metrics.top1_count,
+            "top5_count": validation.metrics.top5_count,
+            "top1_rate": validation.metrics.top1_rate,
+            "top5_rate": validation.metrics.top5_rate,
+            "router_mode": "global",
+            "similarity": "cosine",
+        }
     built = spec.checkpoint_builder(
         model=model,
         optimizer=optimizer,

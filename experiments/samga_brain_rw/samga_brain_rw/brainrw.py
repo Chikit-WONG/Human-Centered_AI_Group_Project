@@ -148,6 +148,9 @@ _BRAINRW_INPUT_HASH_KEYS = frozenset(
         "val_dev_role",
     }
 )
+_BRAINRW_TRAIN_ONLY_INPUT_HASH_KEYS = (
+    _BRAINRW_INPUT_HASH_KEYS | {"validation_policy"}
+)
 _BRAINRW_RUNTIME_CONTRACT = MappingProxyType(
     {
         "accelerator": "NVIDIA A40",
@@ -1264,8 +1267,11 @@ def input_hashes(
     config: BrainRWConfigIdentity,
     manifest: ManifestIdentity,
     semantic_environment_sha256: str,
+    validation_scope: str = "val-dev",
 ) -> dict[str, str]:
-    return {
+    if validation_scope not in {"val-dev", "none"}:
+        raise ValueError("validation scope must be val-dev or none")
+    hashes = {
         "clip_config": config.clip_config_sha256,
         "clip_preprocessor": config.clip_preprocessor_sha256,
         "clip_weights": config.clip_weights_sha256,
@@ -1282,6 +1288,11 @@ def input_hashes(
         "train_role": manifest.train_role_sha256,
         "val_dev_role": manifest.val_dev_role_sha256,
     }
+    if validation_scope == "none":
+        hashes["validation_policy"] = sha256_json(
+            {"validation_scope": "none"}
+        )
+    return hashes
 
 
 def brainrw_run_key(
@@ -1290,11 +1301,13 @@ def brainrw_run_key(
     subject: int,
     seed: int,
     semantic_environment_sha256: str,
+    validation_scope: str = "val-dev",
 ) -> tuple[str, str, dict[str, str]]:
     hashes = input_hashes(
         config,
         manifest,
         semantic_environment_sha256,
+        validation_scope,
     )
     bundle = sha256_json(hashes)
     key = make_run_key(
@@ -2036,19 +2049,20 @@ def save_brainrw_checkpoint(
         raise ValueError(
             "checkpoint payload_type mismatch"
         )
-    if (
-        payload.get("scope") != "train"
-        or payload.get("validation_scope") != "val-dev"
+    if payload.get("scope") != "train":
+        raise PermissionError(
+            "Brain-RW checkpoints must bind the train scope"
+        )
+    observation_policy = (
+        payload.get("validation_scope"),
+        payload.get("observed_scopes"),
+    )
+    if observation_policy not in (
+        ("val-dev", ["train", "val-dev"]),
+        ("none", ["train"]),
     ):
         raise PermissionError(
-            "Brain-RW checkpoints must bind train and val-dev only"
-        )
-    if payload.get("observed_scopes") != [
-        "train",
-        "val-dev",
-    ]:
-        raise PermissionError(
-            "checkpoint observed_scopes must be train and val-dev"
+            "checkpoint validation and observed scopes are inconsistent"
         )
     buffer = io.BytesIO()
     torch.save(dict(payload), buffer)
@@ -2082,7 +2096,7 @@ def save_brainrw_checkpoint(
         "global_step": payload["global_step"],
         "planned_steps": payload["planned_steps"],
         "training_complete": payload["training_complete"],
-        "observed_scopes": ["train", "val-dev"],
+        "observed_scopes": list(payload["observed_scopes"]),
         "ordered_ids": list(manifest.train_ordered_ids),
         "run_key": payload["run_key"],
         "source_records": source_records,
@@ -2522,6 +2536,11 @@ def _validate_checkpoint_metrics(value: object) -> None:
         value,
         "validation_metrics",
     )
+    if metrics == {
+        "performed": False,
+        "validation_scope": "none",
+    }:
+        return
     if set(metrics) != {
         "gallery_count",
         "query_count",
@@ -2712,19 +2731,20 @@ def _validate_loaded_checkpoint(
         )
     if value["complete"] is not True:
         raise ValueError("checkpoint is incomplete")
-    if (
-        value["scope"] != "train"
-        or value["validation_scope"] != "val-dev"
-    ):
+    if value["scope"] != "train":
         raise PermissionError(
             "checkpoint contains a non-development scope"
         )
-    if value["observed_scopes"] != [
-        "train",
-        "val-dev",
-    ]:
+    observation_policy = (
+        value["validation_scope"],
+        value["observed_scopes"],
+    )
+    if observation_policy not in (
+        ("val-dev", ["train", "val-dev"]),
+        ("none", ["train"]),
+    ):
         raise PermissionError(
-            "checkpoint observed scopes are not development-only"
+            "checkpoint validation and observed scopes are inconsistent"
         )
     subject = _positive_int(
         value["subject"], "checkpoint subject"
@@ -2791,7 +2811,12 @@ def _validate_loaded_checkpoint(
         value["input_hashes"],
         "input_hashes",
     )
-    if set(hashes) != _BRAINRW_INPUT_HASH_KEYS:
+    expected_hash_keys = (
+        _BRAINRW_INPUT_HASH_KEYS
+        if value["validation_scope"] == "val-dev"
+        else _BRAINRW_TRAIN_ONLY_INPUT_HASH_KEYS
+    )
+    if set(hashes) != expected_hash_keys:
         raise ValueError(
             "checkpoint input hashes have an unexpected schema"
         )
@@ -2807,6 +2832,14 @@ def _validate_loaded_checkpoint(
     if value["input_bundle_sha256"] != expected_bundle:
         raise ValueError(
             "checkpoint input bundle hash mismatch"
+        )
+    if (
+        value["validation_scope"] == "none"
+        and hashes["validation_policy"]
+        != sha256_json({"validation_scope": "none"})
+    ):
+        raise ValueError(
+            "checkpoint validation policy hash mismatch"
         )
     expected_run_key = make_run_key(
         "brainrw-clip-lora",
@@ -2909,6 +2942,7 @@ def validate_brainrw_checkpoint_identity(
             subject,
             seed,
             str(value["semantic_environment_sha256"]),
+            str(value["validation_scope"]),
         )
     )
     comparisons = {

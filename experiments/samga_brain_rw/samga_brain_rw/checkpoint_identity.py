@@ -302,6 +302,33 @@ def validate_epoch_checkpoint_identity(
     input_hashes = _input_hashes(payload)
     run_manifest = _run_manifest(payload, input_hashes)
     _candidate_spec(payload, input_hashes, run_manifest)
+    observation_keys = {
+        "scope",
+        "validation_scope",
+        "observed_scopes",
+    }
+    present_observation_keys = observation_keys.intersection(payload)
+    if not present_observation_keys:
+        train_only = False
+    else:
+        if present_observation_keys != observation_keys:
+            raise PermissionError(
+                "checkpoint observation policy is incomplete"
+            )
+        if payload["scope"] != "train":
+            raise PermissionError("checkpoint scope must be train")
+        observation = (
+            payload["validation_scope"],
+            tuple(payload["observed_scopes"]),
+        )
+        if observation == ("val-dev", ("train", "val-dev")):
+            train_only = False
+        elif observation == ("none", ("train",)):
+            train_only = True
+        else:
+            raise PermissionError(
+                "checkpoint observation policy is invalid"
+            )
 
     provenance = _mapping(
         envelope.get("provenance"),
@@ -326,6 +353,11 @@ def validate_epoch_checkpoint_identity(
         "checkpoint sidecar metadata",
     )
     _exact_keys(metadata, _METADATA_KEYS, "checkpoint sidecar metadata")
+    expected_scopes = ["train"] if train_only else ["train", "val-dev"]
+    if metadata["observed_scopes"] != expected_scopes:
+        raise ValueError(
+            "checkpoint sidecar observed-scopes binding mismatch"
+        )
     ordered_ids = metadata["ordered_ids"]
     if not isinstance(ordered_ids, list) or any(
         not isinstance(value, str) for value in ordered_ids
@@ -343,7 +375,7 @@ def validate_epoch_checkpoint_identity(
             raise ValueError(
                 f"checkpoint sidecar {role} ordered IDs are invalid"
             )
-        if not values:
+        if not values and (role == "train" or not train_only):
             raise ValueError(
                 f"checkpoint sidecar {role} ordered IDs must be nonempty"
             )
@@ -371,7 +403,7 @@ def validate_epoch_checkpoint_identity(
         raise ValueError(
             "checkpoint sidecar train ordered-ID binding mismatch"
         )
-    if (
+    if not train_only and (
         ordered_ids_sha256(val_dev_ordered_ids)
         != input_hashes["val_dev_ordered_ids_sha256"]
     ):
@@ -380,11 +412,12 @@ def validate_epoch_checkpoint_identity(
         )
 
     records = metadata["source_records"]
-    if not isinstance(records, list) or len(records) != 2:
+    expected_roles = ("train",) if train_only else ("train", "val-dev")
+    if not isinstance(records, list) or len(records) != len(expected_roles):
         raise ValueError(
-            "checkpoint sidecar source_records must contain train and val-dev"
+            "checkpoint sidecar source_records do not match observed scopes"
         )
-    for index, role in enumerate(("train", "val-dev")):
+    for index, role in enumerate(expected_roles):
         record = _mapping(
             records[index],
             f"checkpoint sidecar source record {index}",

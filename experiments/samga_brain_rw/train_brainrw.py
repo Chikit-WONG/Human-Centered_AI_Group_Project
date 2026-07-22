@@ -34,7 +34,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--validation-scope",
         required=True,
-        choices=["val-dev"],
+        choices=["val-dev", "none"],
     )
     parser.add_argument("--subject", required=True, type=int)
     parser.add_argument("--seed", required=True, type=int)
@@ -445,6 +445,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.subject,
         args.seed,
         runtime.semantic_environment_sha256,
+        args.validation_scope,
     )
     resume = None
     if args.resume != "none":
@@ -452,6 +453,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             Path(args.resume),
             requested_scope="train",
         )
+        if (
+            resume.payload["validation_scope"]
+            != args.validation_scope
+        ):
+            raise ValueError("resume checkpoint validation scope mismatch")
         br.validate_brainrw_checkpoint_identity(
             resume.payload,
             config=config,
@@ -566,24 +572,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.seed,
         expected_source_payload_sha256=manifest.source_payload_sha256,
     )
-    val_dataset = br.BrainRWDevelopmentDataset(
-        manifest.path,
-        "val-dev",
-        args.seed,
-        expected_source_payload_sha256=manifest.source_payload_sha256,
-    )
-    if (
-        train_dataset.subject_id != args.subject
-        or val_dataset.subject_id != args.subject
-    ):
+    val_dataset = None
+    if args.validation_scope == "val-dev":
+        val_dataset = br.BrainRWDevelopmentDataset(
+            manifest.path,
+            "val-dev",
+            args.seed,
+            expected_source_payload_sha256=manifest.source_payload_sha256,
+        )
+    if train_dataset.subject_id != args.subject:
         raise ValueError("dataset subject differs from CLI subject")
-    if (
-        len(train_dataset) != sampler.size
-        or len(val_dataset) != manifest.val_dev_row_count
-    ):
+    if len(train_dataset) != sampler.size:
         raise ValueError(
             "dataset row count differs from manifest identity"
         )
+    if val_dataset is not None:
+        if val_dataset.subject_id != args.subject:
+            raise ValueError("dataset subject differs from CLI subject")
+        if len(val_dataset) != manifest.val_dev_row_count:
+            raise ValueError(
+                "dataset row count differs from manifest identity"
+            )
     base_data_order_sha256 = br.data_order_sha256(
         train_dataset,
         sampler,
@@ -645,18 +654,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if not produced_batch:
             raise ValueError("training loader produced no batches")
 
-    (
-        metrics,
-        validation_similarity,
-        validation_identifiers,
-    ) = _validation_metrics(
-        model,
-        val_dataset,
-        processor,
-        batch_size=batch_size,
-        device=device,
-        dtype=runtime_dtype,
-    )
+    if val_dataset is None:
+        metrics = {
+            "performed": False,
+            "validation_scope": "none",
+        }
+        validation_similarity = None
+        validation_identifiers = None
+    else:
+        (
+            metrics,
+            validation_similarity,
+            validation_identifiers,
+        ) = _validation_metrics(
+            model,
+            val_dataset,
+            processor,
+            batch_size=batch_size,
+            device=device,
+            dtype=runtime_dtype,
+        )
     final_git_provenance = _git_provenance()
     if final_git_provenance != initial_git_provenance:
         raise RuntimeError(
@@ -670,8 +687,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "complete": True,
         "training_complete": training_complete,
         "scope": "train",
-        "validation_scope": "val-dev",
-        "observed_scopes": ["train", "val-dev"],
+        "validation_scope": args.validation_scope,
+        "observed_scopes": (
+            ["train", "val-dev"]
+            if args.validation_scope == "val-dev"
+            else ["train"]
+        ),
         "subject": args.subject,
         "seed": args.seed,
         "config_path": str(config.path),
@@ -748,7 +769,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         manifest,
     )
     training_smoke_score_directory: str | None = None
-    if not training_complete:
+    if not training_complete and val_dataset is not None:
         training_smoke_score_directory = "training_smoke/in_loop"
         ScoreArtifact.save(
             output / "training_smoke" / "in_loop",
@@ -798,8 +819,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "complete": True,
         "training_complete": training_complete,
         "scope": "train",
-        "validation_scope": "val-dev",
-        "observed_scopes": ["train", "val-dev"],
+        "validation_scope": args.validation_scope,
+        "observed_scopes": (
+            ["train", "val-dev"]
+            if args.validation_scope == "val-dev"
+            else ["train"]
+        ),
         "subject": args.subject,
         "seed": args.seed,
         "run_key": run_key,

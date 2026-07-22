@@ -564,6 +564,17 @@ def test_config_and_run_identity_bind_preprocessor_and_source_payload(
         42,
         semantic_environment_sha256,
     )
+    assert "validation_policy" not in hashes
+    train_only_run_key, _, train_only_hashes = br.brainrw_run_key(
+        config,
+        _identity(),
+        1,
+        42,
+        semantic_environment_sha256,
+        "none",
+    )
+    assert "validation_policy" in train_only_hashes
+    assert train_only_run_key != run_key
     changed_environment = dict(PINNED_SEMANTIC_ENVIRONMENT)
     changed_environment["transformers"] = "0.0.0"
     changed_environment_sha256 = hashlib.sha256(
@@ -1880,3 +1891,32 @@ def test_cpu_one_step_smoke_persists_complete_resume_state_and_hashes(
     assert len(git_checks) == 4
     assert weights_only_modes
     assert all(mode is True for mode in weights_only_modes)
+
+    observed_scopes: list[str] = []
+
+    class _TrackingDataset(_TinyDataset):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            observed_scopes.append(str(args[1]))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(br, "BrainRWDevelopmentDataset", _TrackingDataset)
+    train_only_output = tmp_path / "run-train-only"
+    train_only_args = arguments.copy()
+    train_only_args[train_only_args.index("val-dev")] = "none"
+    train_only_args[train_only_args.index(str(first))] = str(train_only_output)
+    assert train.main(train_only_args) == 0
+    train_only_payload = br.load_brainrw_checkpoint(
+        train_only_output / "checkpoint.pt", requested_scope="train"
+    ).payload
+    assert train_only_payload["validation_scope"] == "none"
+    assert train_only_payload["observed_scopes"] == ["train"]
+    assert train_only_payload["validation_metrics"] == {
+        "performed": False,
+        "validation_scope": "none",
+    }
+    train_only_manifest = json.loads(
+        (train_only_output / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert train_only_manifest["training_smoke_score_directory"] is None
+    assert not (train_only_output / "training_smoke").exists()
+    assert observed_scopes == ["train"]

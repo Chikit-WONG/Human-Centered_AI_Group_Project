@@ -452,13 +452,16 @@ def _production_environment_binding() -> dict[str, object]:
     )
 
 
-def test_train_parser_requires_locked_development_arguments(tmp_path: Path) -> None:
+@pytest.mark.parametrize("validation_scope", ["val-dev", "none"])
+def test_train_parser_requires_locked_development_arguments(
+    tmp_path: Path, validation_scope: str
+) -> None:
     args = samga_train.parse_arguments(
         [
             "--scope",
             "train",
             "--validation-scope",
-            "val-dev",
+            validation_scope,
             "--stage",
             "0",
             "--subject",
@@ -480,7 +483,7 @@ def test_train_parser_requires_locked_development_arguments(tmp_path: Path) -> N
         ]
     )
     assert args.scope == "train"
-    assert args.validation_scope == "val-dev"
+    assert args.validation_scope == validation_scope
     assert args.subject == 8
     assert args.seed == 42
     assert args.resume == "none"
@@ -1174,19 +1177,23 @@ def _manifest_identity(tmp_path: Path) -> ManifestIdentity:
     )
 
 
-def _checkpoint_payload(tmp_path: Path) -> dict[str, object]:
+def _checkpoint_payload(
+    tmp_path: Path,
+    *,
+    validation_scope: str = "val-dev",
+) -> dict[str, object]:
+    if validation_scope not in ("val-dev", "none"):
+        raise ValueError("invalid fixture validation scope")
     manifest = _manifest_identity(tmp_path)
+    ordered_ids = list(manifest.train_ordered_ids)
+    if validation_scope == "val-dev":
+        ordered_ids.extend(manifest.val_dev_ordered_ids)
     input_hashes = {
         "cache_sha256": _h("cache"),
         "checkpoint_sha256": _h("no-initial-checkpoint"),
         "manifest_sha256": manifest.manifest_sha256,
         "model_sha256": _h("model"),
-        "ordered_ids_sha256": samga_train.ordered_ids_sha256(
-            [
-                *manifest.train_ordered_ids,
-                *manifest.val_dev_ordered_ids,
-            ]
-        ),
+        "ordered_ids_sha256": samga_train.ordered_ids_sha256(ordered_ids),
         "protocol_sha256": manifest.protocol_sha256,
         "records_sha256": manifest.records_sha256,
         "source_manifest_sha256": manifest.source_manifest_sha256,
@@ -1257,6 +1264,22 @@ def _checkpoint_payload(tmp_path: Path) -> dict[str, object]:
         optimizer,
         lambda _: 1.0,
     )
+    if validation_scope == "none":
+        validation_metrics = {
+            "performed": False,
+            "validation_scope": "none",
+        }
+    else:
+        validation_metrics = {
+            "query_count": 2,
+            "gallery_count": 2,
+            "top1_count": 1,
+            "top5_count": 2,
+            "top1_rate": 0.5,
+            "top5_rate": 1.0,
+            "router_mode": "global",
+            "similarity": "cosine",
+        }
     payload = samga_train.build_epoch_checkpoint(
         model=model,
         optimizer=optimizer,
@@ -1270,16 +1293,7 @@ def _checkpoint_payload(tmp_path: Path) -> dict[str, object]:
         trajectory_sha256=_h("trajectory"),
         data_order_sha256=_h("order"),
         generator=generator,
-        validation_metrics={
-            "query_count": 2,
-            "gallery_count": 2,
-            "top1_count": 1,
-            "top5_count": 2,
-            "top1_rate": 0.5,
-            "top5_rate": 1.0,
-            "router_mode": "global",
-            "similarity": "cosine",
-        },
+        validation_metrics=validation_metrics,
         input_hashes=input_hashes,
         environment=_production_environment_binding(),
         effective_batch=512,
@@ -1369,6 +1383,34 @@ def test_samga_checkpoint_bundle_is_exclusive_typed_and_reloadable(
         )
 
 
+def test_train_only_checkpoint_round_trip_records_only_train_scope(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "checkpoint_epoch001_step00000001.pt"
+    payload = _checkpoint_payload(
+        tmp_path, validation_scope="none"
+    )
+    samga_train.save_samga_checkpoint(
+        path, payload, _manifest_identity(tmp_path)
+    )
+    serialized = torch.load(path, map_location="cpu", weights_only=True)
+    assert serialized["validation_scope"] == "none"
+    assert serialized["observed_scopes"] == ["train"]
+    envelope = json.loads(
+        samga_train.samga_checkpoint_sidecar(path).read_text(encoding="utf-8")
+    )
+    assert envelope["metadata"]["observed_scopes"] == ["train"]
+    assert envelope["metadata"]["val_dev_ordered_ids"] == []
+    assert [
+        record["role"] for record in envelope["metadata"]["source_records"]
+    ] == ["train"]
+    loaded = samga_train.load_samga_checkpoint(path, requested_scope="train")
+    assert loaded.payload["validation_metrics"] == {
+        "performed": False,
+        "validation_scope": "none",
+    }
+
+
 def test_samga_checkpoint_loader_rejects_resigned_semantic_conflict(
     tmp_path: Path,
 ) -> None:
@@ -1453,6 +1495,24 @@ def test_run_manifest_is_canonical_and_binds_all_inputs() -> None:
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     assert first["run_manifest_sha256"] == expected
+
+
+def test_train_only_input_hashes_bind_only_train_ids(tmp_path: Path) -> None:
+    manifest = _manifest_identity(tmp_path)
+    config = SimpleNamespace(
+        cache_sha256=_h("cache"),
+        model_sha256=_h("model"),
+    )
+    development = samga_train._build_input_hashes(manifest, config)
+    train_only = samga_train._build_input_hashes(
+        manifest, config, validation_scope="none"
+    )
+
+    assert development["ordered_ids_sha256"] == samga_train.ordered_ids_sha256(
+        [*manifest.train_ordered_ids, *manifest.val_dev_ordered_ids]
+    )
+    assert train_only["ordered_ids_sha256"] == manifest.train_ordered_ids_sha256
+    assert development["ordered_ids_sha256"] != train_only["ordered_ids_sha256"]
 
 
 def test_cached_dataset_factory_reuses_each_verified_role(
@@ -1591,10 +1651,17 @@ def test_resolved_candidate_hashes_the_complete_runtime_environment() -> None:
         **common,
         environment_binding=changed_environment,
     )
+    train_only = samga_train.build_resolved_candidate_payload(
+        **common,
+        environment_binding=first_environment,
+        validation_scope="none",
+    )
 
     assert first["runtime"]["environment"] == first_environment
     assert changed["runtime"]["environment"] == changed_environment
     assert samga_train.sha256_json(first) != samga_train.sha256_json(changed)
+    assert train_only["runtime"]["force_global_validation"] is False
+    assert samga_train.sha256_json(first) != samga_train.sha256_json(train_only)
     assert first["runtime"]["environment"]["runtime_contract"]["device"] == "cuda:0"
     assert (
         first["runtime"]["environment"]["semantic_environment"]["HF_DATASETS_OFFLINE"]

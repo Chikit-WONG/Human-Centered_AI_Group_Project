@@ -707,6 +707,31 @@ def test_cpu_one_step_smoke_uses_protocol_scopes_and_global_validation(
     assert True in result.model.base.router.calls
 
 
+def test_train_only_mode_never_opens_validation_scope(
+    tmp_path: Path,
+    components: UpstreamComponents,
+) -> None:
+    factory = _DatasetFactory(train_size=6, val_size=3)
+    result = run_training_cell(
+        _spec(
+            tmp_path,
+            components,
+            factory,
+            validation_scope="none",
+        )
+    )
+
+    assert result.global_step == 1
+    assert result.completed is False
+    assert result.final_validation is None
+    assert [call["scope"] for call in factory.calls] == ["train"]
+    assert result.final_checkpoint["validation_metrics"] == {
+        "performed": False,
+        "validation_scope": "none",
+    }
+    assert True not in result.model.base.router.calls
+
+
 def test_fresh_optimizer_groups_match_complete_locked_adamw_recipe(
     tmp_path: Path,
     components: UpstreamComponents,
