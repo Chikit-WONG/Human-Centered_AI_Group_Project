@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import ctypes
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +19,8 @@ from .provenance import sha256_file
 
 
 _ARTIFACT_FILES = frozenset({"metadata.json", "similarity.npy"})
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 _ID_FIELDS = (
     "query_ids",
     "gallery_entry_ids",
@@ -144,7 +148,7 @@ def write_score_artifact(directory: Path, artifact: ScoreArtifact) -> None:
         _fsync_directory(temporary)
         if _lexists(directory):
             raise FileExistsError(f"score artifact already exists: {directory}")
-        os.rename(temporary, directory)
+        _rename_directory_noreplace(temporary, directory)
         _fsync_directory(parent)
     finally:
         if _lexists(temporary):
@@ -273,6 +277,56 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish ``source`` only when ``destination`` is absent."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise RuntimeError(
+            "atomic score publication requires Linux renameat2(RENAME_NOREPLACE)"
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+
+    ctypes.set_errno(0)
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            os.fspath(destination),
+        )
+    unavailable_errors = {
+        errno.EINVAL,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    if error_number in unavailable_errors:
+        raise RuntimeError(
+            "atomic score publication requires Linux renameat2(RENAME_NOREPLACE)"
+        ) from OSError(error_number, os.strerror(error_number))
+    raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
 
 
 def _lexists(path: Path) -> bool:

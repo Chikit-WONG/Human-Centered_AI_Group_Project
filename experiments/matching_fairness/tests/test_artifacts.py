@@ -86,6 +86,19 @@ def test_targets_are_resolved_by_canonical_id_not_diagonal() -> None:
     assert independent_ranks(artifact).tolist() == [1, 1]
 
 
+def test_highest_scoring_duplicate_canonical_entry_determines_rank() -> None:
+    artifact = ScoreArtifact(
+        similarity=np.array([[0.95, 0.2, 0.9, 0.1]]),
+        query_ids=("q-target",),
+        gallery_entry_ids=("distractor-0", "target-a", "target-b", "distractor-1"),
+        gallery_canonical_ids=("other-0", "target", "target", "other-1"),
+        target_canonical_ids=("target",),
+        metadata={"model_slug": "fixture"},
+    )
+
+    assert independent_ranks(artifact).tolist() == [2]
+
+
 def test_write_creates_exact_canonical_bundle_with_audit_hashes(
     tmp_path: Path,
 ) -> None:
@@ -232,6 +245,40 @@ def test_write_is_exclusive_and_preserves_existing_artifact(tmp_path: Path) -> N
         write_score_artifact(directory, _artifact(similarity=2 * np.eye(2)))
 
     assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+
+
+def test_write_atomically_preserves_destination_created_during_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "score"
+    marker = tmp_path / "existing-destination.marker"
+    real_lexists = artifact_module._lexists
+    destination_checks = 0
+
+    def inject_racing_destination(path: Path) -> bool:
+        nonlocal destination_checks
+        if Path(path) == directory:
+            destination_checks += 1
+            if destination_checks == 2:
+                directory.mkdir()
+                marker.write_text(str(directory.stat().st_ino), encoding="utf-8")
+                return False
+        return real_lexists(path)
+
+    monkeypatch.setattr(artifact_module, "_lexists", inject_racing_destination)
+
+    with pytest.raises(FileExistsError):
+        write_score_artifact(directory, _artifact())
+
+    assert destination_checks == 2
+    assert directory.is_dir()
+    assert list(directory.iterdir()) == []
+    assert marker.read_text(encoding="utf-8") == str(directory.stat().st_ino)
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "existing-destination.marker",
+        "score",
+    }
 
 
 def test_failed_write_does_not_publish_partial_artifact(
