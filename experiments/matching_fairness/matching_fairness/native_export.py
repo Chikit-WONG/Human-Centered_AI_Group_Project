@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 
 import numpy as np
@@ -18,6 +19,7 @@ import torch
 from .artifacts import (
     ScoreArtifact,
     independent_ranks,
+    publish_staged_directory,
     read_score_artifact,
     write_score_artifact,
 )
@@ -328,20 +330,33 @@ def export_native_scores(config: NativeExportConfig) -> NativeExportResult:
                 "asset_lock": asset_lock["provenance"],
                 "checkpoint_manifest_sha256": checkpoint_manifest_hash,
                 "input_sha256": dict(inputs.input_hashes),
+                "trial_manifest_sha256": inputs.input_hashes["trial_manifest"],
+                "subject": config.subject,
+                "seed": 42,
             },
         )
     _validate_native_artifacts(artifacts, config.expected_image_count)
 
     config.output_dir.parent.mkdir(parents=True, exist_ok=True)
-    config.output_dir.mkdir()
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{config.output_dir.name}.tmp-",
+            dir=config.output_dir.parent,
+        )
+    )
     artifact_paths: dict[str, Path] = {}
     artifact_hashes: dict[str, str] = {}
-    for artifact_name in _ARTIFACT_HALVES:
-        path = config.output_dir / artifact_name
-        write_score_artifact(path, artifacts[artifact_name])
-        read_score_artifact(path)
-        artifact_paths[artifact_name] = path
-        artifact_hashes[artifact_name] = _score_artifact_sha256(path)
+    try:
+        for artifact_name in _ARTIFACT_HALVES:
+            staged_path = staging / artifact_name
+            write_score_artifact(staged_path, artifacts[artifact_name])
+            read_score_artifact(staged_path)
+            artifact_paths[artifact_name] = config.output_dir / artifact_name
+            artifact_hashes[artifact_name] = _score_artifact_sha256(staged_path)
+        publish_staged_directory(staging, config.output_dir)
+    finally:
+        if os.path.lexists(staging):
+            shutil.rmtree(staging)
     return NativeExportResult(
         artifact_paths=artifact_paths,
         artifact_hashes=artifact_hashes,
@@ -888,10 +903,36 @@ def _formal_artifact_inventory(
             expected_image_count,
         ):
             raise ValueError("formal artifact matrix must match canonical image count")
+        expected_role = (
+            "fixed_formal" if model == "our_project" else "val_selected_formal"
+        )
+        if artifact.metadata.get("checkpoint_role") != expected_role:
+            raise ValueError(f"formal artifact checkpoint role mismatch: {key}")
+        if (
+            artifact.metadata.get("subject") != "sub-08"
+            or artifact.metadata.get("seed") != 42
+        ):
+            raise ValueError(f"formal artifact subject/seed mismatch: {key}")
+        if not (
+            artifact.query_ids
+            == artifact.target_canonical_ids
+            == artifact.gallery_entry_ids
+            == artifact.gallery_canonical_ids
+        ):
+            raise ValueError("formal artifacts require canonical query/target/gallery order")
         if common_gallery is None:
             common_gallery = artifact.gallery_canonical_ids
         elif artifact.gallery_canonical_ids != common_gallery:
             raise ValueError("formal artifacts must share canonical gallery order")
+        ranks = independent_ranks(artifact)
+        expected_metrics = {
+            "top1_count": int(np.count_nonzero(ranks <= 1)),
+            "top5_count": int(np.count_nonzero(ranks <= 5)),
+            "sample_count": len(ranks),
+        }
+        if artifact.metadata.get("native_metrics") != expected_metrics:
+            raise ValueError(f"formal artifact metric parity failed: {key}")
+        _validate_formal_artifact_provenance(artifact, str(model))
         entries.append(
             {
                 "model_slug": model,
@@ -906,6 +947,109 @@ def _formal_artifact_inventory(
         entries,
         key=lambda entry: (str(entry["model_slug"]), str(entry["trial_half"])),
     )
+
+
+def _validate_formal_artifact_provenance(
+    artifact: ScoreArtifact,
+    model: str,
+) -> None:
+    metadata = artifact.metadata
+    for field in ("query_embeddings_sha256", "trial_manifest_sha256"):
+        if not _is_sha256(metadata.get(field)):
+            raise ValueError(f"formal artifact lacks immutable {field}")
+    if model in {"nice", "atm_s"}:
+        for field in (
+            "checkpoint_sha256",
+            "checkpoint_manifest_sha256",
+            "asset_lock_manifest_sha256",
+        ):
+            if not _is_sha256(metadata.get(field)):
+                raise ValueError(f"native formal artifact lacks immutable {field}")
+        source = metadata.get("source_lock")
+        if not isinstance(source, Mapping) or set(source) != {
+            "url", "branch", "commit", "checkout_sha256"
+        }:
+            raise ValueError("native formal artifact source lock is incomplete")
+        if not _is_sha256(source.get("checkout_sha256")):
+            raise ValueError("native formal artifact source checkout hash is invalid")
+        if (
+            not isinstance(source.get("url"), str)
+            or not source["url"]
+            or source.get("branch") != "develop"
+            or not isinstance(source.get("commit"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", source["commit"]) is None
+        ):
+            raise ValueError("native formal artifact source identity is invalid")
+        inputs = metadata.get("input_sha256")
+        if not isinstance(inputs, Mapping) or set(inputs) != {
+            "test_eeg", "test_features", "trial_manifest"
+        } or not all(_is_sha256(value) for value in inputs.values()):
+            raise ValueError("native formal artifact input provenance is incomplete")
+        if inputs["trial_manifest"] != metadata["trial_manifest_sha256"]:
+            raise ValueError("native formal artifact trial manifest hashes disagree")
+        _validate_embedded_asset_lock(metadata.get("asset_lock"))
+        if (
+            metadata.get("logit_scale_type") != "exp"
+            or not isinstance(metadata.get("checkpoint"), str)
+        ):
+            raise ValueError("native formal artifact checkpoint semantics are incomplete")
+        return
+
+    if model != "our_project":
+        raise ValueError(f"unsupported formal artifact model: {model}")
+    for field in (
+        "checkpoint_content_sha256",
+        "brain_test_sha256",
+        "evaluator_sha256",
+        "protocol_sha256",
+    ):
+        if not _is_sha256(metadata.get(field)):
+            raise ValueError(f"BrainRW formal artifact lacks immutable {field}")
+    content = metadata.get("model_content_sha256")
+    if not isinstance(content, Mapping) or set(content) != {
+        "brain_model", "vision_adapter", "pretrained_vision_base"
+    } or not all(_is_sha256(value) for value in content.values()):
+        raise ValueError("BrainRW model content provenance is incomplete")
+    if content["brain_model"] != metadata["checkpoint_content_sha256"]:
+        raise ValueError("BrainRW checkpoint content hashes disagree")
+    if metadata.get("evaluator_version") != "AIAA3800-BRAINRW-FORMAL-v1":
+        raise ValueError("BrainRW evaluator identity is invalid")
+    if (
+        metadata.get("similarity") != "cosine"
+        or not isinstance(metadata.get("checkpoint"), str)
+    ):
+        raise ValueError("BrainRW formal scoring semantics are incomplete")
+
+
+def _validate_embedded_asset_lock(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "repo_id", "repo_type", "asset_root", "files"
+    }:
+        raise ValueError("native formal artifact asset lock provenance is incomplete")
+    if (
+        value["repo_id"] != _ASSET_REPO_ID
+        or value["repo_type"] != "dataset"
+        or not isinstance(value["asset_root"], str)
+        or not value["asset_root"]
+    ):
+        raise ValueError("native formal artifact asset lock identity is invalid")
+    files = value["files"]
+    if not isinstance(files, Mapping) or set(files) != set(_ASSET_RELATIVE_PATHS):
+        raise ValueError("native formal artifact asset file ledger is incomplete")
+    for entry in files.values():
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"bytes", "sha256"}
+            or isinstance(entry["bytes"], bool)
+            or not isinstance(entry["bytes"], int)
+            or entry["bytes"] < 0
+            or not _is_sha256(entry["sha256"])
+        ):
+            raise ValueError("native formal artifact asset file entry is invalid")
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def _resolve_device(value: str) -> torch.device:

@@ -155,6 +155,21 @@ def write_score_artifact(directory: Path, artifact: ScoreArtifact) -> None:
             shutil.rmtree(temporary)
 
 
+def publish_staged_directory(staging: Path, destination: Path) -> None:
+    """Atomically publish a complete sibling directory without replacement."""
+    staging = Path(staging)
+    destination = Path(destination)
+    if staging.parent.resolve() != destination.parent.resolve():
+        raise ValueError("staging and destination must be siblings")
+    if staging.is_symlink() or not staging.is_dir():
+        raise ValueError("staging must be a regular directory")
+    if _lexists(destination):
+        raise FileExistsError(f"publication destination exists: {destination}")
+    _fsync_directory(staging)
+    _rename_directory_noreplace(staging, destination)
+    _fsync_directory(destination.parent)
+
+
 def read_score_artifact(directory: Path) -> ScoreArtifact:
     """Load a complete bundle after verifying its matrix and ordered-ID hashes."""
 

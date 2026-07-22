@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -267,22 +268,63 @@ def test_standard_parser_defaults_preserve_existing_mode() -> None:
 
 
 
-def test_brainrw_score_artifact_uses_canonical_id_targets() -> None:
+def test_brainrw_score_artifact_uses_canonical_id_targets(
+    tmp_path: Path,
+) -> None:
     similarity = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    brain_model = tmp_path / "brain-model"
+    adapter = tmp_path / "adapter"
+    vision_base = tmp_path / "vision-base"
+    for directory, content in (
+        (brain_model, b"brain"),
+        (adapter, b"adapter"),
+        (vision_base, b"vision"),
+    ):
+        directory.mkdir()
+        (directory / "weights.bin").write_bytes(content)
+    brain_test = tmp_path / "test.pt"
+    brain_test.write_bytes(b"test eeg")
+    trial_manifest = _trial_manifest(tmp_path / "trials.json")
+    evaluator = tmp_path / "evaluate_retrieval.py"
+    evaluator.write_text("# sealed evaluator\n", encoding="utf-8")
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text(
+        json.dumps({"subject": "sub-08", "seed": 42}),
+        encoding="utf-8",
+    )
 
     artifact = build_brainrw_score_artifact(
         similarity=similarity,
         query_embeddings=np.eye(2, dtype=np.float32),
-        query_ids=("image-a", "image-b"),
-        gallery_ids=("image-b", "image-a"),
+        query_ids=("image-0", "image-1"),
+        gallery_ids=("image-1", "image-0"),
         trial_half="a",
-        brain_model_path=Path("formal-brainrw"),
+        brain_model_path=brain_model,
+        vision_adapter_path=adapter,
+        pretrained_model_path=vision_base,
+        brain_test_path=brain_test,
+        trial_manifest_path=trial_manifest,
+        protocol_path=protocol,
+        subject="sub-08",
+        seed=42,
+        evaluator_path=evaluator,
         top1_count=2,
         top5_count=2,
     )
 
-    assert artifact.target_canonical_ids == ("image-a", "image-b")
-    assert artifact.gallery_canonical_ids == ("image-b", "image-a")
+    assert artifact.target_canonical_ids == ("image-0", "image-1")
+    assert set(artifact.metadata["model_content_sha256"]) == {
+        "brain_model",
+        "vision_adapter",
+        "pretrained_vision_base",
+    }
+    assert len(artifact.metadata["trial_manifest_sha256"]) == 64
+    assert len(artifact.metadata["brain_test_sha256"]) == 64
+    assert len(artifact.metadata["protocol_sha256"]) == 64
+    assert len(artifact.metadata["evaluator_sha256"]) == 64
+    assert artifact.metadata["subject"] == "sub-08"
+    assert artifact.metadata["seed"] == 42
+    assert artifact.gallery_canonical_ids == ("image-1", "image-0")
     assert artifact.metadata["model_slug"] == "our_project"
     assert artifact.metadata["trial_half"] == "a"
     assert len(artifact.metadata["query_embeddings_sha256"]) == 64

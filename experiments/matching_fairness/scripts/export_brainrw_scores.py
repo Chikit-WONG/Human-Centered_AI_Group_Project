@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,8 +16,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if str(EXPERIMENT_ROOT) not in sys.path:
     sys.path.insert(0, str(EXPERIMENT_ROOT))
 
-from matching_fairness.artifacts import read_score_artifact  # noqa: E402
+from matching_fairness.artifacts import (  # noqa: E402
+    publish_staged_directory,
+    read_score_artifact,
+)
 from matching_fairness.provenance import sha256_file  # noqa: E402
+
+
+DEFAULT_PROTOCOL = EXPERIMENT_ROOT / "configs/protocol_sub08_seed42.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selected-channels", required=True)
     parser.add_argument("--trial-split-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--protocol", type=Path, default=DEFAULT_PROTOCOL)
     parser.add_argument("--dataset-name", default="things")
     parser.add_argument("--subject-id", type=int, default=8)
     parser.add_argument("--time-slice", default="0,250")
@@ -86,6 +96,10 @@ def build_evaluator_commands(
         str(arguments.seed),
         "--expected-num-samples",
         str(arguments.expected_num_samples),
+        "--score-provenance-manifest",
+        str(arguments.trial_split_manifest),
+        "--score-protocol",
+        str(arguments.protocol),
     ]
     if arguments.local_files_only:
         common.append("--local-files-only")
@@ -125,52 +139,82 @@ def build_evaluator_commands(
     return commands
 
 
-def main() -> None:
-    arguments = build_parser().parse_args()
+def export_brainrw_scores(
+    arguments: argparse.Namespace,
+    *,
+    runner=subprocess.run,
+) -> dict[str, dict[str, str]]:
     if arguments.output_dir.exists():
         raise FileExistsError(f"output directory already exists: {arguments.output_dir}")
-    arguments.output_dir.mkdir(parents=True)
-    commands = build_evaluator_commands(arguments)
-    for command in commands.values():
-        subprocess.run(command, check=True)
-
-    artifacts = {
-        name: read_score_artifact(arguments.output_dir / name)
-        for name in commands
-    }
-    expected_shape = (
-        arguments.expected_num_samples,
-        arguments.expected_num_samples,
-    )
-    gallery_ids = artifacts["standard"].gallery_canonical_ids
-    for artifact in artifacts.values():
-        if artifact.similarity.shape != expected_shape:
-            raise ValueError("BrainRW score artifact has an invalid matrix shape")
-        if artifact.gallery_canonical_ids != gallery_ids:
-            raise ValueError("BrainRW artifacts do not share canonical gallery order")
-    if (
-        artifacts["eeg_a"].metadata.get("query_embeddings_sha256")
-        == artifacts["eeg_b"].metadata.get("query_embeddings_sha256")
-    ):
-        raise ValueError("BrainRW EEG-A and EEG-B query embeddings are identical")
-
-    inventory = {
-        name: {
-            "path": str(arguments.output_dir / name),
-            "sha256": _artifact_sha256(arguments.output_dir / name),
-        }
-        for name in commands
-    }
-    manifest = arguments.output_dir / "export_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {"schema_version": 1, "model_slug": "our_project", "artifacts": inventory},
-            indent=2,
-            sort_keys=True,
+    arguments.output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{arguments.output_dir.name}.tmp-",
+            dir=arguments.output_dir.parent,
         )
-        + "\n",
-        encoding="utf-8",
     )
+    try:
+        staged_values = vars(arguments).copy()
+        staged_values["output_dir"] = staging
+        staged_arguments = argparse.Namespace(**staged_values)
+        commands = build_evaluator_commands(staged_arguments)
+        for command in commands.values():
+            runner(command, check=True)
+
+        artifacts = {
+            name: read_score_artifact(staging / name)
+            for name in commands
+        }
+        expected_shape = (
+            arguments.expected_num_samples,
+            arguments.expected_num_samples,
+        )
+        gallery_ids = artifacts["standard"].gallery_canonical_ids
+        for artifact in artifacts.values():
+            if artifact.similarity.shape != expected_shape:
+                raise ValueError("BrainRW score artifact has an invalid matrix shape")
+            if artifact.gallery_canonical_ids != gallery_ids:
+                raise ValueError("BrainRW artifacts do not share canonical gallery order")
+        if (
+            artifacts["eeg_a"].metadata.get("query_embeddings_sha256")
+            == artifacts["eeg_b"].metadata.get("query_embeddings_sha256")
+        ):
+            raise ValueError("BrainRW EEG-A and EEG-B query embeddings are identical")
+
+        inventory = {
+            name: {
+                "path": str(arguments.output_dir / name),
+                "sha256": _artifact_sha256(staging / name),
+            }
+            for name in commands
+        }
+        manifest = staging / "export_manifest.json"
+        encoded = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "model_slug": "our_project",
+                    "artifacts": inventory,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        with manifest.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        publish_staged_directory(staging, arguments.output_dir)
+        return inventory
+    finally:
+        if os.path.lexists(staging):
+            shutil.rmtree(staging)
+
+
+def main() -> None:
+    arguments = build_parser().parse_args()
+    inventory = export_brainrw_scores(arguments)
     print(json.dumps(inventory, indent=2, sort_keys=True))
 
 

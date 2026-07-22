@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from matching_fairness.provenance import inspect_checkout, sha256_file
+from matching_fairness.provenance import inspect_checkout, sha256_file, sha256_path
 from scripts.fetch_assets import (
     ASSET_RELATIVE_PATHS,
     HF_DATASET_REPO,
@@ -34,6 +34,30 @@ REQUIRED_SOURCE_FILES = (
     "encoder_utils.py",
     "models/atms.py",
 )
+
+
+def test_sha256_path_binds_directory_names_and_contents(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    (model / "nested").mkdir(parents=True)
+    (model / "config.json").write_text("one", encoding="utf-8")
+    (model / "nested/weights.bin").write_bytes(b"weights")
+
+    original = sha256_path(model)
+    (model / "config.json").write_text("two", encoding="utf-8")
+
+    assert sha256_path(model) != original
+    assert sha256_path(model / "config.json") == sha256_file(model / "config.json")
+
+
+def test_sha256_path_rejects_symlinked_model_members(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    (model / "weights.bin").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        sha256_path(model)
 
 
 def _git(checkout: Path, *arguments: str) -> None:

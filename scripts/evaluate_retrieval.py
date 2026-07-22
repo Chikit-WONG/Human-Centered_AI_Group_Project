@@ -44,15 +44,18 @@ from main.data import (  # noqa: E402
 from main.models_clip import BrainCLIPModel  # noqa: E402
 from matching_fairness.trial_splits import (  # noqa: E402
     trial_indices_by_image as validated_trial_indices_by_image,
+    validate_trial_manifest,
 )
 from matching_fairness.artifacts import (  # noqa: E402
     ScoreArtifact,
     independent_ranks,
     write_score_artifact,
 )
+from matching_fairness.provenance import sha256_file, sha256_path  # noqa: E402
 
 HUNGARIAN_PRIMARY_ORDER_SEED = 3800
 HUNGARIAN_AUDIT_ORDER_SEEDS = tuple(range(3801, 3809))
+EVALUATOR_VERSION = "AIAA3800-BRAINRW-FORMAL-v1"
 
 
 def build_brainrw_score_artifact(
@@ -63,6 +66,14 @@ def build_brainrw_score_artifact(
     gallery_ids: Sequence[str],
     trial_half: str,
     brain_model_path: Path,
+    vision_adapter_path: Path,
+    pretrained_model_path: Path,
+    brain_test_path: Path,
+    trial_manifest_path: Path,
+    protocol_path: Path,
+    subject: str,
+    seed: int,
+    evaluator_path: Path,
     top1_count: int,
     top5_count: int,
 ) -> ScoreArtifact:
@@ -71,6 +82,27 @@ def build_brainrw_score_artifact(
         raise ValueError("trial_half must be standard, a, or b")
     query_ids = tuple(query_ids)
     gallery_ids = tuple(gallery_ids)
+    if subject != "sub-08" or seed != 42:
+        raise ValueError("formal BrainRW artifacts require sub-08 seed 42")
+    try:
+        trial_manifest = json.loads(
+            Path(trial_manifest_path).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid BrainRW trial provenance manifest") from error
+    if not isinstance(trial_manifest, Mapping):
+        raise ValueError("BrainRW trial provenance manifest must be a mapping")
+    validate_trial_manifest(trial_manifest, query_ids)
+    try:
+        protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid BrainRW formal protocol") from error
+    if (
+        not isinstance(protocol, Mapping)
+        or protocol.get("subject") != subject
+        or protocol.get("seed") != seed
+    ):
+        raise ValueError("BrainRW formal protocol subject/seed mismatch")
     artifact = ScoreArtifact(
         similarity=np.ascontiguousarray(similarity, dtype=np.float32),
         query_ids=query_ids,
@@ -82,8 +114,21 @@ def build_brainrw_score_artifact(
             "trial_half": trial_half,
             "checkpoint_role": "fixed_formal",
             "checkpoint": str(Path(brain_model_path)),
+            "checkpoint_content_sha256": sha256_path(brain_model_path),
             "similarity": "cosine",
             "query_embeddings_sha256": sha256_array(query_embeddings),
+            "subject": subject,
+            "seed": seed,
+            "trial_manifest_sha256": sha256_file(trial_manifest_path),
+            "protocol_sha256": sha256_file(protocol_path),
+            "brain_test_sha256": sha256_file(brain_test_path),
+            "model_content_sha256": {
+                "brain_model": sha256_path(brain_model_path),
+                "vision_adapter": sha256_path(vision_adapter_path),
+                "pretrained_vision_base": sha256_path(pretrained_model_path),
+            },
+            "evaluator_version": EVALUATOR_VERSION,
+            "evaluator_sha256": sha256_file(evaluator_path),
         },
     )
     ranks = independent_ranks(artifact)
@@ -177,6 +222,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-top1-count", type=int)
     parser.add_argument("--trial-split-manifest", type=Path)
     parser.add_argument("--score-artifact-output", type=Path)
+    parser.add_argument("--score-provenance-manifest", type=Path)
+    parser.add_argument("--score-protocol", type=Path)
     parser.add_argument(
         "--trial-half", choices=("standard", "a", "b"), default="standard"
     )
@@ -186,6 +233,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--trial-half standard rejects --trial-split-manifest")
     if args.trial_half in {"a", "b"} and args.trial_split_manifest is None:
         parser.error(f"--trial-half {args.trial_half} requires --trial-split-manifest")
+    if args.score_artifact_output is not None and args.score_provenance_manifest is None:
+        parser.error("--score-artifact-output requires --score-provenance-manifest")
+    if args.score_artifact_output is not None and args.score_protocol is None:
+        parser.error("--score-artifact-output requires --score-protocol")
     if args.enable_hungarian and not args.hungarian_output:
         parser.error("--enable-hungarian requires --hungarian-output")
     if args.enable_hungarian and not args.similarity_output:
@@ -557,6 +608,20 @@ def main() -> None:
             gallery_ids=gallery_ids,
             trial_half=args.trial_half,
             brain_model_path=Path(args.brain_model_path).resolve(),
+            vision_adapter_path=Path(args.vision_adapter_path).resolve(),
+            pretrained_model_path=Path(
+                args.pretrained_model_name_or_path
+            ).resolve(),
+            brain_test_path=(
+                Path(args.brain_directory)
+                / f"sub-{args.subject_id:02d}"
+                / "test.pt"
+            ).resolve(),
+            trial_manifest_path=args.score_provenance_manifest.resolve(),
+            protocol_path=args.score_protocol.resolve(),
+            subject=f"sub-{args.subject_id:02d}",
+            seed=args.seed,
+            evaluator_path=Path(__file__).resolve(),
             top1_count=top1_count,
             top5_count=top5_count,
         )

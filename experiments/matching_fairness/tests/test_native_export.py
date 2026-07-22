@@ -500,6 +500,35 @@ def _complete_formal_inventory(
     for model in ("atm_s", "our_project"):
         for half in ("standard", "a", "b"):
             path = root / "inventory" / model / half
+            metadata = dict(template.metadata)
+            metadata.update(
+                {
+                    "model_slug": model,
+                    "trial_half": half,
+                    "subject": "sub-08",
+                    "seed": 42,
+                }
+            )
+            if model == "our_project":
+                metadata.update(
+                    {
+                        "checkpoint_role": "fixed_formal",
+                        "similarity": "cosine",
+                        "checkpoint_content_sha256": "1" * 64,
+                        "trial_manifest_sha256": template.metadata["input_sha256"][
+                            "trial_manifest"
+                        ],
+                        "brain_test_sha256": "2" * 64,
+                        "protocol_sha256": "6" * 64,
+                        "model_content_sha256": {
+                            "brain_model": "1" * 64,
+                            "vision_adapter": "3" * 64,
+                            "pretrained_vision_base": "4" * 64,
+                        },
+                        "evaluator_version": "AIAA3800-BRAINRW-FORMAL-v1",
+                        "evaluator_sha256": "5" * 64,
+                    }
+                )
             write_score_artifact(
                 path,
                 ScoreArtifact(
@@ -508,11 +537,82 @@ def _complete_formal_inventory(
                     gallery_entry_ids=template.gallery_entry_ids,
                     gallery_canonical_ids=template.gallery_canonical_ids,
                     target_canonical_ids=template.target_canonical_ids,
-                    metadata={"model_slug": model, "trial_half": half},
+                    metadata=metadata,
                 ),
             )
             paths.append(path)
     return tuple(paths)
+
+
+def _replace_inventory_artifact(
+    root: Path,
+    inventory: tuple[Path, ...],
+    *,
+    model: str,
+    half: str,
+    transform: object,
+) -> tuple[Path, ...]:
+    paths = list(inventory)
+    index = next(
+        position
+        for position, path in enumerate(paths)
+        if read_score_artifact(path).metadata.get("model_slug") == model
+        and read_score_artifact(path).metadata.get("trial_half") == half
+    )
+    original = read_score_artifact(paths[index])
+    replacement = transform(original)
+    replacement_path = root / "tampered" / model / half
+    write_score_artifact(replacement_path, replacement)
+    paths[index] = replacement_path
+    return tuple(paths)
+
+
+def test_native_audit_rejects_formal_metric_mismatch(tmp_path: Path) -> None:
+    config = _native_export_config(tmp_path)
+    result = export_native_scores(config)
+    inventory = _complete_formal_inventory(tmp_path, result.artifact_paths)
+
+    def corrupt(artifact: ScoreArtifact) -> ScoreArtifact:
+        metadata = dict(artifact.metadata)
+        metrics = dict(metadata["native_metrics"])
+        metrics["top1_count"] += 1
+        metadata["native_metrics"] = metrics
+        return ScoreArtifact(
+            artifact.similarity,
+            artifact.query_ids,
+            artifact.gallery_entry_ids,
+            artifact.gallery_canonical_ids,
+            artifact.target_canonical_ids,
+            metadata,
+        )
+
+    inventory = _replace_inventory_artifact(
+        tmp_path, inventory, model="our_project", half="standard", transform=corrupt
+    )
+    with pytest.raises(ValueError, match="metric parity"):
+        audit_native_checkpoints(config, inventory)
+
+
+def test_native_audit_rejects_query_target_order_mismatch(tmp_path: Path) -> None:
+    config = _native_export_config(tmp_path)
+    result = export_native_scores(config)
+    inventory = _complete_formal_inventory(tmp_path, result.artifact_paths)
+
+    def corrupt(artifact: ScoreArtifact) -> ScoreArtifact:
+        return ScoreArtifact(
+            artifact.similarity,
+            artifact.query_ids,
+            artifact.gallery_entry_ids,
+            artifact.gallery_canonical_ids,
+            tuple(reversed(artifact.target_canonical_ids)),
+            artifact.metadata,
+        )
+
+    inventory = _replace_inventory_artifact(
+        tmp_path, inventory, model="our_project", half="standard", transform=corrupt
+    )
+    with pytest.raises(ValueError, match="canonical query/target/gallery order"):
+        audit_native_checkpoints(config, inventory)
 
 
 def test_native_export_publishes_main_artifacts_before_separate_audit(
@@ -617,6 +717,9 @@ def test_brainrw_cli_builds_three_separate_evaluator_commands(tmp_path: Path) ->
     assert set(commands) == {"standard", "eeg_a", "eeg_b"}
     standard = commands["standard"]
     assert "--trial-split-manifest" not in standard
+    assert standard[standard.index("--score-provenance-manifest") + 1] == str(
+        manifest
+    )
     assert standard[standard.index("--trial-half") + 1] == "standard"
     for name, half in (("eeg_a", "a"), ("eeg_b", "b")):
         command = commands[name]
@@ -641,3 +744,66 @@ def test_native_export_rejects_manifest_with_extra_canonical_id(
 
     with pytest.raises(ValueError, match="canonical image IDs"):
         export_native_scores(config)
+
+
+def test_native_export_failure_leaves_no_partial_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _native_export_config(tmp_path)
+    real_write = native_export_module.write_score_artifact
+    calls = 0
+
+    def fail_second(path: Path, artifact: ScoreArtifact) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected second-artifact failure")
+        real_write(path, artifact)
+
+    monkeypatch.setattr(native_export_module, "write_score_artifact", fail_second)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        export_native_scores(config)
+    assert not config.output_dir.exists()
+    assert not list(config.output_dir.parent.glob(f".{config.output_dir.name}.tmp-*"))
+
+
+def test_brainrw_export_failure_leaves_no_partial_publication(
+    tmp_path: Path,
+) -> None:
+    from scripts.export_brainrw_scores import (
+        build_parser,
+        export_brainrw_scores,
+    )
+
+    output = tmp_path / "brainrw-scores"
+    manifest = tmp_path / "trials.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    arguments = build_parser().parse_args(
+        [
+            "--brain-model-path", "brain",
+            "--vision-adapter-path", "adapter",
+            "--pretrained-model-name-or-path", "base",
+            "--brain-directory", "eeg",
+            "--image-directory", "images",
+            "--selected-channels", "Cz",
+            "--trial-split-manifest", str(manifest),
+            "--output-dir", str(output),
+        ]
+    )
+    calls = 0
+
+    def runner(command: list[str], *, check: bool) -> object:
+        nonlocal calls
+        calls += 1
+        artifact = Path(command[command.index("--score-artifact-output") + 1])
+        artifact.mkdir(parents=True)
+        (artifact / "partial").write_bytes(b"partial")
+        if calls == 2:
+            raise subprocess.CalledProcessError(1, command)
+        return object()
+
+    with pytest.raises(subprocess.CalledProcessError):
+        export_brainrw_scores(arguments, runner=runner)
+    assert not output.exists()
+    assert not list(output.parent.glob(f".{output.name}.tmp-*"))

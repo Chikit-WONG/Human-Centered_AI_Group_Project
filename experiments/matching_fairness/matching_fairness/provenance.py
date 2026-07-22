@@ -38,6 +38,41 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_path(path: Path) -> str:
+    """Hash a regular file or a complete symlink-free directory tree."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"provenance path must not be a symbolic link: {path}")
+    if path.is_file():
+        return sha256_file(path)
+    if not path.is_dir():
+        raise ValueError(f"provenance path must be a file or directory: {path}")
+
+    digest = hashlib.sha256()
+    entries = sorted(
+        path.rglob("*"),
+        key=lambda entry: entry.relative_to(path).as_posix(),
+    )
+    for entry in entries:
+        relative = entry.relative_to(path).as_posix().encode("utf-8")
+        if entry.is_symlink():
+            raise ValueError(
+                f"provenance tree member must not be a symbolic link: {entry}"
+            )
+        if entry.is_dir():
+            digest.update(b"D\0")
+            digest.update(relative)
+            digest.update(b"\0")
+        elif entry.is_file():
+            digest.update(b"F\0")
+            digest.update(relative)
+            digest.update(b"\0")
+            digest.update(bytes.fromhex(sha256_file(entry)))
+        else:
+            raise ValueError(f"unsupported provenance tree member: {entry}")
+    return digest.hexdigest()
+
+
 def _git_output(path: Path, *arguments: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(path), *arguments],
