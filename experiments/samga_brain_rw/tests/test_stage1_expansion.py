@@ -382,3 +382,15 @@ def test_common_train_only_manifest_allows_samga_checkpoint_bound_bundle(
         },
         arguments,
     )
+
+
+def test_expansion_slurm_chunks_one_hundred_rows_into_ten_jobs(
+    experiment_root: Path,
+) -> None:
+    script = (
+        experiment_root / "slurm" / "expansion_train_array.slurm"
+    ).read_text(encoding="utf-8")
+
+    assert "JOB_MAP_CHUNK_STRIDE" in script
+    assert "ARRAY_INDEX+=CHUNK_STRIDE" in script
+    assert "timeout --signal=TERM --kill-after=5m 4h" in script
