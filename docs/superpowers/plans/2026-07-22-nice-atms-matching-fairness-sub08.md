@@ -1109,7 +1109,7 @@ git commit -m "feat(fairness): evaluate five decoders across all scenarios"
 
 **Interfaces:**
 - Consumes: 450 decoder result records plus parity and audit manifests.
-- Produces: `aggregate_metrics.csv`, `aggregate_summary.json`, `RESULTS_EN.md`, `RESULTS_ZH.md`.
+- Produces: `aggregate_metrics.csv`, `aggregate_summary.json`, `RESULTS.md`, `RESULTS_ZH.md`.
 - Produces: presentation-ready standard and duplicate-EEG tables.
 
 - [ ] **Step 1: Write failing report tests**
