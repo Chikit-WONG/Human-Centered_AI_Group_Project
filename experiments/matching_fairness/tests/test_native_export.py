@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import math
+import os
 import subprocess
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -443,6 +446,53 @@ def test_native_export_rejects_tampered_pickled_eeg_before_numpy_load(
     assert called is False
 
 
+def test_native_export_deserializes_the_verified_eeg_byte_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _native_export_config(tmp_path)
+    expected_hash = sha256_file(config.test_eeg)
+    real_load = native_export_module.np.load
+    observed_pickle_load = False
+
+    def replace_path_then_load(source: object, *args: object, **kwargs: object) -> object:
+        nonlocal observed_pickle_load
+        if kwargs.get("allow_pickle") is True:
+            observed_pickle_load = True
+            assert isinstance(source, io.BytesIO)
+            config.test_eeg.write_bytes(b"replacement after verified open")
+        return real_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(native_export_module.np, "load", replace_path_then_load)
+
+    result = export_native_scores(config)
+
+    assert observed_pickle_load is True
+    artifact = read_score_artifact(result.artifact_paths["standard"])
+    assert artifact.metadata["input_sha256"]["test_eeg"] == expected_hash
+
+
+def test_native_export_opens_pickled_eeg_with_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _native_export_config(tmp_path)
+    real_open = native_export_module.os.open
+    observed_no_follow = False
+
+    def recording_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal observed_no_follow
+        if os.fspath(path) == os.fspath(config.test_eeg):
+            observed_no_follow = bool(flags & getattr(os, "O_NOFOLLOW", 0))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(native_export_module.os, "open", recording_open)
+
+    export_native_scores(config)
+
+    assert observed_no_follow is True
+
+
 @pytest.mark.parametrize(
     "field_path,value,message",
     (
@@ -527,6 +577,13 @@ def _complete_formal_inventory(
                         },
                         "evaluator_version": "AIAA3800-BRAINRW-FORMAL-v1",
                         "evaluator_sha256": "5" * 64,
+                        "runtime_inputs": {
+                            "test_image_tree_sha256": "7" * 64,
+                            "selected_channel_indices": [30],
+                            "time_slice": [0, 250],
+                            "dataset_name": "things",
+                            "expected_sample_count": 2,
+                        },
                     }
                 )
             write_score_artifact(
@@ -613,6 +670,88 @@ def test_native_audit_rejects_query_target_order_mismatch(tmp_path: Path) -> Non
     )
     with pytest.raises(ValueError, match="canonical query/target/gallery order"):
         audit_native_checkpoints(config, inventory)
+
+
+def test_native_audit_rejects_one_half_input_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = _native_export_config(tmp_path)
+    result = export_native_scores(config)
+    inventory = _complete_formal_inventory(tmp_path, result.artifact_paths)
+
+    def corrupt(artifact: ScoreArtifact) -> ScoreArtifact:
+        metadata = dict(artifact.metadata)
+        inputs = dict(metadata["input_sha256"])
+        inputs["test_features"] = "8" * 64
+        metadata["input_sha256"] = inputs
+        return ScoreArtifact(
+            artifact.similarity,
+            artifact.query_ids,
+            artifact.gallery_entry_ids,
+            artifact.gallery_canonical_ids,
+            artifact.target_canonical_ids,
+            metadata,
+        )
+
+    inventory = _replace_inventory_artifact(
+        tmp_path, inventory, model="atm_s", half="a", transform=corrupt
+    )
+    with pytest.raises(ValueError, match="native provenance must be identical"):
+        audit_native_checkpoints(config, inventory)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("selected_channel_indices", [31]),
+        ("test_image_tree_sha256", "9" * 64),
+    ),
+)
+def test_native_audit_rejects_one_half_brainrw_runtime_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    config = _native_export_config(tmp_path)
+    result = export_native_scores(config)
+    inventory = _complete_formal_inventory(tmp_path, result.artifact_paths)
+
+    def corrupt(artifact: ScoreArtifact) -> ScoreArtifact:
+        metadata = dict(artifact.metadata)
+        runtime = dict(metadata["runtime_inputs"])
+        runtime[field] = value
+        metadata["runtime_inputs"] = runtime
+        return ScoreArtifact(
+            artifact.similarity,
+            artifact.query_ids,
+            artifact.gallery_entry_ids,
+            artifact.gallery_canonical_ids,
+            artifact.target_canonical_ids,
+            metadata,
+        )
+
+    inventory = _replace_inventory_artifact(
+        tmp_path, inventory, model="our_project", half="b", transform=corrupt
+    )
+    with pytest.raises(ValueError, match="BrainRW provenance must be identical"):
+        audit_native_checkpoints(config, inventory)
+
+
+def test_native_audit_binds_current_config_to_supplied_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _native_export_config(tmp_path)
+    result = export_native_scores(config)
+    inventory = _complete_formal_inventory(tmp_path, result.artifact_paths)
+    alternate_manifest = tmp_path / "alternate_trial_manifest.json"
+    alternate_manifest.write_text(
+        json.dumps(json.loads(config.trial_manifest.read_text(encoding="utf-8"))),
+        encoding="utf-8",
+    )
+    mismatched = replace(config, trial_manifest=alternate_manifest)
+
+    with pytest.raises(ValueError, match="current native audit config"):
+        audit_native_checkpoints(mismatched, inventory)
 
 
 def test_native_export_publishes_main_artifacts_before_separate_audit(

@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 
 import numpy as np
@@ -281,7 +283,7 @@ def export_native_scores(config: NativeExportConfig) -> NativeExportResult:
     """Publish standard/EEG-A/EEG-B artifacts from only ``best_val.pth``."""
     source_lock = _validate_export_config(config, require_new_output=True)
     asset_lock = _validate_asset_lock(config)
-    inputs = _load_native_inputs(config)
+    inputs = _load_native_inputs(config, asset_lock)
     records, best_checkpoint, checkpoint_manifest_hash = _load_checkpoint_manifest(
         config, source_lock, asset_lock
     )
@@ -370,13 +372,29 @@ def audit_native_checkpoints(
     """Audit every epoch only after hashing the complete nine-artifact grid."""
     source_lock = _validate_export_config(config, require_new_output=False)
     asset_lock = _validate_asset_lock(config)
+    inputs = _load_native_inputs(config, asset_lock)
+    records, best_checkpoint, manifest_hash = _load_checkpoint_manifest(
+        config, source_lock, asset_lock
+    )
+    current_native_identity = {
+        "checkpoint_role": "val_selected_formal",
+        "checkpoint": str(best_checkpoint),
+        "checkpoint_sha256": sha256_file(best_checkpoint),
+        "checkpoint_manifest_sha256": manifest_hash,
+        "source_lock": source_lock.to_dict(),
+        "asset_lock_manifest_sha256": asset_lock["manifest_sha256"],
+        "asset_lock": asset_lock["provenance"],
+        "input_sha256": dict(inputs.input_hashes),
+        "trial_manifest_sha256": inputs.input_hashes["trial_manifest"],
+        "logit_scale_type": "exp",
+        "subject": config.subject,
+        "seed": 42,
+    }
     inventory = _formal_artifact_inventory(
         formal_artifact_directories,
         expected_image_count=config.expected_image_count,
-    )
-    inputs = _load_native_inputs(config)
-    records, _best_checkpoint, _manifest_hash = _load_checkpoint_manifest(
-        config, source_lock, asset_lock
+        current_native_model=config.model,
+        current_native_identity=current_native_identity,
     )
     device = _resolve_device(config.device)
     subject_index = _subject_index(config.subject)
@@ -540,6 +558,7 @@ def _validate_asset_lock(config: NativeExportConfig) -> dict[str, object]:
         "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy": Path(config.test_eeg),
         "ViT-H-14_features_test.pt": Path(config.test_features),
     }
+    verified_test_eeg_bytes: bytes | None = None
     for relative in _ASSET_RELATIVE_PATHS:
         path = root / relative
         if relative in expected_test_paths and path != expected_test_paths[relative]:
@@ -566,12 +585,23 @@ def _validate_asset_lock(config: NativeExportConfig) -> dict[str, object]:
             r"[0-9a-f]{64}", expected_hash
         ) is None:
             raise ValueError(f"asset lock SHA-256 is invalid: {relative}")
-        if path.stat().st_size != expected_size:
-            raise ValueError(f"asset byte count mismatch: {relative}")
-        if sha256_file(path) != expected_hash:
-            raise ValueError(f"asset SHA-256 mismatch: {relative}")
+        if relative == "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy":
+            verified = _read_regular_file_nofollow(path)
+            if len(verified) != expected_size:
+                raise ValueError(f"asset byte count mismatch: {relative}")
+            if hashlib.sha256(verified).hexdigest() != expected_hash:
+                raise ValueError(f"asset SHA-256 mismatch: {relative}")
+            verified_test_eeg_bytes = verified
+        else:
+            if path.stat().st_size != expected_size:
+                raise ValueError(f"asset byte count mismatch: {relative}")
+            if sha256_file(path) != expected_hash:
+                raise ValueError(f"asset SHA-256 mismatch: {relative}")
+    if verified_test_eeg_bytes is None:
+        raise RuntimeError("validated asset lock lacks the official test EEG bytes")
     return {
         "manifest_sha256": sha256_file(lock_path),
+        "verified_test_eeg_bytes": verified_test_eeg_bytes,
         "provenance": {
             "repo_id": payload["repo_id"],
             "repo_type": payload["repo_type"],
@@ -581,7 +611,34 @@ def _validate_asset_lock(config: NativeExportConfig) -> dict[str, object]:
     }
 
 
-def _load_native_inputs(config: NativeExportConfig) -> _NativeInputs:
+def _read_regular_file_nofollow(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"could not securely open official asset: {path}") from error
+    try:
+        information = os.fstat(descriptor)
+        if not stat.S_ISREG(information.st_mode):
+            raise ValueError(f"official asset must be a regular file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        value = b"".join(chunks)
+        if len(value) != information.st_size:
+            raise ValueError(f"official asset changed while being read: {path}")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def _load_native_inputs(
+    config: NativeExportConfig,
+    asset_lock: Mapping[str, object],
+) -> _NativeInputs:
     suffixes = {".jpg", ".jpeg", ".png"}
     image_paths = sorted(
         path
@@ -596,7 +653,10 @@ def _load_native_inputs(config: NativeExportConfig) -> _NativeInputs:
     if len(set(image_ids)) != len(image_ids):
         raise ValueError("official test images have duplicate canonical stems")
 
-    loaded = np.load(config.test_eeg, allow_pickle=True)
+    verified_test_eeg_bytes = asset_lock.get("verified_test_eeg_bytes")
+    if not isinstance(verified_test_eeg_bytes, bytes):
+        raise RuntimeError("validated asset lock lacks verified test EEG bytes")
+    loaded = np.load(io.BytesIO(verified_test_eeg_bytes), allow_pickle=True)
     try:
         payload = loaded.item() if getattr(loaded, "shape", None) == () else loaded
         if not isinstance(payload, Mapping) or "preprocessed_eeg_data" not in payload:
@@ -655,7 +715,7 @@ def _load_native_inputs(config: NativeExportConfig) -> _NativeInputs:
         image_features=image_features,
         averaged_eeg=averaged,
         input_hashes={
-            "test_eeg": sha256_file(config.test_eeg),
+            "test_eeg": hashlib.sha256(verified_test_eeg_bytes).hexdigest(),
             "test_features": sha256_file(config.test_features),
             "trial_manifest": sha256_file(config.trial_manifest),
         },
@@ -878,6 +938,8 @@ def _formal_artifact_inventory(
     directories: Sequence[Path],
     *,
     expected_image_count: int,
+    current_native_model: str | None = None,
+    current_native_identity: Mapping[str, object] | None = None,
 ) -> list[dict[str, object]]:
     paths = tuple(Path(path) for path in directories)
     if len(paths) != 9 or len(set(paths)) != 9:
@@ -890,6 +952,8 @@ def _formal_artifact_inventory(
     entries: list[dict[str, object]] = []
     seen: set[tuple[object, object]] = set()
     common_gallery: tuple[str, ...] | None = None
+    common_global_identity: tuple[object, ...] | None = None
+    identities_by_model: dict[str, dict[str, object]] = {}
     for path in paths:
         artifact = read_score_artifact(path)
         model = artifact.metadata.get("model_slug")
@@ -932,7 +996,30 @@ def _formal_artifact_inventory(
         }
         if artifact.metadata.get("native_metrics") != expected_metrics:
             raise ValueError(f"formal artifact metric parity failed: {key}")
-        _validate_formal_artifact_provenance(artifact, str(model))
+        model_name = str(model)
+        _validate_formal_artifact_provenance(
+            artifact,
+            model_name,
+            expected_image_count=expected_image_count,
+        )
+        global_identity = (
+            artifact.metadata["trial_manifest_sha256"],
+            artifact.metadata["subject"],
+            artifact.metadata["seed"],
+            artifact.query_ids,
+            artifact.target_canonical_ids,
+            artifact.gallery_entry_ids,
+            artifact.gallery_canonical_ids,
+        )
+        if common_global_identity is None:
+            common_global_identity = global_identity
+        elif global_identity != common_global_identity:
+            raise ValueError("all formal artifacts must share global provenance")
+        identity = _formal_model_identity(artifact.metadata, model_name)
+        previous_identity = identities_by_model.setdefault(model_name, identity)
+        if identity != previous_identity:
+            label = "BrainRW" if model_name == "our_project" else "native"
+            raise ValueError(f"{label} provenance must be identical across halves")
         entries.append(
             {
                 "model_slug": model,
@@ -943,6 +1030,14 @@ def _formal_artifact_inventory(
         )
     if seen != expected_grid:
         raise ValueError("formal artifact inventory must cover the 3 x 3 grid")
+    if current_native_model is not None:
+        if current_native_identity is None:
+            raise ValueError("current native audit identity is required")
+        supplied = identities_by_model.get(current_native_model)
+        if supplied != dict(current_native_identity):
+            raise ValueError(
+                "current native audit config does not match supplied artifacts"
+            )
     return sorted(
         entries,
         key=lambda entry: (str(entry["model_slug"]), str(entry["trial_half"])),
@@ -952,6 +1047,8 @@ def _formal_artifact_inventory(
 def _validate_formal_artifact_provenance(
     artifact: ScoreArtifact,
     model: str,
+    *,
+    expected_image_count: int,
 ) -> None:
     metadata = artifact.metadata
     for field in ("query_embeddings_sha256", "trial_manifest_sha256"):
@@ -1019,6 +1116,67 @@ def _validate_formal_artifact_provenance(
         or not isinstance(metadata.get("checkpoint"), str)
     ):
         raise ValueError("BrainRW formal scoring semantics are incomplete")
+    runtime = metadata.get("runtime_inputs")
+    if not isinstance(runtime, Mapping) or set(runtime) != {
+        "test_image_tree_sha256",
+        "selected_channel_indices",
+        "time_slice",
+        "dataset_name",
+        "expected_sample_count",
+    }:
+        raise ValueError("BrainRW formal runtime provenance is incomplete")
+    channels = runtime["selected_channel_indices"]
+    if (
+        not _is_sha256(runtime["test_image_tree_sha256"])
+        or not isinstance(channels, list)
+        or not channels
+        or any(
+            isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 63
+            for index in channels
+        )
+        or len(set(channels)) != len(channels)
+        or runtime["time_slice"] != [0, 250]
+        or runtime["dataset_name"] != "things"
+        or runtime["expected_sample_count"] != expected_image_count
+    ):
+        raise ValueError("BrainRW formal runtime provenance is invalid")
+
+
+def _formal_model_identity(
+    metadata: Mapping[str, object],
+    model: str,
+) -> dict[str, object]:
+    common_fields = (
+        "checkpoint_role",
+        "checkpoint",
+        "trial_manifest_sha256",
+        "subject",
+        "seed",
+    )
+    if model in {"nice", "atm_s"}:
+        fields = common_fields + (
+            "checkpoint_sha256",
+            "checkpoint_manifest_sha256",
+            "source_lock",
+            "asset_lock_manifest_sha256",
+            "asset_lock",
+            "input_sha256",
+            "logit_scale_type",
+        )
+    elif model == "our_project":
+        fields = common_fields + (
+            "checkpoint_content_sha256",
+            "brain_test_sha256",
+            "model_content_sha256",
+            "protocol_sha256",
+            "evaluator_version",
+            "evaluator_sha256",
+            "runtime_inputs",
+            "similarity",
+        )
+    else:
+        raise ValueError(f"unsupported formal artifact model: {model}")
+    return {field: metadata[field] for field in fields}
 
 
 def _validate_embedded_asset_lock(value: object) -> None:

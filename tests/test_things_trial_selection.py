@@ -268,10 +268,7 @@ def test_standard_parser_defaults_preserve_existing_mode() -> None:
 
 
 
-def test_brainrw_score_artifact_uses_canonical_id_targets(
-    tmp_path: Path,
-) -> None:
-    similarity = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+def _brainrw_artifact_inputs(tmp_path: Path) -> dict[str, object]:
     brain_model = tmp_path / "brain-model"
     adapter = tmp_path / "adapter"
     vision_base = tmp_path / "vision-base"
@@ -288,29 +285,46 @@ def test_brainrw_score_artifact_uses_canonical_id_targets(
     evaluator = tmp_path / "evaluate_retrieval.py"
     evaluator.write_text("# sealed evaluator\n", encoding="utf-8")
     protocol = tmp_path / "protocol.json"
-    protocol.write_text(
-        json.dumps({"subject": "sub-08", "seed": 42}),
-        encoding="utf-8",
+    protocol.write_bytes(
+        Path(
+            "experiments/matching_fairness/configs/protocol_sub08_seed42.json"
+        ).read_bytes()
     )
+    image_directory = tmp_path / "things"
+    test_images = image_directory / "test_images/class"
+    test_images.mkdir(parents=True)
+    (test_images / "image-0.jpg").write_bytes(b"image zero")
+    (test_images / "image-1.jpg").write_bytes(b"image one")
 
-    artifact = build_brainrw_score_artifact(
-        similarity=similarity,
-        query_embeddings=np.eye(2, dtype=np.float32),
-        query_ids=("image-0", "image-1"),
-        gallery_ids=("image-1", "image-0"),
-        trial_half="a",
-        brain_model_path=brain_model,
-        vision_adapter_path=adapter,
-        pretrained_model_path=vision_base,
-        brain_test_path=brain_test,
-        trial_manifest_path=trial_manifest,
-        protocol_path=protocol,
-        subject="sub-08",
-        seed=42,
-        evaluator_path=evaluator,
-        top1_count=2,
-        top5_count=2,
-    )
+    return {
+        "similarity": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+        "query_embeddings": np.eye(2, dtype=np.float32),
+        "query_ids": ("image-0", "image-1"),
+        "gallery_ids": ("image-1", "image-0"),
+        "trial_half": "a",
+        "brain_model_path": brain_model,
+        "vision_adapter_path": adapter,
+        "pretrained_model_path": vision_base,
+        "brain_test_path": brain_test,
+        "trial_manifest_path": trial_manifest,
+        "protocol_path": protocol,
+        "subject": "sub-08",
+        "seed": 42,
+        "evaluator_path": evaluator,
+        "image_directory": image_directory,
+        "selected_channels": "Cz",
+        "time_slice": (0, 250),
+        "dataset_name": "things",
+        "expected_sample_count": 2,
+        "top1_count": 2,
+        "top5_count": 2,
+    }
+
+
+def test_brainrw_score_artifact_uses_canonical_id_targets(
+    tmp_path: Path,
+) -> None:
+    artifact = build_brainrw_score_artifact(**_brainrw_artifact_inputs(tmp_path))
 
     assert artifact.target_canonical_ids == ("image-0", "image-1")
     assert set(artifact.metadata["model_content_sha256"]) == {
@@ -324,10 +338,67 @@ def test_brainrw_score_artifact_uses_canonical_id_targets(
     assert len(artifact.metadata["evaluator_sha256"]) == 64
     assert artifact.metadata["subject"] == "sub-08"
     assert artifact.metadata["seed"] == 42
+    assert artifact.metadata["runtime_inputs"] == {
+        "dataset_name": "things",
+        "expected_sample_count": 2,
+        "selected_channel_indices": [30],
+        "test_image_tree_sha256": artifact.metadata["runtime_inputs"][
+            "test_image_tree_sha256"
+        ],
+        "time_slice": [0, 250],
+    }
     assert artifact.gallery_canonical_ids == ("image-1", "image-0")
     assert artifact.metadata["model_slug"] == "our_project"
     assert artifact.metadata["trial_half"] == "a"
     assert len(artifact.metadata["query_embeddings_sha256"]) == 64
+
+
+def test_brainrw_image_tree_hash_changes_with_image_bytes(tmp_path: Path) -> None:
+    arguments = _brainrw_artifact_inputs(tmp_path)
+    before = build_brainrw_score_artifact(**arguments)
+    image = Path(arguments["image_directory"]) / "test_images/class/image-0.jpg"
+    image.write_bytes(b"changed image zero")
+
+    after = build_brainrw_score_artifact(**arguments)
+
+    assert (
+        before.metadata["runtime_inputs"]["test_image_tree_sha256"]
+        != after.metadata["runtime_inputs"]["test_image_tree_sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    (
+        ("dataset_name", "imagenet", "dataset_name"),
+        ("time_slice", (1, 250), "time slice"),
+        ("expected_sample_count", 3, "sample count"),
+        ("selected_channels", "Cz,Cz", "unique"),
+    ),
+)
+def test_brainrw_artifact_rejects_formal_runtime_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    arguments = _brainrw_artifact_inputs(tmp_path)
+    arguments[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        build_brainrw_score_artifact(**arguments)
+
+
+def test_brainrw_artifact_rejects_minimal_protocol(tmp_path: Path) -> None:
+    arguments = _brainrw_artifact_inputs(tmp_path)
+    protocol = Path(arguments["protocol_path"])
+    protocol.write_text(
+        json.dumps({"subject": "sub-08", "seed": 42}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exact formal schema"):
+        build_brainrw_score_artifact(**arguments)
 
 
 

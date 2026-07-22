@@ -37,9 +37,11 @@ if str(MATCHING_FAIRNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(MATCHING_FAIRNESS_ROOT))
 
 from main.data import (  # noqa: E402
+    THINGS_EEG_CHANNEL_NAME_TO_INDEX,
     load_image_dataset,
     load_things_brain_dataset,
     merge_datasets_by_image_id,
+    parse_selected_channels,
 )
 from main.models_clip import BrainCLIPModel  # noqa: E402
 from matching_fairness.trial_splits import (  # noqa: E402
@@ -52,6 +54,7 @@ from matching_fairness.artifacts import (  # noqa: E402
     write_score_artifact,
 )
 from matching_fairness.provenance import sha256_file, sha256_path  # noqa: E402
+from matching_fairness.config import Protocol  # noqa: E402
 
 HUNGARIAN_PRIMARY_ORDER_SEED = 3800
 HUNGARIAN_AUDIT_ORDER_SEEDS = tuple(range(3801, 3809))
@@ -74,6 +77,11 @@ def build_brainrw_score_artifact(
     subject: str,
     seed: int,
     evaluator_path: Path,
+    image_directory: Path,
+    selected_channels: str,
+    time_slice: tuple[int, int],
+    dataset_name: str,
+    expected_sample_count: int,
     top1_count: int,
     top5_count: int,
 ) -> ScoreArtifact:
@@ -93,16 +101,40 @@ def build_brainrw_score_artifact(
     if not isinstance(trial_manifest, Mapping):
         raise ValueError("BrainRW trial provenance manifest must be a mapping")
     validate_trial_manifest(trial_manifest, query_ids)
-    try:
-        protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("invalid BrainRW formal protocol") from error
-    if (
-        not isinstance(protocol, Mapping)
-        or protocol.get("subject") != subject
-        or protocol.get("seed") != seed
-    ):
+    protocol = Protocol.load(Path(protocol_path))
+    protocol.assert_formal_scope()
+    if protocol.subject != subject or protocol.seed != seed:
         raise ValueError("BrainRW formal protocol subject/seed mismatch")
+    if dataset_name.lower() != "things":
+        raise ValueError("formal BrainRW dataset_name must be things")
+    if (
+        isinstance(expected_sample_count, bool)
+        or not isinstance(expected_sample_count, int)
+        or expected_sample_count != len(query_ids)
+        or expected_sample_count != len(gallery_ids)
+    ):
+        raise ValueError("BrainRW expected sample count does not match artifact IDs")
+    expected_time_slice = (0, int(protocol.native_training["n_times"]))
+    if tuple(time_slice) != expected_time_slice:
+        raise ValueError(
+            f"BrainRW time slice must match formal protocol: {expected_time_slice}"
+        )
+    channel_names = parse_selected_channels(selected_channels)
+    if not channel_names:
+        raise ValueError("formal BrainRW selected channels must be non-empty")
+    if len(set(channel_names)) != len(channel_names):
+        raise ValueError("formal BrainRW selected channels must be unique")
+    unknown = [
+        name for name in channel_names
+        if name not in THINGS_EEG_CHANNEL_NAME_TO_INDEX
+    ]
+    if unknown:
+        raise ValueError(f"unknown formal BrainRW selected channels: {unknown}")
+    channel_indices = tuple(
+        THINGS_EEG_CHANNEL_NAME_TO_INDEX[name] for name in channel_names
+    )
+    image_tree = Path(image_directory) / "test_images"
+    image_tree_hash = sha256_path(image_tree)
     artifact = ScoreArtifact(
         similarity=np.ascontiguousarray(similarity, dtype=np.float32),
         query_ids=query_ids,
@@ -129,6 +161,13 @@ def build_brainrw_score_artifact(
             },
             "evaluator_version": EVALUATOR_VERSION,
             "evaluator_sha256": sha256_file(evaluator_path),
+            "runtime_inputs": {
+                "test_image_tree_sha256": image_tree_hash,
+                "selected_channel_indices": list(channel_indices),
+                "time_slice": list(expected_time_slice),
+                "dataset_name": dataset_name.lower(),
+                "expected_sample_count": expected_sample_count,
+            },
         },
     )
     ranks = independent_ranks(artifact)
@@ -622,6 +661,11 @@ def main() -> None:
             subject=f"sub-{args.subject_id:02d}",
             seed=args.seed,
             evaluator_path=Path(__file__).resolve(),
+            image_directory=Path(args.image_directory).resolve(),
+            selected_channels=args.selected_channels,
+            time_slice=(start, end),
+            dataset_name=args.dataset_name,
+            expected_sample_count=args.expected_num_samples,
             top1_count=top1_count,
             top5_count=top5_count,
         )
