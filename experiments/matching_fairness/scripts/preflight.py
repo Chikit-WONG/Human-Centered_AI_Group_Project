@@ -159,22 +159,19 @@ def validate_runtime(runtime: RuntimeInfo) -> None:
 
 
 def _load_official_eeg(path: Path, numpy: Any) -> Any:
-    loaded = numpy.load(path, allow_pickle=True, mmap_mode="r")
+    loaded = numpy.load(path, allow_pickle=True)
     try:
-        if hasattr(loaded, "files"):
-            if "preprocessed_eeg_data" not in loaded.files:
-                raise ValueError(f"official EEG file lacks preprocessed_eeg_data: {path}")
-            return numpy.asarray(loaded["preprocessed_eeg_data"])
-        if getattr(loaded.dtype, "names", None):
-            if "preprocessed_eeg_data" not in loaded.dtype.names:
-                raise ValueError(f"official EEG file lacks preprocessed_eeg_data: {path}")
-            return numpy.asarray(loaded["preprocessed_eeg_data"])
-        if loaded.shape == ():
+        if isinstance(loaded, Mapping):
+            payload = loaded
+        elif getattr(loaded, "shape", None) == ():
             payload = loaded.item()
-            if not isinstance(payload, Mapping) or "preprocessed_eeg_data" not in payload:
-                raise ValueError(f"official EEG file lacks preprocessed_eeg_data: {path}")
-            return numpy.asarray(payload["preprocessed_eeg_data"])
-        raise ValueError(f"official EEG file lacks preprocessed_eeg_data: {path}")
+        else:
+            raise ValueError(f"official EEG file must contain a mapping: {path}")
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"official EEG file must contain a mapping: {path}")
+        if "preprocessed_eeg_data" not in payload:
+            raise ValueError(f"official EEG file lacks preprocessed_eeg_data: {path}")
+        return numpy.asarray(payload["preprocessed_eeg_data"])
     finally:
         close = getattr(loaded, "close", None)
         if close is not None:
@@ -298,6 +295,7 @@ def run_preflight(
     protocol = Protocol.load(protocol_path)
     protocol.assert_formal_scope()
     source_lock = inspect_checkout(checkout_path)
+    asset_inventory = inventory_assets(asset_root)
 
     numpy = importlib.import_module("numpy")
     torch = importlib.import_module("torch")
@@ -346,7 +344,7 @@ def run_preflight(
         "source": source_lock.to_dict(),
         "assets": {
             "root": str(asset_root),
-            "files": inventory_assets(asset_root),
+            "files": asset_inventory,
         },
         "official_data": {
             "train_shape": list(train_eeg.shape),
