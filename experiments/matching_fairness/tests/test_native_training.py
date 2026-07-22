@@ -42,7 +42,17 @@ def _git(checkout: Path, *arguments: str) -> None:
 def _write_fake_upstream(checkout: Path) -> None:
     sources = {
         "Retrieval/train_unified.py": "raise RuntimeError('train_unified is sealed')\n",
-        "models/atms.py": "# required source-lock fixture\n",
+        "source_origin.txt": "1\n",
+        "models/atms.py": (
+            "from pathlib import Path\n"
+            "ORIGIN = int((Path(__file__).resolve().parents[1] / "
+            "'source_origin.txt').read_text())\n"
+        ),
+        "models/loss.py": (
+            "from pathlib import Path\n"
+            "ORIGIN = int((Path(__file__).resolve().parents[1] / "
+            "'source_origin.txt').read_text())\n"
+        ),
         "eegdatasets.py": r'''
             from pathlib import Path
             import torch
@@ -100,6 +110,8 @@ def _write_fake_upstream(checkout: Path) -> None:
                     ]
                     self.text_features = preloaded_features["text_features"]
                     self.img_features = preloaded_features["img_features"]
+                    if eeg_path.read_bytes() == b"truncate text features":
+                        self.text_features = self.text_features[:1]
 
                 def __len__(self):
                     return len(self.data)
@@ -135,6 +147,7 @@ def _write_fake_upstream(checkout: Path) -> None:
         ''',
         "Retrieval/eeg_encoders.py": r'''
             import torch
+            from models.loss import ORIGIN
 
             class FakeEncoder(torch.nn.Module):
                 def __init__(self, encoder_type):
@@ -142,6 +155,7 @@ def _write_fake_upstream(checkout: Path) -> None:
                     self.encoder_type = encoder_type
                     self.weight = torch.nn.Parameter(torch.zeros(()))
                     self.register_buffer("forward_arity", torch.zeros((), dtype=torch.long))
+                    self.register_buffer("source_origin", torch.tensor(ORIGIN))
 
                 def forward(self, *arguments):
                     expected = 1 if self.encoder_type == "NICE" else 2
@@ -168,6 +182,7 @@ def _write_fake_upstream(checkout: Path) -> None:
                 return FakeEncoder(encoder_type)
         ''',
         "Retrieval/retrieval_engine.py": r'''
+            import importlib
             import random
             import numpy as np
             import torch
@@ -232,6 +247,8 @@ def _write_fake_upstream(checkout: Path) -> None:
             ):
                 global _train_calls
                 _train_calls += 1
+                atms = importlib.import_module("models.atms")
+                assert atms.ORIGIN == eeg_model.source_origin.item()
                 assert isinstance(optimizer, torch.optim.AdamW)
                 assert optimizer.param_groups[0]["lr"] == 3e-4
                 assert dataloader.batch_size == 1_024
@@ -510,3 +527,164 @@ def test_cli_maps_only_formal_protocol_and_training_inputs(tmp_path: Path) -> No
     assert config.early_stopping_patience == 10
     assert config.ema_decay == 0.999
     assert config.avg_trials is True
+
+
+def test_post_materialization_text_features_must_keep_all_training_rows(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+) -> None:
+    fake_native_inputs.training_eeg.write_bytes(b"truncate text features")
+
+    with pytest.raises(ValueError, match="text_features length must be 16,540"):
+        train_native(_config(fake_native_inputs, tmp_path / "truncated"))
+
+
+def test_existing_stale_output_is_rejected_without_modification(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "stale-output"
+    stale = output_dir / "checkpoints/nice/epoch_0020.pth"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale checkpoint bytes")
+    before = {
+        path.relative_to(output_dir): path.read_bytes()
+        for path in output_dir.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(FileExistsError, match="output directory already exists"):
+        train_native(_config(fake_native_inputs, output_dir))
+
+    after = {
+        path.relative_to(output_dir): path.read_bytes()
+        for path in output_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_existing_empty_output_directory_is_rejected_without_modification(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "empty-output"
+    output_dir.mkdir()
+
+    with pytest.raises(FileExistsError, match="output directory already exists"):
+        train_native(_config(fake_native_inputs, output_dir))
+
+    assert tuple(output_dir.iterdir()) == ()
+
+
+def _make_additional_fake_inputs(root: Path, *, source_origin: int) -> FakeNativeInputs:
+    root.mkdir(parents=True)
+    checkout = root / "official-checkout"
+    subprocess.run(
+        ["git", "init", str(checkout)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _git(checkout, "config", "user.email", "test@example.com")
+    _git(checkout, "config", "user.name", "Test")
+    _git(checkout, "remote", "add", "origin", FAKE_URL)
+    _write_fake_upstream(checkout)
+    (checkout / "source_origin.txt").write_text(
+        f"{source_origin}\n", encoding="utf-8"
+    )
+    _git(checkout, "add", ".")
+    _git(checkout, "commit", "-m", f"fake upstream {source_origin}")
+    _git(checkout, "checkout", "--detach", "HEAD")
+
+    lock = inspect_checkout(
+        checkout,
+        expected_url=FAKE_URL,
+        expected_branch="develop",
+    )
+    source_lock = root / "upstream_lock.json"
+    source_lock.write_text(
+        json.dumps(lock.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    training_eeg = (
+        root
+        / "assets/Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy"
+    )
+    training_eeg.parent.mkdir(parents=True)
+    training_eeg.write_bytes(b"sealed fake training EEG")
+    training_features = root / "assets/ViT-H-14_features_train.pt"
+    torch.save(
+        {
+            "img_features": torch.ones(16_540, 1),
+            "text_features": torch.ones(16_540, 1),
+        },
+        training_features,
+    )
+    return FakeNativeInputs(
+        checkout=checkout,
+        source_lock=source_lock,
+        training_eeg=training_eeg,
+        training_features=training_features,
+    )
+
+
+def test_locked_import_context_is_hermetic_and_restores_foreign_modules(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import ModuleType
+
+    def is_official_namespace(name: str) -> bool:
+        return name in {
+            "eegdatasets",
+            "encoder_utils",
+            "Retrieval",
+            "models",
+        } or name.startswith(("Retrieval.", "models."))
+
+    for name in tuple(sys.modules):
+        if is_official_namespace(name):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    foreign_models = ModuleType("models")
+    foreign_models.__file__ = str(tmp_path / "foreign/models/__init__.py")
+    foreign_models.__path__ = [str(fake_native_inputs.checkout / "models")]
+    foreign_loss = ModuleType("models.loss")
+    foreign_loss.__file__ = str(tmp_path / "foreign/models/loss.py")
+    foreign_loss.ORIGIN = -1
+    foreign_models.loss = foreign_loss
+    monkeypatch.setitem(sys.modules, "models", foreign_models)
+    monkeypatch.setitem(sys.modules, "models.loss", foreign_loss)
+    expected_ambient = {
+        name: module
+        for name, module in sys.modules.items()
+        if is_official_namespace(name)
+    }
+
+    first = train_native(_config(fake_native_inputs, tmp_path / "hermetic-first"))
+    first_state = torch.load(first.best_checkpoint, weights_only=True)
+    assert first_state["source_origin"].item() == 1
+    assert {
+        name: module
+        for name, module in sys.modules.items()
+        if is_official_namespace(name)
+    } == expected_ambient
+    assert sys.modules["models"] is foreign_models
+    assert sys.modules["models.loss"] is foreign_loss
+
+    second_inputs = _make_additional_fake_inputs(
+        tmp_path / "second-upstream", source_origin=2
+    )
+    second = train_native(_config(second_inputs, tmp_path / "hermetic-second"))
+    second_state = torch.load(second.best_checkpoint, weights_only=True)
+    assert second_state["source_origin"].item() == 2
+    assert {
+        name: module
+        for name, module in sys.modules.items()
+        if is_official_namespace(name)
+    } == expected_ambient
+    assert sys.modules["models"] is foreign_models
+    assert sys.modules["models.loss"] is foreign_loss

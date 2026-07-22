@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
-import importlib.util
+import importlib
 import io
 import json
 import math
@@ -13,6 +13,7 @@ from pathlib import Path
 import random
 import sys
 import tempfile
+import threading
 from types import ModuleType
 from typing import Any, Iterator
 
@@ -42,6 +43,8 @@ _AVERAGED_TRIALS_PER_CONDITION = 1
 _N_TRAINING_SAMPLES = _N_CLASSES * _CONDITIONS_PER_CLASS
 _TRAINING_EEG_NAME = "preprocessed_eeg_training.npy"
 _TRAINING_FEATURES_NAME = "ViT-H-14_features_train.pt"
+_OFFICIAL_NAMESPACES = ("eegdatasets", "encoder_utils", "Retrieval", "models")
+_OFFICIAL_MODULE_IMPORT_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,14 @@ def train_native(config: NativeTrainConfig) -> TrainingResult:
     """Train one official NICE or ATM-S encoder without constructing test data."""
     _validate_config(config)
     source_lock = _validate_source_lock(config.source_checkout, config.source_lock)
+    _claim_output_directory(config.output_dir)
+    with _official_source_context(config.source_checkout):
+        return _train_native_in_context(config, source_lock)
+
+
+def _train_native_in_context(
+    config: NativeTrainConfig, source_lock: SourceLock
+) -> TrainingResult:
     modules = _load_official_modules(config.source_checkout, source_lock)
     input_hashes = {
         "training_eeg": sha256_file(config.training_eeg),
@@ -144,7 +155,7 @@ def train_native(config: NativeTrainConfig) -> TrainingResult:
     ema = modules.EMA(model, decay=config.ema_decay)
 
     checkpoint_dir = config.output_dir / "checkpoints" / config.model
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
     best_checkpoint = checkpoint_dir / "best_val.pth"
     records: list[EpochRecord] = []
     best_val_loss = math.inf
@@ -291,6 +302,14 @@ def _validate_config(config: NativeTrainConfig) -> None:
         raise ValueError(f"training features must be named {_TRAINING_FEATURES_NAME}")
 
 
+def _claim_output_directory(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir()
+    except FileExistsError:
+        raise FileExistsError(f"output directory already exists: {path}") from None
+
+
 def _validate_source_lock(checkout: Path, manifest: Path) -> SourceLock:
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -315,30 +334,61 @@ def _validate_source_lock(checkout: Path, manifest: Path) -> SourceLock:
     return actual
 
 
+def _is_official_namespace(name: str) -> bool:
+    return name in _OFFICIAL_NAMESPACES or name.startswith(("Retrieval.", "models."))
+
+
+def _verify_official_module_origins(checkout: Path) -> None:
+    checkout = checkout.resolve()
+    for name, module in tuple(sys.modules.items()):
+        if not _is_official_namespace(name):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        resolved = Path(module_file).resolve()
+        try:
+            resolved.relative_to(checkout)
+        except ValueError as error:
+            raise ImportError(
+                f"official namespace {name} escaped locked checkout: {resolved}"
+            ) from error
+
+
 @contextmanager
-def _official_import_paths(checkout: Path) -> Iterator[None]:
-    original_path = list(sys.path)
-    original_dont_write_bytecode = sys.dont_write_bytecode
-    sys.path[:0] = [str(checkout / "Retrieval"), str(checkout), str(checkout.parent)]
-    sys.dont_write_bytecode = True
-    try:
-        yield
-    finally:
-        sys.path[:] = original_path
-        sys.dont_write_bytecode = original_dont_write_bytecode
+def _official_source_context(checkout: Path) -> Iterator[None]:
+    checkout = checkout.resolve()
+    with _OFFICIAL_MODULE_IMPORT_LOCK:
+        original_path = list(sys.path)
+        original_dont_write_bytecode = sys.dont_write_bytecode
+        ambient_modules = {
+            name: module
+            for name, module in tuple(sys.modules.items())
+            if _is_official_namespace(name)
+        }
+        for name in ambient_modules:
+            sys.modules.pop(name, None)
+        sys.path[:0] = [str(checkout / "Retrieval"), str(checkout)]
+        sys.dont_write_bytecode = True
+        importlib.invalidate_caches()
+        try:
+            yield
+            _verify_official_module_origins(checkout)
+        finally:
+            for name in tuple(sys.modules):
+                if _is_official_namespace(name):
+                    sys.modules.pop(name, None)
+            sys.modules.update(ambient_modules)
+            sys.path[:] = original_path
+            sys.dont_write_bytecode = original_dont_write_bytecode
+            importlib.invalidate_caches()
 
 
 def _load_official_module(path: Path, name: str) -> ModuleType:
-    specification = importlib.util.spec_from_file_location(name, path)
-    if specification is None or specification.loader is None:
-        raise ImportError(f"could not load official module: {path}")
-    module = importlib.util.module_from_spec(specification)
-    sys.modules[name] = module
-    try:
-        specification.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(name, None)
-        raise
+    module = importlib.import_module(name)
+    module_file = getattr(module, "__file__", None)
+    if module_file is None or Path(module_file).resolve() != path.resolve():
+        raise ImportError(f"official module resolved outside locked file: {name}")
     return module
 
 
@@ -349,21 +399,20 @@ def _required_symbol(module: ModuleType, name: str) -> Any:
     return value
 
 
-def _load_official_modules(checkout: Path, source_lock: SourceLock) -> _OfficialModules:
-    prefix = f"_matching_fairness_official_{source_lock.commit[:12]}"
-    with _official_import_paths(checkout):
-        datasets = _load_official_module(
-            checkout / "eegdatasets.py", f"{prefix}_eegdatasets"
-        )
-        encoder_utils = _load_official_module(
-            checkout / "encoder_utils.py", f"{prefix}_encoder_utils"
-        )
-        encoders = _load_official_module(
-            checkout / "Retrieval/eeg_encoders.py", f"{prefix}_eeg_encoders"
-        )
-        engine = _load_official_module(
-            checkout / "Retrieval/retrieval_engine.py", f"{prefix}_retrieval_engine"
-        )
+def _load_official_modules(
+    checkout: Path, _source_lock: SourceLock
+) -> _OfficialModules:
+    datasets = _load_official_module(checkout / "eegdatasets.py", "eegdatasets")
+    encoder_utils = _load_official_module(
+        checkout / "encoder_utils.py", "encoder_utils"
+    )
+    encoders = _load_official_module(
+        checkout / "Retrieval/eeg_encoders.py", "Retrieval.eeg_encoders"
+    )
+    engine = _load_official_module(
+        checkout / "Retrieval/retrieval_engine.py", "Retrieval.retrieval_engine"
+    )
+    _verify_official_module_origins(checkout)
     return _OfficialModules(
         EEGDataset=_required_symbol(datasets, "EEGDataset"),
         build_encoder=_required_symbol(encoders, "build_encoder"),
@@ -439,6 +488,7 @@ def _validate_training_dataset(dataset: Any) -> None:
         "data": _N_TRAINING_SAMPLES,
         "labels": _N_TRAINING_SAMPLES,
         "img_features": _N_TRAINING_SAMPLES,
+        "text_features": _N_TRAINING_SAMPLES,
         "text": _N_CLASSES,
         "img": _N_TRAINING_SAMPLES,
     }
