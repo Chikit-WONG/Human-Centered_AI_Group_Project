@@ -183,6 +183,7 @@ def _write_fake_upstream(checkout: Path) -> None:
         ''',
         "Retrieval/retrieval_engine.py": r'''
             import importlib
+            from pathlib import Path
             import random
             import numpy as np
             import torch
@@ -231,6 +232,24 @@ def _write_fake_upstream(checkout: Path) -> None:
                     return model(eeg, subject_ids)
                 return model(eeg)
 
+            def _assert_official_package_paths():
+                checkout = Path(__file__).resolve().parents[1]
+                expected = {
+                    "models": (checkout / "models",),
+                    "Retrieval": (checkout / "Retrieval",),
+                }
+                for name, expected_paths in expected.items():
+                    package = importlib.import_module(name)
+                    actual_paths = tuple(
+                        Path(path).resolve() for path in package.__path__
+                    )
+                    spec_paths = tuple(
+                        Path(path).resolve()
+                        for path in package.__spec__.submodule_search_locations
+                    )
+                    assert actual_paths == expected_paths
+                    assert spec_paths == expected_paths
+
             def train_epoch(
                 sub,
                 eeg_model,
@@ -249,6 +268,7 @@ def _write_fake_upstream(checkout: Path) -> None:
                 _train_calls += 1
                 atms = importlib.import_module("models.atms")
                 assert atms.ORIGIN == eeg_model.source_origin.item()
+                _assert_official_package_paths()
                 assert isinstance(optimizer, torch.optim.AdamW)
                 assert optimizer.param_groups[0]["lr"] == 3e-4
                 assert dataloader.batch_size == 1_024
@@ -688,3 +708,75 @@ def test_locked_import_context_is_hermetic_and_restores_foreign_modules(
     } == expected_ambient
     assert sys.modules["models"] is foreign_models
     assert sys.modules["models.loss"] is foreign_loss
+
+
+def test_unloaded_foreign_regular_models_package_never_executes(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    def is_official_namespace(name: str) -> bool:
+        return name in {
+            "eegdatasets",
+            "encoder_utils",
+            "Retrieval",
+            "models",
+        } or name.startswith(("Retrieval.", "models."))
+
+    for name in tuple(sys.modules):
+        if is_official_namespace(name):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    foreign_root = tmp_path / "ambient"
+    foreign_models = foreign_root / "models"
+    foreign_models.mkdir(parents=True)
+    marker = foreign_root / "foreign_models_executed.txt"
+    (foreign_models / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "marker = Path(__file__).resolve().parents[1] / "
+        "\"foreign_models_executed.txt\"\n"
+        "marker.write_text(\"init\", encoding=\"utf-8\")\n",
+        encoding="utf-8",
+    )
+    (foreign_models / "loss.py").write_text(
+        "from pathlib import Path\n"
+        "marker = Path(__file__).resolve().parents[1] / "
+        "\"foreign_models_executed.txt\"\n"
+        "with marker.open(\"a\", encoding=\"utf-8\") as stream:\n"
+        "    stream.write(\"loss\")\n"
+        "ORIGIN = -1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(foreign_root))
+    expected_path = list(sys.path)
+    expected_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if is_official_namespace(name)
+    }
+
+    import_error = None
+    try:
+        result = train_native(
+            _config(fake_native_inputs, tmp_path / "unloaded-foreign")
+        )
+    except ImportError as error:
+        import_error = error
+
+    marker_content = marker.read_text(encoding="utf-8") if marker.exists() else ""
+    assert not marker.exists(), (
+        "foreign regular models package executed before origin rejection: "
+        f"{marker_content!r}; {import_error!r}"
+    )
+    if import_error is not None:
+        raise import_error
+    state = torch.load(result.best_checkpoint, weights_only=True)
+    assert state["source_origin"].item() == 1
+    assert sys.path == expected_path
+    assert {
+        name: module
+        for name, module in sys.modules.items()
+        if is_official_namespace(name)
+    } == expected_modules

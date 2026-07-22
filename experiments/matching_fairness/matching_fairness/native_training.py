@@ -5,6 +5,8 @@ from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
 import importlib
+from importlib.machinery import ModuleSpec
+from importlib.util import module_from_spec
 import io
 import json
 import math
@@ -344,15 +346,33 @@ def _verify_official_module_origins(checkout: Path) -> None:
         if not _is_official_namespace(name):
             continue
         module_file = getattr(module, "__file__", None)
-        if module_file is None:
+        if module_file is not None:
+            _verify_official_path(name, module_file, checkout)
             continue
-        resolved = Path(module_file).resolve()
-        try:
-            resolved.relative_to(checkout)
-        except ValueError as error:
-            raise ImportError(
-                f"official namespace {name} escaped locked checkout: {resolved}"
-            ) from error
+        module_path = getattr(module, "__path__", None)
+        paths = tuple(module_path) if module_path is not None else ()
+        if not paths:
+            raise ImportError(f"official namespace {name} lacks locked checkout paths")
+        for path in paths:
+            _verify_official_path(name, path, checkout)
+
+
+def _verify_official_path(name: str, path: Any, checkout: Path) -> None:
+    resolved = Path(path).resolve()
+    try:
+        resolved.relative_to(checkout)
+    except ValueError as error:
+        raise ImportError(
+            f"official namespace {name} escaped locked checkout: {resolved}"
+        ) from error
+
+
+def _pin_official_package(name: str, path: Path) -> None:
+    location = str(path.resolve())
+    specification = ModuleSpec(name, loader=None, is_package=True)
+    specification.submodule_search_locations[:] = [location]
+    package = module_from_spec(specification)
+    sys.modules[name] = package
 
 
 @contextmanager
@@ -368,6 +388,8 @@ def _official_source_context(checkout: Path) -> Iterator[None]:
         }
         for name in ambient_modules:
             sys.modules.pop(name, None)
+        _pin_official_package("models", checkout / "models")
+        _pin_official_package("Retrieval", checkout / "Retrieval")
         sys.path[:0] = [str(checkout / "Retrieval"), str(checkout)]
         sys.dont_write_bytecode = True
         importlib.invalidate_caches()
