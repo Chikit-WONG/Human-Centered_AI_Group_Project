@@ -70,11 +70,13 @@ NICE 与 ATM-S 使用同一套官方验证划分及相同 checkpoint 规则：
 
 1. 使用 seed-42 固定数据划分、初始化和数据顺序。
 2. 训练期间保存满足官方评估间隔的 checkpoint。
-3. 仅用验证集 Top-1 选择 checkpoint；若相同，依次用验证集 Top-5、较早 epoch 打破平局。
+3. 仅按最低 validation contrastive loss 选择 checkpoint；若 loss 完全相同，选择较早 epoch。验证集 Top-1/Top-5 只记录，不参与选模。
 4. 选择完成后冻结 checkpoint、配置和哈希。
 5. 每个模型只对正式测试集生成一次主结果相似度矩阵。
 
-若锁定的官方实现有明确 validation split 与 early stopping 默认值，则原样使用并记录。若缺少可复现的固定验证划分，实施必须先提出书面差异，不能查看测试结果后临时划分。
+锁定的官方 develop 实现使用 `val_ratio=0.1`、validation contrastive loss 和
+`early_stopping_patience=10`，实施原样使用并记录。若锁定 commit 的行为与上述规则
+不一致，必须先提出书面差异，不能查看测试结果后临时改变选模规则。
 
 ### 4.2 核验结果：paper-style best-test
 
