@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from types import MappingProxyType
@@ -40,7 +41,6 @@ from matching_fairness.native_export import (  # noqa: E402
     _formal_artifact_inventory,
     _score_artifact_sha256,
 )
-from matching_fairness.provenance import sha256_file  # noqa: E402
 from matching_fairness.scenarios import (  # noqa: E402
     ScenarioSpec,
     apply_standard_scenario,
@@ -112,7 +112,10 @@ def _build_scenario_plan(
     """Build and hash the single canonical selection used by every model."""
 
     gallery_ids = tuple(gallery_canonical_ids)
-    if not re.fullmatch(r"[0-9a-f]{64}", trial_manifest_sha256):
+    if (
+        not isinstance(trial_manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", trial_manifest_sha256) is None
+    ):
         raise ValueError("trial manifest SHA-256 is invalid")
     if tuple(config.name for config in decoder_configs) != DECODER_NAMES:
         raise ValueError("scenario plan requires the exact five decoder configs")
@@ -336,12 +339,10 @@ def _validate_scenario_manifest(
     ]
     if payload.get("decoder_configs") != expected_decoders:
         raise ValueError("scenario manifest decoder configuration is invalid")
+    trial_manifest_sha256 = payload.get("trial_manifest_sha256")
     if (
-        re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(payload.get("trial_manifest_sha256")),
-        )
-        is None
+        not isinstance(trial_manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", trial_manifest_sha256) is None
     ):
         raise ValueError("scenario manifest trial-manifest hash is invalid")
     return payload
@@ -450,7 +451,7 @@ def run_scenarios(
     )
     protocol = Protocol.load(protocol_path)
     protocol.assert_formal_scope()
-    artifacts, artifact_hashes = _load_formal_artifacts(
+    artifacts, artifact_hashes, trial_manifest_sha256 = _load_formal_artifacts(
         artifact_root,
         trial_manifest_path=trial_manifest_path,
         expected_image_count=200,
@@ -467,7 +468,7 @@ def run_scenarios(
     plan = _build_scenario_plan(
         common_gallery,
         seed=protocol.seed,
-        trial_manifest_sha256=sha256_file(trial_manifest_path),
+        trial_manifest_sha256=trial_manifest_sha256,
         decoder_configs=configs,
     )
     staging = Path(
@@ -546,6 +547,49 @@ def _validated_existing_file(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _read_regular_file_nofollow(path: Path, label: str) -> bytes:
+    """Read one immutable byte snapshot through a no-follow descriptor."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"could not securely open {label}: {path}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        value = b"".join(chunks)
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if len(value) != before.st_size or before_identity != after_identity:
+            raise ValueError(f"{label} changed while being read")
+        return value
+    except OSError as error:
+        raise ValueError(f"could not securely read {label}: {path}") from error
+    finally:
+        os.close(descriptor)
+
+
 def _validated_output_directory(path: Path) -> Path:
     path = Path(path)
     if path.is_symlink():
@@ -572,6 +616,7 @@ def _load_formal_artifacts(
 ) -> tuple[
     dict[str, dict[str, ScoreArtifact]],
     dict[str, dict[str, str]],
+    str,
 ]:
     artifact_root = _validated_existing_directory(
         artifact_root,
@@ -618,21 +663,21 @@ def _load_formal_artifacts(
     if any(set(artifacts[model]) != {"standard", "a", "b"} for model in _MODEL_ORDER):
         raise ValueError("strict Task 6 inventory roles are incomplete")
 
+    trial_bytes = _read_regular_file_nofollow(trial_manifest_path, "trial manifest")
+    trial_hash = hashlib.sha256(trial_bytes).hexdigest()
     try:
-        trial_text = trial_manifest_path.read_text(encoding="utf-8")
-        trial_manifest = json.loads(trial_text)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        trial_manifest = json.loads(trial_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("trial manifest must be valid UTF-8 JSON") from error
     common_gallery = artifacts["nice"]["standard"].gallery_canonical_ids
     validate_trial_manifest(trial_manifest, common_gallery)
-    trial_hash = sha256_file(trial_manifest_path)
     for model in _MODEL_ORDER:
         for artifact in artifacts[model].values():
             if artifact.metadata.get("trial_manifest_sha256") != trial_hash:
                 raise ValueError("formal artifact does not bind the supplied trial manifest")
             if artifact.gallery_canonical_ids != common_gallery:
                 raise ValueError("all nine artifacts must share canonical gallery order")
-    return artifacts, hashes
+    return artifacts, hashes, trial_hash
 
 
 def _result_record(

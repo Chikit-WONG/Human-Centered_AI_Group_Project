@@ -285,6 +285,22 @@ def test_scenario_plan_is_shared_byte_stable_and_hash_bound_across_models() -> N
             tampered_bytes,
             hashlib.sha256(tampered_bytes).hexdigest(),
         )
+    numeric_hash = int("1" * 64)
+    with pytest.raises(ValueError, match="SHA-256"):
+        runner._build_scenario_plan(
+            gallery,
+            seed=42,
+            trial_manifest_sha256=numeric_hash,
+            decoder_configs=configs,
+        )
+    numeric_payload = json.loads(first.manifest_bytes)
+    numeric_payload["trial_manifest_sha256"] = numeric_hash
+    numeric_bytes = runner._json_bytes(numeric_payload)
+    with pytest.raises(ValueError, match="trial-manifest hash"):
+        runner._validate_scenario_manifest(
+            numeric_bytes,
+            hashlib.sha256(numeric_bytes).hexdigest(),
+        )
 
     selections = []
     selection_objects = []
@@ -505,17 +521,31 @@ def test_lightweight_runner_publishes_exact_grid_manifest_and_cleans_failures(
 ) -> None:
     runner = _load_runner()
     artifacts, hashes = _synthetic_formal_artifacts()
-    monkeypatch.setattr(
-        runner,
-        "_load_formal_artifacts",
-        lambda *args, **kwargs: (artifacts, hashes),
-    )
     monkeypatch.setattr(runner, "evaluate_artifact", _lightweight_evaluation)
     results_root = tmp_path / "matching_fairness_v3"
     (results_root / "manifests").mkdir(parents=True)
     (results_root / "matrices").mkdir()
     trial_manifest = results_root / "manifests" / "trial.json"
     trial_manifest.write_text("{}\n", encoding="utf-8")
+    verified_trial_hash = hashlib.sha256(trial_manifest.read_bytes()).hexdigest()
+
+    def load_then_replace_manifest(*_args, **_kwargs):
+        def verified_result():
+            yield artifacts
+            yield hashes
+            yield verified_trial_hash
+            # Three-value unpacking advances once more to confirm exhaustion.
+            # This replacement therefore occurs after the loader has returned
+            # and before the caller starts constructing its scenario plan.
+            trial_manifest.write_text('{"replaced":true}\n', encoding="utf-8")
+
+        return verified_result()
+
+    monkeypatch.setattr(
+        runner,
+        "_load_formal_artifacts",
+        load_then_replace_manifest,
+    )
     output = results_root / "runs"
 
     count = runner.run_scenarios(
@@ -535,9 +565,8 @@ def test_lightweight_runner_publishes_exact_grid_manifest_and_cleans_failures(
     manifest = output / "scenario_manifest.json"
     manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["trial_manifest_sha256"] == hashlib.sha256(
-        trial_manifest.read_bytes()
-    ).hexdigest()
+    assert payload["trial_manifest_sha256"] == verified_trial_hash
+    assert hashlib.sha256(trial_manifest.read_bytes()).hexdigest() != verified_trial_hash
     records = []
     selections: dict[int, list[object]] = {}
     for path in summaries:
