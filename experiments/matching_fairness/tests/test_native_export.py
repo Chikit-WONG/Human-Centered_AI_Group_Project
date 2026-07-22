@@ -1,0 +1,496 @@
+from __future__ import annotations
+
+import json
+import math
+import subprocess
+import textwrap
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from matching_fairness.artifacts import (
+    ScoreArtifact,
+    independent_ranks,
+    read_score_artifact,
+    write_score_artifact,
+)
+from matching_fairness.native_export import (
+    NativeExportConfig,
+    audit_native_checkpoints,
+    build_native_score_artifact,
+    evaluate_native_checkpoint,
+    export_native_scores,
+    native_scores,
+)
+from matching_fairness.provenance import inspect_checkout, sha256_file
+from matching_fairness.trial_splits import build_trial_manifest
+
+
+FAKE_URL = "https://example.invalid/native-export.git"
+
+
+def test_atms_uses_normalized_native_scores() -> None:
+    eeg = np.array([[3.0, 4.0], [0.0, 2.0]])
+    image = np.array([[4.0, 3.0], [2.0, 0.0]])
+
+    scores = native_scores("atm_s", eeg, image, logit_scale=2.0)
+
+    eeg_unit = eeg / np.linalg.norm(eeg, axis=1, keepdims=True)
+    image_unit = image / np.linalg.norm(image, axis=1, keepdims=True)
+    expected = 2.0 * eeg_unit @ image_unit.T
+    np.testing.assert_allclose(scores, expected)
+
+
+def test_nice_uses_official_raw_logit_scores() -> None:
+    eeg = np.array([[3.0, 4.0], [0.0, 2.0]])
+    image = np.array([[4.0, 3.0], [2.0, 0.0]])
+
+    scores = native_scores("nice", eeg, image, logit_scale=2.0)
+
+    np.testing.assert_allclose(scores, 2.0 * eeg @ image.T)
+
+
+@pytest.mark.parametrize(
+    "eeg,image,message",
+    (
+        (
+            np.array([[0.0, 0.0]]),
+            np.array([[1.0, 0.0]]),
+            "nonzero EEG row norms",
+        ),
+        (
+            np.array([[1.0, 0.0]]),
+            np.array([[0.0, 0.0]]),
+            "nonzero image row norms",
+        ),
+        (
+            np.array([[np.nan, 0.0]]),
+            np.array([[1.0, 0.0]]),
+            "finite",
+        ),
+    ),
+)
+def test_atms_rejects_invalid_normalization_inputs(
+    eeg: np.ndarray,
+    image: np.ndarray,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        native_scores("atm_s", eeg, image, logit_scale=1.0)
+
+
+def test_native_artifact_ranking_uses_canonical_ids_not_diagonal() -> None:
+    eeg = np.array([[1.0, 0.0], [0.0, 1.0]])
+    image = np.array([[0.0, 1.0], [1.0, 0.0]])
+    scores = native_scores("nice", eeg, image, logit_scale=1.0)
+
+    artifact = build_native_score_artifact(
+        model="nice",
+        similarity=scores,
+        query_ids=("query-a", "query-b"),
+        gallery_ids=("image-b", "image-a"),
+        target_ids=("image-a", "image-b"),
+        trial_half="standard",
+        checkpoint=Path("best_val.pth"),
+        checkpoint_sha256="a" * 64,
+        logit_scale=1.0,
+        query_embeddings=eeg,
+    )
+
+    assert independent_ranks(artifact).tolist() == [1, 1]
+    assert artifact.metadata["native_metrics"] == {
+        "top1_count": 2,
+        "top5_count": 2,
+        "sample_count": 2,
+    }
+
+
+class _TinyEncoder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(2))
+        self.logit_scale = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, eeg: torch.Tensor) -> torch.Tensor:
+        return eeg @ self.weight
+
+
+def _checkpoint(path: Path, raw_logit_scale: float) -> Path:
+    model = _TinyEncoder()
+    model.logit_scale.data.fill_(raw_logit_scale)
+    torch.save(model.state_dict(), path)
+    return path
+
+
+def test_checkpoint_raw_logit_scale_drives_effective_export_scale(
+    tmp_path: Path,
+) -> None:
+    eeg = np.eye(2, dtype=np.float32)
+    image = np.eye(2, dtype=np.float32)
+    low = _checkpoint(tmp_path / "low.pth", math.log(2.0))
+    high = _checkpoint(tmp_path / "high.pth", math.log(5.0))
+
+    low_result = evaluate_native_checkpoint(
+        model=_TinyEncoder(),
+        checkpoint=low,
+        model_slug="nice",
+        eeg=eeg,
+        image_features=image,
+        subject_index=7,
+        device=torch.device("cpu"),
+    )
+    high_result = evaluate_native_checkpoint(
+        model=_TinyEncoder(),
+        checkpoint=high,
+        model_slug="nice",
+        eeg=eeg,
+        image_features=image,
+        subject_index=7,
+        device=torch.device("cpu"),
+    )
+
+    assert low_result.logit_scale == pytest.approx(2.0)
+    assert high_result.logit_scale == pytest.approx(5.0)
+    np.testing.assert_allclose(low_result.similarity, 2.0 * np.eye(2))
+    np.testing.assert_allclose(high_result.similarity, 5.0 * np.eye(2))
+
+
+
+def _git(checkout: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(checkout), *arguments],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _fake_locked_checkout(root: Path) -> tuple[Path, Path]:
+    checkout = root / "official"
+    subprocess.run(
+        ["git", "init", str(checkout)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _git(checkout, "config", "user.email", "test@example.com")
+    _git(checkout, "config", "user.name", "Test")
+    _git(checkout, "remote", "add", "origin", FAKE_URL)
+    sources = {
+        "Retrieval/train_unified.py": "raise RuntimeError(\"sealed\")\n",
+        "Retrieval/retrieval_engine.py": "raise RuntimeError(\"sealed\")\n",
+        "eegdatasets.py": "raise RuntimeError(\"sealed\")\n",
+        "encoder_utils.py": "raise RuntimeError(\"sealed\")\n",
+        "models/atms.py": "ORIGIN = \"locked\"\n",
+        "Retrieval/eeg_encoders.py": r"""
+            import torch
+
+            class TinyOfficialEncoder(torch.nn.Module):
+                def __init__(self, encoder_type):
+                    super().__init__()
+                    self.encoder_type = encoder_type
+                    self.weight = torch.nn.Parameter(torch.eye(2))
+                    self.logit_scale = torch.nn.Parameter(torch.tensor(0.0))
+
+                def forward(self, eeg, subject_ids=None):
+                    if self.encoder_type == "ATMS":
+                        assert subject_ids is not None
+                        assert subject_ids.tolist() == [7] * len(eeg)
+                    else:
+                        assert subject_ids is None
+                    return eeg.squeeze(1) @ self.weight
+
+            def build_encoder(
+                encoder_type,
+                n_chans=63,
+                n_times=250,
+                joint_train=False,
+                **kwargs,
+            ):
+                assert encoder_type in {"NICE", "ATMS"}
+                assert n_chans == 1
+                assert n_times == 2
+                assert joint_train is False
+                assert kwargs == {}
+                return TinyOfficialEncoder(encoder_type)
+        """,
+    }
+    for relative, source in sources.items():
+        path = checkout / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    _git(checkout, "add", ".")
+    _git(checkout, "commit", "-m", "fake official source")
+    _git(checkout, "checkout", "--detach", "HEAD")
+    lock = inspect_checkout(
+        checkout,
+        expected_url=FAKE_URL,
+        expected_branch="develop",
+    )
+    lock_path = root / "source_lock.json"
+    lock_path.write_text(
+        json.dumps(lock.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return checkout, lock_path
+
+
+def _native_export_config(root: Path) -> NativeExportConfig:
+    checkout, source_lock = _fake_locked_checkout(root)
+    image_ids = ("image-a", "image-b")
+    sessions = np.tile(np.repeat(np.arange(4), 20), (2, 1))
+    manifest = build_trial_manifest(image_ids, sessions, seed=42)
+    manifest_path = root / "trial_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    eeg = np.empty((2, 80, 1, 2), dtype=np.float32)
+    for image_index, image_id in enumerate(image_ids):
+        a_indices = [
+            index
+            for split in manifest["images"][image_id].values()
+            for index in split["a"]
+        ]
+        b_indices = [
+            index
+            for split in manifest["images"][image_id].values()
+            for index in split["b"]
+        ]
+        if image_index == 0:
+            eeg[image_index, a_indices] = np.array([[[1.0, 0.0]]])
+            eeg[image_index, b_indices] = np.array([[[0.8, 0.2]]])
+        else:
+            eeg[image_index, a_indices] = np.array([[[0.0, 1.0]]])
+            eeg[image_index, b_indices] = np.array([[[0.2, 0.8]]])
+    test_eeg = root / "preprocessed_eeg_test.npy"
+    np.save(test_eeg, {"preprocessed_eeg_data": eeg}, allow_pickle=True)
+    test_features = root / "ViT-H-14_features_test.pt"
+    torch.save(
+        {
+            "img_features": torch.eye(2),
+            "text_features": torch.eye(2),
+        },
+        test_features,
+    )
+    test_images = root / "test_images"
+    (test_images / "class-a").mkdir(parents=True)
+    (test_images / "class-b").mkdir()
+    (test_images / "class-a/image-a.jpg").write_bytes(b"a")
+    (test_images / "class-b/image-b.jpg").write_bytes(b"b")
+
+    checkpoint_dir = root / "checkpoints/nice"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoints = {}
+    for name, raw_scale, weight in (
+        ("epoch_0001.pth", math.log(2.0), torch.eye(2)),
+        ("epoch_0002.pth", math.log(3.0), torch.tensor([[0.0, 1.0], [1.0, 0.0]])),
+        ("best_val.pth", math.log(2.0), torch.eye(2)),
+    ):
+        encoder = _TinyEncoder()
+        encoder.logit_scale.data.fill_(raw_scale)
+        encoder.weight.data.copy_(weight)
+        checkpoint = checkpoint_dir / name
+        torch.save(encoder.state_dict(), checkpoint)
+        checkpoints[name] = checkpoint
+    checkpoints["best_val.pth"].write_bytes(
+        checkpoints["epoch_0001.pth"].read_bytes()
+    )
+    checkpoint_manifest = {
+        "schema_version": 1,
+        "model": "nice",
+        "subject": "sub-08",
+        "checkpoints": [
+            {
+                "epoch": epoch,
+                "val_loss": value,
+                "checkpoint": f"epoch_{epoch:04d}.pth",
+                "sha256": sha256_file(checkpoints[f"epoch_{epoch:04d}.pth"]),
+            }
+            for epoch, value in ((1, 0.2), (2, 0.4))
+        ],
+        "selection": {
+            "epoch": 1,
+            "val_loss": 0.2,
+            "checkpoint": "epoch_0001.pth",
+        },
+        "best_checkpoint": {
+            "name": "best_val.pth",
+            "sha256": sha256_file(checkpoints["best_val.pth"]),
+        },
+    }
+    (checkpoint_dir / "checkpoint_manifest.json").write_text(
+        json.dumps(checkpoint_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return NativeExportConfig(
+        source_checkout=checkout,
+        source_lock=source_lock,
+        test_eeg=test_eeg,
+        test_features=test_features,
+        test_images=test_images,
+        trial_manifest=manifest_path,
+        checkpoint_dir=checkpoint_dir,
+        output_dir=root / "scores/nice",
+        model="nice",
+        subject="sub-08",
+        device="cpu",
+        expected_image_count=2,
+        n_chans=1,
+        n_times=2,
+    )
+
+
+def _complete_formal_inventory(
+    root: Path,
+    native_paths: dict[str, Path],
+) -> tuple[Path, ...]:
+    paths = list(native_paths.values())
+    template = read_score_artifact(native_paths["standard"])
+    for model in ("atm_s", "our_project"):
+        for half in ("standard", "a", "b"):
+            path = root / "inventory" / model / half
+            write_score_artifact(
+                path,
+                ScoreArtifact(
+                    similarity=template.similarity,
+                    query_ids=template.query_ids,
+                    gallery_entry_ids=template.gallery_entry_ids,
+                    gallery_canonical_ids=template.gallery_canonical_ids,
+                    target_canonical_ids=template.target_canonical_ids,
+                    metadata={"model_slug": model, "trial_half": half},
+                ),
+            )
+            paths.append(path)
+    return tuple(paths)
+
+
+def test_native_export_publishes_main_artifacts_before_separate_audit(
+    tmp_path: Path,
+) -> None:
+    config = _native_export_config(tmp_path)
+
+    result = export_native_scores(config)
+
+    assert set(result.artifact_paths) == {"standard", "eeg_a", "eeg_b"}
+    assert set(result.artifact_hashes) == {"standard", "eeg_a", "eeg_b"}
+    artifacts = {
+        half: read_score_artifact(path)
+        for half, path in result.artifact_paths.items()
+    }
+    assert artifacts["standard"].similarity.shape == (2, 2)
+    assert artifacts["eeg_a"].gallery_canonical_ids == artifacts["eeg_b"].gallery_canonical_ids
+    assert (
+        artifacts["eeg_a"].metadata["query_embeddings_sha256"]
+        != artifacts["eeg_b"].metadata["query_embeddings_sha256"]
+    )
+    assert artifacts["standard"].metadata["checkpoint"].endswith("best_val.pth")
+    standard_ranks = independent_ranks(artifacts["standard"])
+    assert artifacts["standard"].metadata["native_metrics"] == {
+        "top1_count": int(np.count_nonzero(standard_ranks <= 1)),
+        "top5_count": int(np.count_nonzero(standard_ranks <= 5)),
+        "sample_count": 2,
+    }
+    assert not (config.output_dir / "best_test_audit.json").exists()
+
+    inventory = _complete_formal_inventory(tmp_path, result.artifact_paths)
+    audit_path = audit_native_checkpoints(config, inventory)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+
+    assert audit["scope"] == "best_test_audit_only"
+    assert len(audit["formal_artifact_inventory"]) == 9
+    assert [row["epoch"] for row in audit["runs"]] == [1, 2]
+    assert audit["best_test"]["epoch"] == 1
+    assert {
+        path.name for path in config.output_dir.iterdir()
+    } == {"standard", "eeg_a", "eeg_b", "best_test_audit.json"}
+
+
+
+def test_native_export_cli_maps_only_fixed_protocol_fields(tmp_path: Path) -> None:
+    from matching_fairness.config import Protocol
+    from scripts.export_native_scores import native_export_config_from_protocol
+
+    protocol = Protocol.load(
+        Path(__file__).resolve().parents[1] / "configs/protocol_sub08_seed42.json"
+    )
+    config = native_export_config_from_protocol(
+        protocol=protocol,
+        source_checkout=tmp_path / "source",
+        source_lock=tmp_path / "source.json",
+        test_eeg=tmp_path / "preprocessed_eeg_test.npy",
+        test_features=tmp_path / "ViT-H-14_features_test.pt",
+        test_images=tmp_path / "test_images",
+        trial_manifest=tmp_path / "trials.json",
+        checkpoint_dir=tmp_path / "checkpoints/nice",
+        output_dir=tmp_path / "scores/nice",
+        model="nice",
+        device="cpu",
+    )
+
+    assert config.subject == "sub-08"
+    assert config.expected_image_count == 200
+    assert config.n_chans == 63
+    assert config.n_times == 250
+    assert config.logit_scale_type == "exp"
+
+
+def test_brainrw_cli_builds_three_separate_evaluator_commands(tmp_path: Path) -> None:
+    from scripts.export_brainrw_scores import build_evaluator_commands, build_parser
+
+    manifest = tmp_path / "trials.json"
+    arguments = build_parser().parse_args(
+        [
+            "--brain-model-path",
+            "brain.pt",
+            "--vision-adapter-path",
+            "adapter",
+            "--pretrained-model-name-or-path",
+            "clip",
+            "--brain-directory",
+            "brain",
+            "--image-directory",
+            "images",
+            "--selected-channels",
+            "Cz",
+            "--trial-split-manifest",
+            str(manifest),
+            "--output-dir",
+            str(tmp_path / "scores"),
+        ]
+    )
+
+    commands = build_evaluator_commands(arguments)
+
+    assert set(commands) == {"standard", "eeg_a", "eeg_b"}
+    standard = commands["standard"]
+    assert "--trial-split-manifest" not in standard
+    assert standard[standard.index("--trial-half") + 1] == "standard"
+    for name, half in (("eeg_a", "a"), ("eeg_b", "b")):
+        command = commands[name]
+        assert command[command.index("--trial-half") + 1] == half
+        assert command[command.index("--trial-split-manifest") + 1] == str(manifest)
+        artifact = command[command.index("--score-artifact-output") + 1]
+        assert artifact.endswith(f"/{name}")
+
+
+
+def test_native_export_rejects_manifest_with_extra_canonical_id(
+    tmp_path: Path,
+) -> None:
+    config = _native_export_config(tmp_path)
+    manifest = json.loads(config.trial_manifest.read_text(encoding="utf-8"))
+    manifest["image_ids"].append("extra-image")
+    manifest["images"]["extra-image"] = manifest["images"]["image-a"]
+    config.trial_manifest.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="canonical image IDs"):
+        export_native_scores(config)

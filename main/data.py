@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+from collections.abc import Mapping
 from pathlib import Path
 from tqdm import tqdm
 from typing import (
@@ -372,12 +373,33 @@ def load_things_brain_dataset(
     brain_column: Literal["eeg", "meg"] = "eeg",
     avg_trials: bool = True,
     selected_channels: Optional[Union[str, Sequence[str]]] = None,
+    trial_indices_by_image: Optional[Mapping[str, Sequence[int]]] = None,
+    expected_trial_count: Optional[int] = None,
 ) -> datasets.Dataset:
     """Build HF Dataset with columns:
     - {brain_key}: Array2D float32 [C, T]
     - image_id: string
     - subject_id: int32
     """
+
+    if trial_indices_by_image is not None:
+        if split != "test":
+            raise ValueError("explicit trial selection requires split='test'")
+        if not avg_trials:
+            raise ValueError("explicit trial selection requires avg_trials=True")
+        if not isinstance(trial_indices_by_image, Mapping):
+            raise ValueError("trial_indices_by_image must be a mapping")
+    if expected_trial_count is not None:
+        if (
+            isinstance(expected_trial_count, bool)
+            or not isinstance(expected_trial_count, int)
+            or expected_trial_count <= 0
+        ):
+            raise ValueError("expected_trial_count must be a positive integer")
+        if trial_indices_by_image is None:
+            raise ValueError(
+                "expected_trial_count requires trial_indices_by_image"
+            )
 
     if isinstance(subject_ids, int):
         subject_ids = (subject_ids,)
@@ -397,6 +419,78 @@ def load_things_brain_dataset(
         pt_path = Path(data_directory).joinpath(f"sub-{sid:02d}", f"{split}.pt")
         loaded = torch.load(str(pt_path), weights_only=False)
         x = torch.as_tensor(loaded[brain_column])
+        imgs = np.array(loaded["img"])
+
+        if trial_indices_by_image is not None:
+            if x.ndim != 4:
+                raise ValueError(
+                    "explicit trial selection requires an original 4-D test tensor"
+                )
+            if imgs.ndim == 2:
+                if imgs.shape[:2] != x.shape[:2]:
+                    raise ValueError(
+                        "Brain/image trial shape mismatch for explicit selection: "
+                        f"{tuple(x.shape[:2])} vs {tuple(imgs.shape)} in {pt_path}"
+                    )
+                image_ids = []
+                for image_index, row in enumerate(imgs):
+                    row_ids = [Path(str(value)).stem for value in row.tolist()]
+                    if len(set(row_ids)) != 1:
+                        raise ValueError(
+                            "Brain image trial row contains mixed image IDs at "
+                            f"row {image_index} in {pt_path}"
+                        )
+                    image_ids.append(row_ids[0])
+            elif imgs.ndim == 1 and len(imgs) == x.shape[0]:
+                image_ids = [Path(str(value)).stem for value in imgs.tolist()]
+            else:
+                raise ValueError(
+                    "explicit trial selection requires one image identity per "
+                    f"4-D tensor row in {pt_path}"
+                )
+            if len(set(image_ids)) != len(image_ids):
+                raise ValueError("Brain test image IDs must be unique")
+            actual_ids = set(trial_indices_by_image)
+            expected_ids = set(image_ids)
+            if actual_ids != expected_ids:
+                missing = sorted(expected_ids - actual_ids)
+                extra = sorted(actual_ids - expected_ids)
+                raise ValueError(
+                    "trial selection requires exact image-ID coverage; "
+                    f"missing={missing}, extra={extra}"
+                )
+
+            selected_rows = []
+            for image_index, image_id in enumerate(image_ids):
+                raw_indices = trial_indices_by_image[image_id]
+                if not isinstance(raw_indices, Sequence) or isinstance(
+                    raw_indices, (str, bytes)
+                ):
+                    raise ValueError("trial indices must be sequences of integers")
+                values = tuple(raw_indices)
+                if not values:
+                    raise ValueError("trial indices must be non-empty")
+                if any(
+                    isinstance(index, bool)
+                    or not isinstance(index, (int, np.integer))
+                    for index in values
+                ):
+                    raise ValueError("trial indices must be integers")
+                indices = np.asarray(values, dtype=np.int64)
+                if len(np.unique(indices)) != len(indices):
+                    raise ValueError("trial indices must be unique per image")
+                if np.any(indices < 0) or np.any(indices >= x.shape[1]):
+                    raise ValueError("trial index is out of range")
+                if (
+                    expected_trial_count is not None
+                    and len(indices) != expected_trial_count
+                ):
+                    raise ValueError(
+                        "formal trial selection requires exactly "
+                        f"{expected_trial_count} trials per image"
+                    )
+                selected_rows.append(x[image_index, indices].mean(dim=0))
+            x = torch.stack(selected_rows)
 
         if x.ndim == 4:
             if avg_trials:
@@ -411,7 +505,6 @@ def load_things_brain_dataset(
         if sel_idx is not None:
             x = x[:, sel_idx, :]
 
-        imgs = np.array(loaded["img"])
         if avg_trials:
             if imgs.ndim == 2:
                 imgs = imgs[:, 0]

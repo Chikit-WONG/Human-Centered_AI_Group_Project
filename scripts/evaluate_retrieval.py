@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 import csv
 import hashlib
 import json
@@ -31,6 +32,9 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+MATCHING_FAIRNESS_ROOT = PROJECT_ROOT / "experiments/matching_fairness"
+if str(MATCHING_FAIRNESS_ROOT) not in sys.path:
+    sys.path.insert(0, str(MATCHING_FAIRNESS_ROOT))
 
 from main.data import (  # noqa: E402
     load_image_dataset,
@@ -38,12 +42,145 @@ from main.data import (  # noqa: E402
     merge_datasets_by_image_id,
 )
 from main.models_clip import BrainCLIPModel  # noqa: E402
+from matching_fairness.artifacts import (  # noqa: E402
+    ScoreArtifact,
+    independent_ranks,
+    write_score_artifact,
+)
 
 HUNGARIAN_PRIMARY_ORDER_SEED = 3800
 HUNGARIAN_AUDIT_ORDER_SEEDS = tuple(range(3801, 3809))
 
 
-def parse_args() -> argparse.Namespace:
+def build_brainrw_score_artifact(
+    *,
+    similarity: np.ndarray,
+    query_embeddings: np.ndarray,
+    query_ids: Sequence[str],
+    gallery_ids: Sequence[str],
+    trial_half: str,
+    brain_model_path: Path,
+    top1_count: int,
+    top5_count: int,
+) -> ScoreArtifact:
+    """Build a BrainRW artifact and verify canonical-ID metric parity."""
+    if trial_half not in {"standard", "a", "b"}:
+        raise ValueError("trial_half must be standard, a, or b")
+    query_ids = tuple(query_ids)
+    gallery_ids = tuple(gallery_ids)
+    artifact = ScoreArtifact(
+        similarity=np.ascontiguousarray(similarity, dtype=np.float32),
+        query_ids=query_ids,
+        gallery_entry_ids=gallery_ids,
+        gallery_canonical_ids=gallery_ids,
+        target_canonical_ids=query_ids,
+        metadata={
+            "model_slug": "our_project",
+            "trial_half": trial_half,
+            "checkpoint_role": "fixed_formal",
+            "checkpoint": str(Path(brain_model_path)),
+            "similarity": "cosine",
+            "query_embeddings_sha256": sha256_array(query_embeddings),
+        },
+    )
+    ranks = independent_ranks(artifact)
+    metrics = {
+        "top1_count": int(np.count_nonzero(ranks <= 1)),
+        "top5_count": int(np.count_nonzero(ranks <= 5)),
+        "sample_count": len(ranks),
+    }
+    expected = {
+        "top1_count": top1_count,
+        "top5_count": top5_count,
+        "sample_count": len(query_ids),
+    }
+    if metrics != expected:
+        raise ValueError(
+            f"BrainRW ScoreArtifact metric parity failed: {metrics} != {expected}"
+        )
+    metadata = dict(artifact.metadata)
+    metadata["native_metrics"] = metrics
+    artifact = ScoreArtifact(
+        similarity=artifact.similarity,
+        query_ids=artifact.query_ids,
+        gallery_entry_ids=artifact.gallery_entry_ids,
+        gallery_canonical_ids=artifact.gallery_canonical_ids,
+        target_canonical_ids=artifact.target_canonical_ids,
+        metadata=metadata,
+    )
+    artifact.validate()
+    return artifact
+
+
+def load_trial_indices_by_image(
+    path: Path, half: str
+) -> dict[str, tuple[int, ...]]:
+    """Load one canonical 40-trial half from a Task 4 manifest."""
+    if half not in {"a", "b"}:
+        raise ValueError("trial half must be a or b")
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid trial split manifest: {path}") from error
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
+        raise ValueError("trial split manifest must use schema_version 1")
+    images = payload.get("images")
+    image_ids = payload.get("image_ids")
+    if (
+        not isinstance(images, Mapping)
+        or not isinstance(image_ids, list)
+        or not image_ids
+        or any(not isinstance(value, str) or not value for value in image_ids)
+        or len(set(image_ids)) != len(image_ids)
+        or set(images) != set(image_ids)
+    ):
+        raise ValueError("trial split manifest has invalid canonical image IDs")
+
+    result: dict[str, tuple[int, ...]] = {}
+    for image_id in image_ids:
+        sessions = images[image_id]
+        if not isinstance(sessions, Mapping) or len(sessions) != 4:
+            raise ValueError("each manifest image must contain exactly 4 sessions")
+        selected: list[int] = []
+        all_indices: list[int] = []
+        for split in sessions.values():
+            if not isinstance(split, Mapping):
+                raise ValueError("manifest session split must be a mapping")
+            halves: dict[str, tuple[int, ...]] = {}
+            for name in ("a", "b"):
+                value = split.get(name)
+                if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+                    raise ValueError("manifest trial indices must be sequences")
+                indices = tuple(value)
+                if (
+                    len(indices) != 10
+                    or any(
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or not 0 <= index < 80
+                        for index in indices
+                    )
+                    or len(set(indices)) != len(indices)
+                ):
+                    raise ValueError(
+                        "each manifest session half must contain 10 unique "
+                        "in-range trial indices"
+                    )
+                halves[name] = indices
+            if set(halves["a"]).intersection(halves["b"]):
+                raise ValueError("manifest session halves must not overlap")
+            selected.extend(halves[half])
+            all_indices.extend(halves["a"])
+            all_indices.extend(halves["b"])
+        if len(selected) != 40 or len(set(selected)) != 40:
+            raise ValueError("manifest half must select exactly 40 unique trials")
+        if len(all_indices) != 80 or len(set(all_indices)) != 80:
+            raise ValueError("manifest sessions must account for 80 distinct trials")
+        result[image_id] = tuple(selected)
+    return result
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate final-checkpoint 200-way EEG-to-image retrieval."
     )
@@ -85,8 +222,17 @@ def parse_args() -> argparse.Namespace:
         help="Auditable NPZ containing the full similarity matrix and ID order.",
     )
     parser.add_argument("--expected-top1-count", type=int)
+    parser.add_argument("--trial-split-manifest", type=Path)
+    parser.add_argument("--score-artifact-output", type=Path)
+    parser.add_argument(
+        "--trial-half", choices=("standard", "a", "b"), default="standard"
+    )
     parser.add_argument("--expected-top5-count", type=int)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.trial_half == "standard" and args.trial_split_manifest is not None:
+        parser.error("--trial-half standard rejects --trial-split-manifest")
+    if args.trial_half in {"a", "b"} and args.trial_split_manifest is None:
+        parser.error(f"--trial-half {args.trial_half} requires --trial-split-manifest")
     if args.enable_hungarian and not args.hungarian_output:
         parser.error("--enable-hungarian requires --hungarian-output")
     if args.enable_hungarian and not args.similarity_output:
@@ -128,6 +274,13 @@ def resolve_device_and_dtype(
 
 
 def build_dataset(args: argparse.Namespace) -> datasets.Dataset:
+    trial_half = getattr(args, "trial_half", "standard")
+    manifest = getattr(args, "trial_split_manifest", None)
+    trial_indices = (
+        None
+        if trial_half == "standard"
+        else load_trial_indices_by_image(manifest, trial_half)
+    )
     brain_dataset = load_things_brain_dataset(
         data_directory=args.brain_directory,
         split="test",
@@ -135,6 +288,8 @@ def build_dataset(args: argparse.Namespace) -> datasets.Dataset:
         brain_column="eeg",
         avg_trials=True,
         selected_channels=args.selected_channels,
+        trial_indices_by_image=trial_indices,
+        expected_trial_count=40 if trial_indices is not None else None,
     )
     image_dataset = load_image_dataset(
         dataset_name=args.dataset_name,
@@ -314,6 +469,8 @@ def main() -> None:
     output_values = [args.metrics_output, args.predictions_output]
     if args.enable_hungarian:
         output_values.extend([args.hungarian_output, args.similarity_output])
+    if args.score_artifact_output is not None:
+        output_values.append(args.score_artifact_output)
     resolved_outputs = [str(Path(value).resolve()) for value in output_values]
     if len(resolved_outputs) != len(set(resolved_outputs)):
         raise ValueError("all evaluator output paths must be distinct")
@@ -418,6 +575,9 @@ def main() -> None:
     top1_count = int(correct_top1.sum().item())
     top5_count = int(correct_top5.sum().item())
     sample_count = len(query_ids)
+    similarity_array = np.ascontiguousarray(
+        cosine_similarity.numpy(), dtype=np.float32
+    )
 
     if (
         args.expected_top1_count is not None
@@ -436,13 +596,23 @@ def main() -> None:
             f"expected {args.expected_top5_count}, found {top5_count}"
         )
 
+    if args.score_artifact_output is not None:
+        score_artifact = build_brainrw_score_artifact(
+            similarity=similarity_array,
+            query_embeddings=brain_embeddings.numpy(),
+            query_ids=query_ids,
+            gallery_ids=gallery_ids,
+            trial_half=args.trial_half,
+            brain_model_path=Path(args.brain_model_path).resolve(),
+            top1_count=top1_count,
+            top5_count=top5_count,
+        )
+        write_score_artifact(args.score_artifact_output, score_artifact)
+
     hungarian_metrics: dict[str, Any] | None = None
     hungarian_path: Path | None = None
     similarity_path: Path | None = None
     if args.enable_hungarian:
-        similarity_array = np.ascontiguousarray(
-            cosine_similarity.numpy(), dtype=np.float32
-        )
         target_array = np.ascontiguousarray(targets.numpy(), dtype=np.int64)
         if similarity_array.shape != (sample_count, sample_count):
             raise ValueError(

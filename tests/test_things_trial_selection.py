@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from main.data import load_things_brain_dataset
+from scripts.evaluate_retrieval import (
+    build_brainrw_score_artifact,
+    load_trial_indices_by_image,
+    parse_args,
+)
+
+
+def _write_brain_file(
+    root: Path,
+    *,
+    split: str = "test",
+    trial_count: int = 8,
+    four_dimensional: bool = True,
+) -> torch.Tensor:
+    subject_dir = root / "sub-08"
+    subject_dir.mkdir(parents=True)
+    if four_dimensional:
+        eeg = torch.arange(
+            2 * trial_count * 3 * 4,
+            dtype=torch.float32,
+        ).reshape(2, trial_count, 3, 4)
+        images = np.array(
+            [
+                ["image-0.jpg"] * trial_count,
+                ["image-1.jpg"] * trial_count,
+            ],
+            dtype=object,
+        )
+    else:
+        eeg = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+        images = np.array(["image-0.jpg", "image-1.jpg"], dtype=object)
+    torch.save(
+        {
+            "eeg": eeg,
+            "label": torch.arange(2),
+            "img": images,
+        },
+        subject_dir / f"{split}.pt",
+    )
+    return eeg
+
+
+def test_explicit_trial_indices_are_averaged_per_image(tmp_path: Path) -> None:
+    eeg = _write_brain_file(tmp_path)
+    selection = {"image-0": [0, 2, 4, 6], "image-1": [1, 3, 5, 7]}
+
+    dataset = load_things_brain_dataset(
+        data_directory=str(tmp_path),
+        split="test",
+        subject_ids=8,
+        avg_trials=True,
+        trial_indices_by_image=selection,
+    )
+
+    assert len(dataset) == 2
+    np.testing.assert_allclose(
+        dataset[0]["eeg"],
+        eeg[0, [0, 2, 4, 6]].mean(dim=0).numpy(),
+    )
+    np.testing.assert_allclose(
+        dataset[1]["eeg"],
+        eeg[1, [1, 3, 5, 7]].mean(dim=0).numpy(),
+    )
+
+
+@pytest.mark.parametrize(
+    "selection, message",
+    (
+        ({"image-0": [0, 1]}, "exact image-ID coverage"),
+        (
+            {"image-0": [0, 1], "image-1": [2, 3], "extra": [4, 5]},
+            "exact image-ID coverage",
+        ),
+        (
+            {"image-0": [0, 0], "image-1": [1, 2]},
+            "unique",
+        ),
+        (
+            {"image-0": [0, 8], "image-1": [1, 2]},
+            "range",
+        ),
+        (
+            {"image-0": [0, 1], "image-1": [2, 3], 7: [4, 5]},
+            "image-ID",
+        ),
+    ),
+)
+def test_explicit_trial_selection_rejects_invalid_mapping(
+    tmp_path: Path,
+    selection: dict[str, list[int]],
+    message: str,
+) -> None:
+    _write_brain_file(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        load_things_brain_dataset(
+            data_directory=str(tmp_path),
+            split="test",
+            subject_ids=8,
+            avg_trials=True,
+            trial_indices_by_image=selection,
+        )
+
+
+def test_explicit_trial_selection_is_test_only(tmp_path: Path) -> None:
+    _write_brain_file(tmp_path, split="train")
+
+    with pytest.raises(ValueError, match="split='test'"):
+        load_things_brain_dataset(
+            data_directory=str(tmp_path),
+            split="train",
+            subject_ids=8,
+            avg_trials=True,
+            trial_indices_by_image={"image-0": [0], "image-1": [1]},
+        )
+
+
+def test_explicit_trial_selection_requires_averaging(tmp_path: Path) -> None:
+    _write_brain_file(tmp_path)
+
+    with pytest.raises(ValueError, match="avg_trials=True"):
+        load_things_brain_dataset(
+            data_directory=str(tmp_path),
+            split="test",
+            subject_ids=8,
+            avg_trials=False,
+            trial_indices_by_image={"image-0": [0], "image-1": [1]},
+        )
+
+
+def test_explicit_trial_selection_requires_four_dimensions(tmp_path: Path) -> None:
+    _write_brain_file(tmp_path, four_dimensional=False)
+
+    with pytest.raises(ValueError, match="4-D"):
+        load_things_brain_dataset(
+            data_directory=str(tmp_path),
+            split="test",
+            subject_ids=8,
+            avg_trials=True,
+            trial_indices_by_image={"image-0": [0], "image-1": [0]},
+        )
+
+
+def test_formal_trial_selection_requires_exact_count(tmp_path: Path) -> None:
+    _write_brain_file(tmp_path)
+
+    with pytest.raises(ValueError, match="exactly 40"):
+        load_things_brain_dataset(
+            data_directory=str(tmp_path),
+            split="test",
+            subject_ids=8,
+            avg_trials=True,
+            trial_indices_by_image={
+                "image-0": [0, 1, 2, 3],
+                "image-1": [4, 5, 6, 7],
+            },
+            expected_trial_count=40,
+        )
+
+
+def test_existing_averaging_output_is_unchanged_without_selection(
+    tmp_path: Path,
+) -> None:
+    eeg = _write_brain_file(tmp_path)
+
+    dataset = load_things_brain_dataset(
+        data_directory=str(tmp_path),
+        split="test",
+        subject_ids=8,
+        avg_trials=True,
+    )
+
+    np.testing.assert_array_equal(dataset[0]["eeg"], eeg[0].mean(dim=0).numpy())
+    np.testing.assert_array_equal(dataset[1]["eeg"], eeg[1].mean(dim=0).numpy())
+
+
+
+def _trial_manifest(path: Path) -> Path:
+    import json
+
+    sessions = {}
+    for session in range(4):
+        start = session * 20
+        sessions[str(session)] = {
+            "a": list(range(start, start + 10)),
+            "b": list(range(start + 10, start + 20)),
+            "sha256": {},
+        }
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "algorithm_version": "AIAA3800-DUPLICATE-EEG-v1",
+                "seed": 42,
+                "image_ids": ["image-0", "image-1"],
+                "images": {"image-0": sessions, "image-1": sessions},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _required_evaluator_arguments() -> list[str]:
+    return [
+        "--brain-model-path",
+        "brain.pt",
+        "--vision-adapter-path",
+        "adapter",
+        "--pretrained-model-name-or-path",
+        "clip",
+        "--brain-directory",
+        "brain",
+        "--image-directory",
+        "images",
+        "--selected-channels",
+        "Cz",
+        "--metrics-output",
+        "metrics.json",
+        "--predictions-output",
+        "predictions.csv",
+    ]
+
+
+def test_trial_manifest_loads_exact_canonical_half_mapping(tmp_path: Path) -> None:
+    manifest = _trial_manifest(tmp_path / "trials.json")
+
+    selection = load_trial_indices_by_image(manifest, "a")
+
+    expected = tuple(
+        index
+        for session in range(4)
+        for index in range(session * 20, session * 20 + 10)
+    )
+    assert selection == {"image-0": expected, "image-1": expected}
+
+
+def test_standard_trial_half_rejects_manifest(tmp_path: Path) -> None:
+    manifest = _trial_manifest(tmp_path / "trials.json")
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                *_required_evaluator_arguments(),
+                "--trial-half",
+                "standard",
+                "--trial-split-manifest",
+                str(manifest),
+            ]
+        )
+
+
+@pytest.mark.parametrize("half", ("a", "b"))
+def test_repeated_trial_half_requires_manifest(half: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args([*_required_evaluator_arguments(), "--trial-half", half])
+
+
+def test_standard_parser_defaults_preserve_existing_mode() -> None:
+    arguments = parse_args(_required_evaluator_arguments())
+
+    assert arguments.trial_half == "standard"
+    assert arguments.trial_split_manifest is None
+
+
+
+def test_brainrw_score_artifact_uses_canonical_id_targets() -> None:
+    similarity = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+
+    artifact = build_brainrw_score_artifact(
+        similarity=similarity,
+        query_embeddings=np.eye(2, dtype=np.float32),
+        query_ids=("image-a", "image-b"),
+        gallery_ids=("image-b", "image-a"),
+        trial_half="a",
+        brain_model_path=Path("formal-brainrw"),
+        top1_count=2,
+        top5_count=2,
+    )
+
+    assert artifact.target_canonical_ids == ("image-a", "image-b")
+    assert artifact.gallery_canonical_ids == ("image-b", "image-a")
+    assert artifact.metadata["model_slug"] == "our_project"
+    assert artifact.metadata["trial_half"] == "a"
+    assert len(artifact.metadata["query_embeddings_sha256"]) == 64
