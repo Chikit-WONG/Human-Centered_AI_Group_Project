@@ -19,15 +19,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
-from build_job_map import JobCompletion, load_job_completion, load_job_map
-from run_brainrw_cell import (
+from scripts.build_job_map import JobCompletion, load_job_completion, load_job_map
+from scripts.run_brainrw_cell import (
     BRAINRW_SCHEDULE_SHA256 as _BRAINRW_TRAINING_SCHEDULE_SHA256,
 )
-from run_brainrw_cell import (
+from scripts.run_brainrw_cell import (
     ValidatedBrainRWRunProof,
     validate_brainrw_command_proof,
 )
-from run_training_cell import (
+from scripts.run_training_cell import (
     ValidatedTrainingRunProof,
     validate_training_command_proof,
 )
