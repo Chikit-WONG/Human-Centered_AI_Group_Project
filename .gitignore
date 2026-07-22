@@ -110,3 +110,7 @@ model_weights/
 # Project-local working plans and generated evaluation results
 plan/
 results/
+
+# Matching-fairness local source and runtime fallbacks
+/experiments/matching_fairness/upstream/
+/experiments/matching_fairness/runtime/

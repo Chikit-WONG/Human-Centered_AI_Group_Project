@@ -1,0 +1,24 @@
+name: atm_native
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch=2.5.0
+  - torchvision=0.20.0
+  - torchaudio=2.5.0
+  - pytorch-cuda=12.4
+  - numpy=1.26.4
+  - pandas=2.3.3
+  - scipy=1.15.3
+  - scikit-learn=1.6.1
+  - mne=1.9.0
+  - einops=0.8.1
+  - pytest
+  - pip
+  - pip:
+      - braindecode==0.8.1
+      - wandb==0.19.10
+      - open-clip-torch==2.26.1
+      - git+https://github.com/openai/CLIP.git@a9b1bf5920416aaeaec965c25dd9e8f98c864f16

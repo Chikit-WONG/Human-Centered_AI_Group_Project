@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "subject": "sub-08",
+  "seed": 42,
+  "models": [
+    {"slug": "nice", "encoder_type": "NICE", "checkpoint_role": "val_selected_formal"},
+    {"slug": "atm_s", "encoder_type": "ATMS", "checkpoint_role": "val_selected_formal"},
+    {"slug": "our_project", "encoder_type": "BrainRW", "checkpoint_role": "fixed_formal"}
+  ],
+  "native_training": {
+    "mode": "intra",
+    "epochs": 500,
+    "batch_size": 1024,
+    "lr": 0.0003,
+    "val_ratio": 0.1,
+    "early_stopping_patience": 10,
+    "ema_decay": 0.999,
+    "logit_scale_type": "exp",
+    "avg_trials": true,
+    "n_chans": 63,
+    "n_times": 250,
+    "checkpoint_metric": "validation_contrastive_loss",
+    "checkpoint_direction": "min"
+  },
+  "standard_grid": {
+    "drop_query": [0, 5, 10],
+    "drop_gallery": [0, 5, 10],
+    "drop_pair": [0],
+    "duplicate_gallery": [0, 10, 20]
+  },
+  "duplicate_query_counts": [0, 10, 20],
+  "sinkhorn": {"temperature": 0.05, "max_iterations": 500, "tolerance": 1e-8}
+}
