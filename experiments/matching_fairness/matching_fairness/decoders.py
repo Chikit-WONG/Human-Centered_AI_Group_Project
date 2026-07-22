@@ -105,6 +105,8 @@ def decode_hungarian(similarity: np.ndarray, seed: int) -> Assignment:
         strict_one_to_one=True,
         metadata={
             "seed": int(seed),
+            "row_permutation_sha256": _array_sha256(row_permutation),
+            "column_permutation_sha256": _array_sha256(column_permutation),
             "matched_count": int(matched.sum()),
             "unmatched_count": int((~matched).sum()),
             "assigned_sum_similarity": float(
@@ -112,6 +114,15 @@ def decode_hungarian(similarity: np.ndarray, seed: int) -> Assignment:
             ),
         },
     )
+
+
+def _array_sha256(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def decode_stable(similarity: np.ndarray) -> Assignment:

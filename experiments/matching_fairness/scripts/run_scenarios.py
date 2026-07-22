@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 import csv
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
+from types import MappingProxyType
 from typing import Any
 
 
@@ -38,6 +42,7 @@ from matching_fairness.native_export import (  # noqa: E402
 )
 from matching_fairness.provenance import sha256_file  # noqa: E402
 from matching_fairness.scenarios import (  # noqa: E402
+    ScenarioSpec,
     apply_standard_scenario,
     build_duplicate_query_artifact,
     build_standard_manifest,
@@ -56,6 +61,7 @@ _HALF_DIRECTORIES = {
     "b": "eeg_b",
 }
 _EXPECTED_RECORDS = 3 * 30 * 5
+_RUN_MANIFEST_ALGORITHM = "AIAA3800-MATCHING-FAIRNESS-RUN-v1"
 
 
 @dataclass(frozen=True)
@@ -64,6 +70,281 @@ class ScenarioCell:
     index: int
     slug: str
     artifact: ScoreArtifact
+    selection: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class ScenarioPlan:
+    """One immutable model-independent selection and provenance plan."""
+
+    standard_manifest: Mapping[str, object]
+    standard_selections: tuple[Mapping[str, object], ...]
+    duplicate_query_ids: tuple[str, ...]
+    duplicate_selections: tuple[Mapping[str, object], ...]
+    manifest_bytes: bytes
+    manifest_sha256: str
+
+
+def _decoder_configs(
+    *,
+    seed: int,
+    sinkhorn: Mapping[str, object],
+) -> tuple[DecoderConfig, ...]:
+    return tuple(
+        DecoderConfig(
+            name=name,
+            seed=seed,
+            temperature=float(sinkhorn["temperature"]),
+            max_iterations=int(sinkhorn["max_iterations"]),
+            tolerance=float(sinkhorn["tolerance"]),
+        )
+        for name in DECODER_NAMES
+    )
+
+
+def _build_scenario_plan(
+    gallery_canonical_ids: Sequence[str],
+    *,
+    seed: int,
+    trial_manifest_sha256: str,
+    decoder_configs: Sequence[DecoderConfig],
+) -> ScenarioPlan:
+    """Build and hash the single canonical selection used by every model."""
+
+    gallery_ids = tuple(gallery_canonical_ids)
+    if not re.fullmatch(r"[0-9a-f]{64}", trial_manifest_sha256):
+        raise ValueError("trial manifest SHA-256 is invalid")
+    if tuple(config.name for config in decoder_configs) != DECODER_NAMES:
+        raise ValueError("scenario plan requires the exact five decoder configs")
+    mutable_master = build_standard_manifest(gallery_ids, seed=seed)
+    standard_manifest = MappingProxyType(
+        {
+            key: tuple(value) if isinstance(value, list) else value
+            for key, value in mutable_master.items()
+        }
+    )
+    selections = tuple(
+        _standard_selection(standard_manifest, scenario)
+        for scenario in standard_scenarios()
+    )
+    duplicate_query_ids = select_duplicate_image_ids(gallery_ids, seed=seed)
+    duplicate_selections = tuple(
+        MappingProxyType(
+            {
+                "duplicate_query_ids": duplicate_query_ids[:count],
+                "duplicate_query_count": count,
+            }
+        )
+        for count in (0, 10, 20)
+    )
+    decoder_payload = []
+    for config in decoder_configs:
+        entry: dict[str, object] = {"name": config.name}
+        if config.name == "hungarian":
+            entry["seed"] = config.seed
+        elif config.name == "sinkhorn":
+            entry.update(
+                {
+                    "temperature": config.temperature,
+                    "max_iterations": config.max_iterations,
+                    "tolerance": config.tolerance,
+                }
+            )
+        decoder_payload.append(entry)
+    payload = {
+        "schema_version": 1,
+        "algorithm_version": _RUN_MANIFEST_ALGORITHM,
+        "seed": seed,
+        "gallery_canonical_ids": list(gallery_ids),
+        "gallery_canonical_ids_sha256": _ordered_ids_sha256(gallery_ids),
+        "standard_master": {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in standard_manifest.items()
+        },
+        "standard_scenarios": [
+            {
+                "scenario_index": index,
+                "scenario": scenario.slug,
+                "parameters": {
+                    "drop_query": scenario.drop_query,
+                    "drop_gallery": scenario.drop_gallery,
+                    "drop_pair": scenario.drop_pair,
+                    "duplicate_gallery": scenario.duplicate_gallery,
+                },
+                "selected_canonical_ids": _jsonable_selection(selections[index]),
+            }
+            for index, scenario in enumerate(standard_scenarios())
+        ],
+        "duplicate_query": {
+            "ordered_ids": list(duplicate_query_ids),
+            "counts": [0, 10, 20],
+            "selected_by_count": {
+                str(count): list(duplicate_query_ids[:count])
+                for count in (0, 10, 20)
+            },
+        },
+        "trial_manifest_sha256": trial_manifest_sha256,
+        "decoder_configs": decoder_payload,
+    }
+    manifest_bytes = _json_bytes(payload)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    _validate_scenario_manifest(manifest_bytes, manifest_sha256)
+    return ScenarioPlan(
+        standard_manifest=standard_manifest,
+        standard_selections=selections,
+        duplicate_query_ids=duplicate_query_ids,
+        duplicate_selections=duplicate_selections,
+        manifest_bytes=manifest_bytes,
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _standard_selection(
+    manifest: Mapping[str, object],
+    scenario: ScenarioSpec,
+) -> Mapping[str, object]:
+    dropped_gallery = set(manifest["drop_gallery"][: scenario.drop_gallery])
+    duplicate_gallery = tuple(
+        canonical_id
+        for canonical_id in manifest["duplicate_gallery"]
+        if canonical_id not in dropped_gallery
+    )[: scenario.duplicate_gallery]
+    return MappingProxyType(
+        {
+            "drop_query": tuple(manifest["drop_query"][: scenario.drop_query]),
+            "drop_gallery": tuple(
+                manifest["drop_gallery"][: scenario.drop_gallery]
+            ),
+            "drop_pair": tuple(manifest["drop_pair"][: scenario.drop_pair]),
+            "duplicate_gallery": duplicate_gallery,
+        }
+    )
+
+
+def _jsonable_selection(selection: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in selection.items()
+    }
+
+
+def _ordered_ids_sha256(values: Sequence[str]) -> str:
+    encoded = json.dumps(
+        list(values),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_scenario_manifest(
+    manifest_bytes: bytes,
+    expected_sha256: str,
+) -> Mapping[str, object]:
+    if (
+        not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or hashlib.sha256(manifest_bytes).hexdigest() != expected_sha256
+    ):
+        raise ValueError("scenario manifest SHA-256 mismatch")
+    try:
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("scenario manifest must be valid UTF-8 JSON") from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("algorithm_version") != _RUN_MANIFEST_ALGORITHM
+        or _json_bytes(payload) != manifest_bytes
+    ):
+        raise ValueError("scenario manifest is not the canonical formal schema")
+    expected_keys = {
+        "schema_version",
+        "algorithm_version",
+        "seed",
+        "gallery_canonical_ids",
+        "gallery_canonical_ids_sha256",
+        "standard_master",
+        "standard_scenarios",
+        "duplicate_query",
+        "trial_manifest_sha256",
+        "decoder_configs",
+    }
+    gallery_ids = payload.get("gallery_canonical_ids")
+    if (
+        set(payload) != expected_keys
+        or payload.get("seed") != 42
+        or not isinstance(gallery_ids, list)
+        or len(gallery_ids) != 200
+        or any(not isinstance(value, str) or not value for value in gallery_ids)
+        or len(set(gallery_ids)) != 200
+        or payload.get("gallery_canonical_ids_sha256")
+        != _ordered_ids_sha256(gallery_ids)
+    ):
+        raise ValueError("scenario manifest gallery identity is invalid")
+    expected_master = build_standard_manifest(tuple(gallery_ids), seed=42)
+    if payload.get("standard_master") != expected_master:
+        raise ValueError("scenario manifest standard master is invalid")
+    frozen_master = MappingProxyType(
+        {
+            key: tuple(value) if isinstance(value, list) else value
+            for key, value in expected_master.items()
+        }
+    )
+    expected_standard = []
+    for index, scenario in enumerate(standard_scenarios()):
+        expected_standard.append(
+            {
+                "scenario_index": index,
+                "scenario": scenario.slug,
+                "parameters": {
+                    "drop_query": scenario.drop_query,
+                    "drop_gallery": scenario.drop_gallery,
+                    "drop_pair": scenario.drop_pair,
+                    "duplicate_gallery": scenario.duplicate_gallery,
+                },
+                "selected_canonical_ids": _jsonable_selection(
+                    _standard_selection(frozen_master, scenario)
+                ),
+            }
+        )
+    if payload.get("standard_scenarios") != expected_standard:
+        raise ValueError("scenario manifest standard selections are invalid")
+    duplicate_ids = select_duplicate_image_ids(tuple(gallery_ids), seed=42)
+    expected_duplicate = {
+        "ordered_ids": list(duplicate_ids),
+        "counts": [0, 10, 20],
+        "selected_by_count": {
+            str(count): list(duplicate_ids[:count]) for count in (0, 10, 20)
+        },
+    }
+    if payload.get("duplicate_query") != expected_duplicate:
+        raise ValueError("scenario manifest duplicate-query selection is invalid")
+    expected_decoders = [
+        {"name": "independent"},
+        {"name": "greedy"},
+        {"name": "hungarian", "seed": 42},
+        {"name": "stable_matching"},
+        {
+            "name": "sinkhorn",
+            "temperature": 0.05,
+            "max_iterations": 500,
+            "tolerance": 1e-8,
+        },
+    ]
+    if payload.get("decoder_configs") != expected_decoders:
+        raise ValueError("scenario manifest decoder configuration is invalid")
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(payload.get("trial_manifest_sha256")),
+        )
+        is None
+    ):
+        raise ValueError("scenario manifest trial-manifest hash is invalid")
+    return payload
 
 
 def _scenario_artifacts(
@@ -71,25 +352,36 @@ def _scenario_artifacts(
     eeg_a: ScoreArtifact,
     eeg_b: ScoreArtifact,
     *,
-    seed: int,
+    plan: ScenarioPlan,
 ) -> tuple[ScenarioCell, ...]:
     """Build the exact shared 27 standard plus 3 real-repeat cells."""
 
-    manifest = build_standard_manifest(standard.gallery_canonical_ids, seed=seed)
-    cells = [
-        ScenarioCell(
-            suite="standard",
-            index=index,
-            slug=scenario.slug,
-            artifact=apply_standard_scenario(standard, manifest, scenario),
+    if tuple(plan.standard_manifest["canonical_image_ids"]) != (
+        standard.gallery_canonical_ids
+    ):
+        raise ValueError("scenario plan gallery does not match model artifact")
+    cells: list[ScenarioCell] = []
+    for index, scenario in enumerate(standard_scenarios()):
+        artifact = apply_standard_scenario(
+            standard,
+            plan.standard_manifest,
+            scenario,
         )
-        for index, scenario in enumerate(standard_scenarios())
-    ]
-    repeated = select_duplicate_image_ids(
-        standard.gallery_canonical_ids,
-        seed=seed,
-    )
-    for offset, count in enumerate((0, 10, 20), start=27):
+        selection = plan.standard_selections[index]
+        if artifact.metadata.get("selected_canonical_ids") != dict(selection):
+            raise ValueError("Task 4 scenario selection differs from sealed plan")
+        cells.append(
+            ScenarioCell(
+                suite="standard",
+                index=index,
+                slug=scenario.slug,
+                artifact=artifact,
+                selection=selection,
+            )
+        )
+    for selection_index, count in enumerate((0, 10, 20)):
+        offset = 27 + selection_index
+        selection = plan.duplicate_selections[selection_index]
         cells.append(
             ScenarioCell(
                 suite="duplicate_eeg",
@@ -98,9 +390,10 @@ def _scenario_artifacts(
                 artifact=build_duplicate_query_artifact(
                     eeg_a,
                     eeg_b,
-                    repeated,
+                    plan.duplicate_query_ids,
                     count,
                 ),
+                selection=selection,
             )
         )
     if (
@@ -145,11 +438,21 @@ def run_scenarios(
 ) -> int:
     """Validate sealed inputs, evaluate all cells, then atomically publish."""
 
-    protocol = Protocol.load(Path(protocol_path))
+    output_dir = _validated_output_directory(Path(output_dir))
+    protocol_path = _validated_existing_file(Path(protocol_path), "formal protocol")
+    artifact_root = _validated_existing_directory(
+        Path(artifact_root),
+        "formal artifact root",
+    )
+    trial_manifest_path = _validated_existing_file(
+        Path(trial_manifest_path),
+        "trial manifest",
+    )
+    protocol = Protocol.load(protocol_path)
     protocol.assert_formal_scope()
     artifacts, artifact_hashes = _load_formal_artifacts(
-        Path(artifact_root),
-        trial_manifest_path=Path(trial_manifest_path),
+        artifact_root,
+        trial_manifest_path=trial_manifest_path,
         expected_image_count=200,
     )
     common_gallery = artifacts["nice"]["standard"].gallery_canonical_ids
@@ -157,20 +460,16 @@ def run_scenarios(
         if artifacts[model]["standard"].gallery_canonical_ids != common_gallery:
             raise ValueError("formal models must share exact canonical gallery order")
 
-    configs = tuple(
-        DecoderConfig(
-            name=name,
-            seed=protocol.seed,
-            temperature=float(protocol.sinkhorn["temperature"]),
-            max_iterations=int(protocol.sinkhorn["max_iterations"]),
-            tolerance=float(protocol.sinkhorn["tolerance"]),
-        )
-        for name in DECODER_NAMES
+    configs = _decoder_configs(
+        seed=protocol.seed,
+        sinkhorn=protocol.sinkhorn,
     )
-    output_dir = Path(output_dir)
-    if os.path.lexists(output_dir):
-        raise FileExistsError(f"scenario output already exists: {output_dir}")
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    plan = _build_scenario_plan(
+        common_gallery,
+        seed=protocol.seed,
+        trial_manifest_sha256=sha256_file(trial_manifest_path),
+        decoder_configs=configs,
+    )
     staging = Path(
         tempfile.mkdtemp(
             prefix=f".{output_dir.name}.tmp-",
@@ -179,12 +478,16 @@ def run_scenarios(
     )
     records: list[dict[str, object]] = []
     try:
+        _write_bytes_exclusive(
+            staging / "scenario_manifest.json",
+            plan.manifest_bytes,
+        )
         for model in _MODEL_ORDER:
             cells = _scenario_artifacts(
                 artifacts[model]["standard"],
                 artifacts[model]["a"],
                 artifacts[model]["b"],
-                seed=protocol.seed,
+                plan=plan,
             )
             for cell in cells:
                 evaluations = tuple(
@@ -206,8 +509,14 @@ def run_scenarios(
                         cell,
                         artifact_hashes[model],
                     ),
+                    scenario_manifest_sha256=plan.manifest_sha256,
                 )
         _validate_record_grid(records)
+        manifest_path = staging / "scenario_manifest.json"
+        _validate_scenario_manifest(
+            manifest_path.read_bytes(),
+            plan.manifest_sha256,
+        )
         summaries = tuple(staging.rglob("summary.json"))
         ledgers = tuple(staging.rglob("per_query.csv"))
         if len(summaries) != 90 or len(ledgers) != 90:
@@ -219,6 +528,42 @@ def run_scenarios(
     return len(records)
 
 
+def _validated_existing_directory(path: Path, label: str) -> Path:
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink")
+    if not os.path.lexists(path) or not path.is_dir():
+        raise ValueError(f"{label} must be an existing regular directory")
+    return path.resolve(strict=True)
+
+
+def _validated_existing_file(path: Path, label: str) -> Path:
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink")
+    if not os.path.lexists(path) or not path.is_file():
+        raise ValueError(f"{label} must be an existing regular file")
+    return path.resolve(strict=True)
+
+
+def _validated_output_directory(path: Path) -> Path:
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError("scenario output directory must not be a symlink")
+    if os.path.lexists(path):
+        raise FileExistsError(f"scenario output already exists: {path}")
+    parent = _validated_existing_directory(
+        path.parent,
+        "scenario output parent",
+    )
+    if not path.name or path.name in {".", ".."}:
+        raise ValueError("scenario output directory name is invalid")
+    destination = parent / path.name
+    if os.path.lexists(destination):
+        raise FileExistsError(f"scenario output already exists: {destination}")
+    return destination
+
+
 def _load_formal_artifacts(
     artifact_root: Path,
     *,
@@ -228,8 +573,14 @@ def _load_formal_artifacts(
     dict[str, dict[str, ScoreArtifact]],
     dict[str, dict[str, str]],
 ]:
-    if artifact_root.is_symlink() or not artifact_root.is_dir():
-        raise ValueError("formal artifact root must be a regular directory")
+    artifact_root = _validated_existing_directory(
+        artifact_root,
+        "formal artifact root",
+    )
+    trial_manifest_path = _validated_existing_file(
+        trial_manifest_path,
+        "trial manifest",
+    )
     if set(path.name for path in artifact_root.iterdir()) != set(_MODEL_ORDER):
         raise ValueError("formal artifact root must contain exactly three model dirs")
     directories: list[Path] = []
@@ -317,12 +668,12 @@ def _write_cell(
     evaluations: tuple[EvaluationResult, ...],
     records: list[dict[str, object]],
     source_hashes: dict[str, str],
+    scenario_manifest_sha256: str,
 ) -> None:
     if subject != "sub-08":
         raise ValueError("formal scenario output requires subject sub-08")
     cell_dir = (
         staging
-        / "runs"
         / model
         / "subj08"
         / f"seed{seed}"
@@ -339,6 +690,8 @@ def _write_cell(
         "scenario_index": cell.index,
         "scenario": cell.slug,
         "matrix_shape": [int(value) for value in cell.artifact.similarity.shape],
+        "scenario_selection": _jsonable_selection(cell.selection),
+        "scenario_manifest_sha256": scenario_manifest_sha256,
         "source_artifact_sha256": source_hashes,
         "decoder_records": records,
     }
@@ -362,7 +715,12 @@ def _write_cell(
 
 
 def _write_json_exclusive(path: Path, payload: object) -> None:
-    encoded = (
+    encoded = _json_bytes(payload)
+    _write_bytes_exclusive(path, encoded)
+
+
+def _json_bytes(payload: object) -> bytes:
+    return (
         json.dumps(
             payload,
             ensure_ascii=False,
@@ -372,6 +730,9 @@ def _write_json_exclusive(path: Path, payload: object) -> None:
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _write_bytes_exclusive(path: Path, encoded: bytes) -> None:
     with path.open("xb") as stream:
         stream.write(encoded)
         stream.flush()
@@ -412,12 +773,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     count = run_scenarios(
-        protocol_path=args.protocol.resolve(),
-        artifact_root=args.artifact_root.resolve(),
-        trial_manifest_path=args.trial_manifest.resolve(),
-        output_dir=args.output_dir.resolve(),
+        protocol_path=args.protocol,
+        artifact_root=args.artifact_root,
+        trial_manifest_path=args.trial_manifest,
+        output_dir=args.output_dir,
     )
-    print(f"published {count} decoder records to {args.output_dir.resolve()}")
+    print(f"published {count} decoder records to {args.output_dir}")
 
 
 if __name__ == "__main__":

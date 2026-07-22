@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import re
 
 import numpy as np
 
@@ -61,6 +62,27 @@ def test_hungarian_seeded_rectangular_assignment_reports_unmatched() -> None:
     assert first.metadata["matched_count"] == 2
     assert first.metadata["unmatched_count"] == 1
     assert math.isfinite(first.metadata["assigned_sum_similarity"])
+
+
+def test_hungarian_binds_deterministic_row_and_column_permutations() -> None:
+    tied = np.ones((4, 3), dtype=np.float64)
+
+    seed_42 = decode_hungarian(tied, seed=42)
+    repeated = decode_hungarian(tied.copy(), seed=42)
+    seed_7 = decode_hungarian(tied, seed=7)
+    other_shape = decode_hungarian(np.ones((5, 3)), seed=42)
+
+    for field in ("row_permutation_sha256", "column_permutation_sha256"):
+        value = seed_42.metadata[field]
+        assert isinstance(value, str)
+        assert re.fullmatch(r"[0-9a-f]{64}", value)
+        assert repeated.metadata[field] == value
+    assert seed_7.metadata["row_permutation_sha256"] != seed_42.metadata[
+        "row_permutation_sha256"
+    ]
+    assert other_shape.metadata["row_permutation_sha256"] != seed_42.metadata[
+        "row_permutation_sha256"
+    ]
 
 
 def test_query_proposing_stable_matching_has_no_blocking_pair() -> None:
