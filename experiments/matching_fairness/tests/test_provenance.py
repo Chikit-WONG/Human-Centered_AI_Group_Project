@@ -1,4 +1,6 @@
 import json
+import pickle
+from collections.abc import Mapping
 from pathlib import Path
 import subprocess
 
@@ -13,7 +15,12 @@ from scripts.fetch_assets import (
     fetch_assets,
     inventory_assets,
 )
-from scripts.preflight import PreflightExpectations, RuntimeInfo, run_preflight
+from scripts.preflight import (
+    PreflightExpectations,
+    RuntimeInfo,
+    _load_official_eeg,
+    run_preflight,
+)
 from scripts.fetch_upstream import resolve_detached_checkout, write_source_lock
 
 
@@ -62,28 +69,26 @@ def _make_checkout(tmp_path: Path, *, detached: bool = True) -> Path:
     return checkout
 
 
-def _write_official_npy(path: Path, eeg: np.ndarray) -> None:
+def _write_official_pickle(path: Path, eeg: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(
-        path,
-        {
-            "preprocessed_eeg_data": eeg,
-            "times": np.arange(eeg.shape[-1]),
-            "ch_names": np.asarray([f"c{i}" for i in range(eeg.shape[-2])]),
-        },
-        allow_pickle=True,
-    )
+    payload = {
+        "preprocessed_eeg_data": eeg,
+        "times": np.arange(eeg.shape[-1]),
+        "ch_names": np.asarray([f"c{i}" for i in range(eeg.shape[-2])]),
+    }
+    with path.open("wb") as stream:
+        pickle.dump(payload, stream, protocol=4)
 
 
 def _write_tiny_preflight_fixtures(tmp_path: Path) -> dict[str, Path]:
     assets = tmp_path / "assets"
     train_eeg = np.zeros((6, 3, 5), dtype=np.float32)
     test_eeg = np.zeros((2, 4, 3, 5), dtype=np.float32)
-    _write_official_npy(
+    _write_official_pickle(
         assets / "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy",
         train_eeg,
     )
-    _write_official_npy(
+    _write_official_pickle(
         assets / "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy",
         test_eeg,
     )
@@ -145,6 +150,28 @@ def _valid_runtime() -> RuntimeInfo:
             "clip": "a9b1bf5920416aaeaec965c25dd9e8f98c864f16",
         },
     )
+
+
+def test_official_pickle_fixture_loads_as_direct_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "official.npy"
+    eeg = np.arange(6, dtype=np.float32).reshape(2, 3)
+    _write_official_pickle(path, eeg)
+
+    loaded = np.load(path, allow_pickle=True)
+    assert isinstance(loaded, Mapping)
+    np.testing.assert_array_equal(loaded["preprocessed_eeg_data"], eeg)
+    np.testing.assert_array_equal(_load_official_eeg(path, np), eeg)
+
+
+def test_load_official_eeg_accepts_0d_object_array(tmp_path: Path) -> None:
+    path = tmp_path / "object-array.npy"
+    eeg = np.arange(6, dtype=np.float32).reshape(2, 3)
+    np.save(path, {"preprocessed_eeg_data": eeg}, allow_pickle=True)
+
+    loaded = np.load(path, allow_pickle=True)
+    assert loaded.shape == ()
+    assert loaded.dtype == np.dtype("O")
+    np.testing.assert_array_equal(_load_official_eeg(path, np), eeg)
 
 
 def test_sha256_file_is_content_sensitive(tmp_path: Path) -> None:
