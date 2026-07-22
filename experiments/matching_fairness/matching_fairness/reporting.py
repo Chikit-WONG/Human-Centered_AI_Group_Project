@@ -15,9 +15,14 @@ import re
 import shutil
 import stat
 import tempfile
-from typing import Any
 
-from .artifacts import publish_staged_directory
+from .artifacts import (
+    ScoreArtifact,
+    independent_ranks,
+    publish_staged_directory,
+    read_score_artifact,
+)
+from .provenance import sha256_file
 from .scenarios import build_standard_manifest, standard_scenarios
 from .trial_splits import select_duplicate_image_ids
 
@@ -35,6 +40,26 @@ STRICT_DECODERS = frozenset({"greedy", "hungarian", "stable_matching"})
 EXPECTED_RECORDS = 3 * 30 * 5
 _RUN_MANIFEST_ALGORITHM = "AIAA3800-MATCHING-FAIRNESS-RUN-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_PER_QUERY_FIELDS = (
+    "model",
+    "subject",
+    "seed",
+    "suite",
+    "scenario_index",
+    "scenario",
+    "decoder",
+    "query_index",
+    "query_id",
+    "target_canonical_id",
+    "answerable",
+    "gallery_index",
+    "predicted_gallery_entry_id",
+    "predicted_canonical_id",
+    "assigned_score",
+    "unmatched",
+    "correct_top1",
+    "correct_top5",
+)
 _AUDIT_FIELDS = frozenset(
     {"scope", "best_test", "best_test_audit_only", "checkpoint_policy"}
 )
@@ -56,6 +81,53 @@ _DUPLICATE_FIELDS = frozenset(
         "distance_from_ceiling",
         "unmatched_repeated_queries",
     }
+)
+_CSV_FIELDS = (
+    "model",
+    "subject",
+    "seed",
+    "suite",
+    "scenario_index",
+    "scenario",
+    "scenario_manifest_sha256",
+    "source_artifact_sha256",
+    "decoder",
+    "correct",
+    "total",
+    "top1",
+    "answerable_correct",
+    "answerable_total",
+    "answerable_top1",
+    "unanswerable_count",
+    "assigned_count",
+    "unmatched_count",
+    "unique_gallery_entry_predictions",
+    "unique_canonical_predictions",
+    "strict_one_to_one",
+    "top5_count",
+    "top5",
+    "assignment_changes_from_independent",
+    "delta_correct_vs_independent",
+    "assignment_metadata",
+    "correct_to_correct",
+    "correct_to_wrong",
+    "wrong_to_correct",
+    "wrong_to_wrong",
+    "base_a_correct",
+    "base_a_total",
+    "base_a_top1",
+    "appended_b_correct",
+    "appended_b_total",
+    "appended_b_top1",
+    "repeated_canonical_total",
+    "at_least_one_correct_count",
+    "at_least_one_coverage",
+    "both_correct_count",
+    "both_correct",
+    "theoretical_ceiling_count",
+    "theoretical_ceiling",
+    "distance_from_ceiling",
+    "unmatched_repeated_queries",
 )
 _BASE_FIELDS = frozenset(
     {
@@ -201,7 +273,7 @@ def load_run_records(runs_dir: Path) -> list[dict[str, object]]:
             ledger_path = cell / "per_query.csv"
             expected_files.update({summary_path, ledger_path})
             summary_bytes = _read_regular_file(summary_path, "cell summary")
-            _read_regular_file(ledger_path, "per-query ledger")
+            ledger_bytes = _read_regular_file(ledger_path, "per-query ledger")
             summary = _canonical_json(summary_bytes, "cell summary")
             expected_summary_keys = {
                 "schema_version",
@@ -244,6 +316,16 @@ def load_run_records(runs_dir: Path) -> list[dict[str, object]]:
             if summary.get("scenario_selection") != expected_selection:
                 raise ValueError("cell scenario selection differs from canonical manifest")
             _validate_matrix_shape(summary.get("matrix_shape"), index, standard_specs)
+            ledger = _parse_per_query_ledger(
+                ledger_bytes,
+                model=model,
+                suite=suite,
+                scenario_index=index,
+                scenario=scenario,
+                matrix_shape=summary["matrix_shape"],
+                selection=expected_selection,
+                canonical_ids=manifest["gallery_canonical_ids"],
+            )
             sources = _validate_source_hashes(summary.get("source_artifact_sha256"), suite)
             decoder_records = summary.get("decoder_records")
             if not isinstance(decoder_records, list) or len(decoder_records) != 5:
@@ -260,6 +342,31 @@ def load_run_records(runs_dir: Path) -> list[dict[str, object]]:
                         "source_artifact_sha256": sources,
                     }
                 )
+                expected_record = _record_from_ledger(
+                    ledger,
+                    decoder=str(enriched.get("decoder")),
+                    model=model,
+                    suite=suite,
+                    scenario_index=index,
+                    scenario=scenario,
+                    matrix_shape=summary["matrix_shape"],
+                    assignment_metadata=enriched.get("assignment_metadata"),
+                )
+                summary_record = {
+                    key: value
+                    for key, value in enriched.items()
+                    if key
+                    not in {
+                        "subject",
+                        "seed",
+                        "scenario_manifest_sha256",
+                        "source_artifact_sha256",
+                    }
+                }
+                if summary_record != expected_record:
+                    raise ValueError(
+                        "decoder summary metrics do not match the per-query ledger"
+                    )
                 records.append(enriched)
 
     actual_files: set[Path] = set()
@@ -323,6 +430,20 @@ def load_reproduction_audits(
         elif inventory != common_inventory:
             raise ValueError("native audit manifests bind different formal inventories")
         formal = _lookup_record(aggregate, model, 0, "independent")
+        artifact_path = root / "matrices" / model / "standard"
+        artifact = read_score_artifact(artifact_path)
+        artifact_digest = _score_artifact_sha256(artifact_path)
+        if artifact_digest != expected_inventory[(model, "standard")]:
+            raise ValueError(
+                "native standard artifact hash does not match the formal run ledger"
+            )
+        _validate_native_standard_artifact(
+            artifact,
+            model=model,
+            checkpoint=checkpoint,
+            checkpoint_manifest_sha256=hashlib.sha256(checkpoint_bytes).hexdigest(),
+            formal=formal,
+        )
         source = checkpoint.get("source")
         rows.append(
             {
@@ -354,12 +475,14 @@ def render_english_report(
     audit_rows = _validated_audit_rows(audits)
     standard = _standard_table(aggregate, language="en")
     duplicate = _duplicate_table(aggregate, language="en")
+    sinkhorn = _sinkhorn_status(aggregate, language="en")
     provenance = _provenance_table(aggregate, language="en")
     audit = _audit_table(audit_rows, language="en")
     return (
         "# Matching Fairness Results\n\n"
         "This formal result covers **sub-08 / seed-42** only and does not establish "
         "cross-subject significance. Counts are reported before percentages.\n\n"
+        f"{sinkhorn}\n\n"
         "## Standard (80-trial averages)\n\n"
         f"{standard}\n\n"
         "## Duplicate EEG (40-trial disjoint averages)\n\n"
@@ -388,11 +511,13 @@ def render_chinese_report(
     audit_rows = _validated_audit_rows(audits)
     standard = _standard_table(aggregate, language="zh")
     duplicate = _duplicate_table(aggregate, language="zh")
+    sinkhorn = _sinkhorn_status(aggregate, language="zh")
     provenance = _provenance_table(aggregate, language="zh")
     audit = _audit_table(audit_rows, language="zh")
     return (
         "# 匹配公平性实验结果\n\n"
         "本正式结果仅覆盖 **sub-08 / seed-42**，不能建立跨被试显著性。所有百分比前均报告精确计数。\n\n"
+        f"{sinkhorn}\n\n"
         "## 标准套件（80-trial 平均）\n\n"
         f"{standard}\n\n"
         "## 重复 EEG 套件（互不重叠的 40-trial 平均）\n\n"
@@ -441,6 +566,7 @@ def publish_aggregate(
             "scenario_manifest_sha256": aggregate.scenario_manifest_sha256,
             "source_artifact_sha256": aggregate.source_artifact_sha256,
             "reproduction_audit": list(audit_rows),
+            "sinkhorn": _sinkhorn_summary(aggregate),
             "limitation": "sub-08 / seed-42; no cross-subject significance",
         }
         _write_exclusive(
@@ -471,6 +597,418 @@ def aggregate_results(results_root: Path) -> Path:
     return publish_aggregate(aggregate, root / "aggregate", audits)
 
 
+def _parse_per_query_ledger(
+    encoded: bytes,
+    *,
+    model: str,
+    suite: str,
+    scenario_index: int,
+    scenario: str,
+    matrix_shape: Sequence[int],
+    selection: Mapping[str, object],
+    canonical_ids: Sequence[str],
+) -> dict[str, tuple[dict[str, object], ...]]:
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("per-query ledger must be valid UTF-8") from error
+    if "\x00" in text or "\r" in text or not text.endswith("\n"):
+        raise ValueError("per-query ledger has invalid control characters/newlines")
+    try:
+        raw_rows = list(csv.reader(io.StringIO(text, newline=""), strict=True))
+    except csv.Error as error:
+        raise ValueError("per-query ledger is malformed CSV") from error
+    if not raw_rows or tuple(raw_rows[0]) != _PER_QUERY_FIELDS:
+        raise ValueError("per-query ledger header does not match Task 7 schema")
+    query_count, gallery_count = (int(value) for value in matrix_shape)
+    expected_data_rows = query_count * len(DECODER_ORDER)
+    if len(raw_rows) != expected_data_rows + 1:
+        raise ValueError(
+            "per-query ledger row count does not match matrix rows x five decoders"
+        )
+
+    expected_query_ids, expected_targets, gallery_entries, gallery_canonical = (
+        _scenario_identities(
+            suite=suite,
+            selection=selection,
+            canonical_ids=canonical_ids,
+        )
+    )
+    if (
+        len(expected_query_ids) != query_count
+        or len(expected_targets) != query_count
+        or len(gallery_entries) != gallery_count
+        or len(gallery_canonical) != gallery_count
+    ):
+        raise ValueError("scenario identity cardinality does not match matrix shape")
+
+    groups: dict[str, list[dict[str, object]]] = {
+        decoder: [] for decoder in DECODER_ORDER
+    }
+    gallery_identity: dict[int, tuple[str, str]] = {}
+    for flat_index, cells in enumerate(raw_rows[1:]):
+        if len(cells) != len(_PER_QUERY_FIELDS):
+            raise ValueError("per-query ledger row has missing or extra cells")
+        raw = dict(zip(_PER_QUERY_FIELDS, cells))
+        decoder = DECODER_ORDER[flat_index // query_count]
+        query_index = flat_index % query_count
+        expected_literals = {
+            "model": model,
+            "subject": "sub-08",
+            "seed": "42",
+            "suite": suite,
+            "scenario_index": str(scenario_index),
+            "scenario": scenario,
+            "decoder": decoder,
+            "query_index": str(query_index),
+        }
+        if any(raw[field] != value for field, value in expected_literals.items()):
+            raise ValueError("per-query ledger identity/order/index is invalid")
+        query_id = _safe_text(raw["query_id"], "query ID")
+        target = _safe_text(raw["target_canonical_id"], "target canonical ID")
+        if query_id != expected_query_ids[query_index] or target != expected_targets[query_index]:
+            raise ValueError("per-query ledger query/target ID is invalid")
+        answerable = _parse_bool(raw["answerable"], "answerable")
+        expected_answerable = target in set(gallery_canonical)
+        if answerable is not expected_answerable:
+            raise ValueError("per-query ledger answerable flag is invalid")
+        gallery_index = _parse_int(raw["gallery_index"], "gallery index", allow_negative=True)
+        unmatched = _parse_bool(raw["unmatched"], "unmatched")
+        if unmatched is not (gallery_index == -1):
+            raise ValueError("per-query ledger unmatched/gallery index disagree")
+        if gallery_index < -1 or gallery_index >= gallery_count:
+            raise ValueError("per-query ledger gallery index is out of range")
+
+        predicted_entry = _optional_safe_text(
+            raw["predicted_gallery_entry_id"], "predicted gallery entry ID"
+        )
+        predicted_canonical = _optional_safe_text(
+            raw["predicted_canonical_id"], "predicted canonical ID"
+        )
+        assigned_score = _parse_optional_float(raw["assigned_score"], "assigned score")
+        if unmatched:
+            if predicted_entry is not None or predicted_canonical is not None or assigned_score is not None:
+                raise ValueError("unmatched ledger row must have empty prediction/score cells")
+        else:
+            if predicted_entry != gallery_entries[gallery_index] or predicted_canonical != gallery_canonical[gallery_index] or assigned_score is None:
+                raise ValueError("ledger prediction does not match canonical gallery index")
+            previous = gallery_identity.setdefault(
+                gallery_index, (predicted_entry, predicted_canonical)
+            )
+            if previous != (predicted_entry, predicted_canonical):
+                raise ValueError("gallery index has inconsistent ledger identity")
+
+        correct_top1 = _parse_bool(raw["correct_top1"], "correct_top1")
+        expected_correct = not unmatched and predicted_canonical == target
+        if correct_top1 is not expected_correct:
+            raise ValueError("per-query ledger Top-1 flag is invalid")
+        if decoder == "independent":
+            correct_top5 = _parse_bool(raw["correct_top5"], "correct_top5")
+            if correct_top1 and not correct_top5:
+                raise ValueError("Independent Top-5 cannot be false when Top-1 is true")
+            if correct_top5 and not answerable:
+                raise ValueError("unanswerable query cannot be Independent Top-5 correct")
+        else:
+            if raw["correct_top5"] != "":
+                raise ValueError("assignment decoder per-query Top-5 must be empty")
+            correct_top5 = None
+        groups[decoder].append(
+            {
+                "query_index": query_index,
+                "query_id": query_id,
+                "target_canonical_id": target,
+                "answerable": answerable,
+                "gallery_index": gallery_index,
+                "predicted_gallery_entry_id": predicted_entry,
+                "predicted_canonical_id": predicted_canonical,
+                "assigned_score": assigned_score,
+                "unmatched": unmatched,
+                "correct_top1": correct_top1,
+                "correct_top5": correct_top5,
+            }
+        )
+
+    baseline_identity: tuple[tuple[object, ...], ...] | None = None
+    for decoder in DECODER_ORDER:
+        rows = groups[decoder]
+        if len({row["query_index"] for row in rows}) != query_count or len({row["query_id"] for row in rows}) != query_count:
+            raise ValueError("per-query ledger contains duplicate or missing query indexes/IDs")
+        identity = tuple(
+            (
+                row["query_index"],
+                row["query_id"],
+                row["target_canonical_id"],
+                row["answerable"],
+            )
+            for row in rows
+        )
+        if baseline_identity is None:
+            baseline_identity = identity
+        elif identity != baseline_identity:
+            raise ValueError("decoder ledger blocks do not share exact query identity")
+        strict = decoder in STRICT_DECODERS
+        unmatched_count = sum(row["unmatched"] is True for row in rows)
+        expected_unmatched = max(query_count - gallery_count, 0) if strict else 0
+        if unmatched_count != expected_unmatched:
+            raise ValueError("decoder ledger unmatched count violates matrix cardinality")
+        matched_entries = [
+            row["predicted_gallery_entry_id"] for row in rows if not row["unmatched"]
+        ]
+        if strict and len(set(matched_entries)) != len(matched_entries):
+            raise ValueError("strict one-to-one ledger reuses a gallery entry")
+    return {decoder: tuple(rows) for decoder, rows in groups.items()}
+
+
+def _scenario_identities(
+    *,
+    suite: str,
+    selection: Mapping[str, object],
+    canonical_ids: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    canonical = tuple(str(value) for value in canonical_ids)
+    if suite == "standard":
+        dropped_query = set(selection["drop_query"]) | set(selection["drop_pair"])
+        dropped_gallery = set(selection["drop_gallery"]) | set(selection["drop_pair"])
+        queries = tuple(value for value in canonical if value not in dropped_query)
+        base_gallery = tuple(value for value in canonical if value not in dropped_gallery)
+        duplicates = tuple(str(value) for value in selection["duplicate_gallery"])
+        duplicate_entries = tuple(
+            f"{value}__duplicate_entry_{position:04d}"
+            for position, value in enumerate(duplicates)
+        )
+        return (
+            queries,
+            queries,
+            base_gallery + duplicate_entries,
+            base_gallery + duplicates,
+        )
+    repeated = tuple(str(value) for value in selection["duplicate_query_ids"])
+    return (
+        canonical + tuple(f"{value}__eeg_b" for value in repeated),
+        canonical + repeated,
+        canonical,
+        canonical,
+    )
+
+
+def _record_from_ledger(
+    ledger: Mapping[str, Sequence[Mapping[str, object]]],
+    *,
+    decoder: str,
+    model: str,
+    suite: str,
+    scenario_index: int,
+    scenario: str,
+    matrix_shape: Sequence[int],
+    assignment_metadata: object,
+) -> dict[str, object]:
+    if decoder not in DECODER_ORDER:
+        raise ValueError("decoder summary has invalid decoder identity")
+    rows = ledger[decoder]
+    independent = ledger["independent"]
+    total = len(rows)
+    correct = sum(row["correct_top1"] is True for row in rows)
+    answerable = sum(row["answerable"] is True for row in rows)
+    answerable_correct = sum(
+        row["answerable"] is True and row["correct_top1"] is True for row in rows
+    )
+    assigned = sum(row["unmatched"] is False for row in rows)
+    unmatched = total - assigned
+    _validate_assignment_metadata(
+        decoder,
+        assignment_metadata,
+        matched=assigned,
+        unmatched=unmatched,
+        total=total,
+    )
+    if decoder == "hungarian":
+        assigned_sum = sum(
+            float(row["assigned_score"])
+            for row in rows
+            if row["assigned_score"] is not None
+        )
+        if not math.isclose(
+            float(assignment_metadata["assigned_sum_similarity"]),
+            assigned_sum,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("Hungarian assigned similarity sum disagrees with ledger")
+    transitions = {
+        "correct_to_correct": sum(
+            old["correct_top1"] is True and new["correct_top1"] is True
+            for old, new in zip(independent, rows)
+        ),
+        "correct_to_wrong": sum(
+            old["correct_top1"] is True and new["correct_top1"] is False
+            for old, new in zip(independent, rows)
+        ),
+        "wrong_to_correct": sum(
+            old["correct_top1"] is False and new["correct_top1"] is True
+            for old, new in zip(independent, rows)
+        ),
+        "wrong_to_wrong": sum(
+            old["correct_top1"] is False and new["correct_top1"] is False
+            for old, new in zip(independent, rows)
+        ),
+    }
+    result: dict[str, object] = {
+        "model": model,
+        "suite": suite,
+        "scenario_index": scenario_index,
+        "scenario": scenario,
+        "decoder": decoder,
+        "correct": correct,
+        "total": total,
+        "top1": _percent(correct, total),
+        "answerable_correct": answerable_correct,
+        "answerable_total": answerable,
+        "answerable_top1": _percent(answerable_correct, answerable),
+        "unanswerable_count": total - answerable,
+        "assigned_count": assigned,
+        "unmatched_count": unmatched,
+        "unique_gallery_entry_predictions": len(
+            {
+                row["predicted_gallery_entry_id"]
+                for row in rows
+                if not row["unmatched"]
+            }
+        ),
+        "unique_canonical_predictions": len(
+            {
+                row["predicted_canonical_id"]
+                for row in rows
+                if not row["unmatched"]
+            }
+        ),
+        "strict_one_to_one": decoder in STRICT_DECODERS,
+        "top5_count": sum(row["correct_top5"] is True for row in rows)
+        if decoder == "independent"
+        else None,
+        "top5": _percent(
+            sum(row["correct_top5"] is True for row in rows), total
+        )
+        if decoder == "independent"
+        else None,
+        "assignment_changes_from_independent": sum(
+            old["gallery_index"] != new["gallery_index"]
+            for old, new in zip(independent, rows)
+        ),
+        "delta_correct_vs_independent": correct
+        - sum(row["correct_top1"] is True for row in independent),
+        "assignment_metadata": dict(assignment_metadata),
+        **transitions,
+    }
+    if suite == "duplicate_eeg":
+        repeated_targets = {
+            row["target_canonical_id"]
+            for row in rows
+            if str(row["query_id"]).endswith("__eeg_b")
+        }
+        by_target = {
+            target: [
+                row for row in rows if row["target_canonical_id"] == target
+            ]
+            for target in repeated_targets
+        }
+        base = [
+            row for row in rows if not str(row["query_id"]).endswith("__eeg_b")
+        ]
+        appended = [
+            row for row in rows if str(row["query_id"]).endswith("__eeg_b")
+        ]
+        at_least_one = sum(
+            any(row["correct_top1"] for row in values)
+            for values in by_target.values()
+        )
+        both = sum(
+            all(row["correct_top1"] for row in values)
+            for values in by_target.values()
+        )
+        ceiling = (
+            min(int(matrix_shape[0]), int(matrix_shape[1]))
+            if decoder in STRICT_DECODERS
+            else answerable
+        )
+        if correct > ceiling:
+            raise ValueError("duplicate EEG correct count exceeds theoretical ceiling")
+        result.update(
+            {
+                "base_a_correct": sum(row["correct_top1"] for row in base),
+                "base_a_total": len(base),
+                "base_a_top1": _percent(
+                    sum(row["correct_top1"] for row in base), len(base)
+                ),
+                "appended_b_correct": sum(
+                    row["correct_top1"] for row in appended
+                ),
+                "appended_b_total": len(appended),
+                "appended_b_top1": _percent(
+                    sum(row["correct_top1"] for row in appended), len(appended)
+                ),
+                "repeated_canonical_total": len(repeated_targets),
+                "at_least_one_correct_count": at_least_one,
+                "at_least_one_coverage": _percent(
+                    at_least_one, len(repeated_targets)
+                ),
+                "both_correct_count": both,
+                "both_correct": _percent(both, len(repeated_targets)),
+                "theoretical_ceiling_count": ceiling,
+                "theoretical_ceiling": _percent(ceiling, total),
+                "distance_from_ceiling": ceiling - correct,
+                "unmatched_repeated_queries": sum(
+                    row["unmatched"]
+                    and row["target_canonical_id"] in repeated_targets
+                    for row in rows
+                ),
+            }
+        )
+    return result
+
+
+def _parse_bool(value: str, label: str) -> bool:
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    raise ValueError(f"per-query ledger {label} must be an exact boolean")
+
+
+def _parse_int(value: str, label: str, *, allow_negative: bool = False) -> int:
+    if re.fullmatch(r"-?(0|[1-9][0-9]*)", value) is None:
+        raise ValueError(f"per-query ledger {label} must be an exact integer")
+    parsed = int(value)
+    if not allow_negative and parsed < 0:
+        raise ValueError(f"per-query ledger {label} must be non-negative")
+    return parsed
+
+
+def _parse_optional_float(value: str, label: str) -> float | None:
+    if value == "":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"per-query ledger {label} must be numeric") from error
+    if not math.isfinite(parsed):
+        raise ValueError(f"per-query ledger {label} must be finite")
+    return parsed
+
+
+def _safe_text(value: str, label: str) -> str:
+    if not value:
+        raise ValueError(f"per-query ledger {label} must be non-empty")
+    if value[0] in "=+-@" or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise ValueError(f"per-query ledger {label} contains formula/control text")
+    return value
+
+
+def _optional_safe_text(value: str, label: str) -> str | None:
+    return None if value == "" else _safe_text(value, label)
+
+
 def _scenario_identity(index: int) -> tuple[str, str]:
     if index < 27:
         return "standard", standard_scenarios()[index].slug
@@ -478,15 +1016,14 @@ def _scenario_identity(index: int) -> tuple[str, str]:
 
 
 def _validate_metric_record(record: Mapping[str, object], *, duplicate: bool) -> None:
-    required = _BASE_FIELDS.difference({"source_artifact_sha256"})
-    if not required.issubset(record):
-        missing = sorted(required.difference(record))
-        raise ValueError(f"formal metric record is incomplete: {missing}")
-    unexpected_duplicate = _DUPLICATE_FIELDS.intersection(record)
-    if duplicate and unexpected_duplicate != _DUPLICATE_FIELDS:
-        raise ValueError("duplicate EEG record lacks the complete duplicate metric schema")
-    if not duplicate and unexpected_duplicate:
-        raise ValueError("standard record must not contain duplicate EEG metrics")
+    expected = _BASE_FIELDS | (_DUPLICATE_FIELDS if duplicate else frozenset())
+    if set(record) != expected:
+        missing = sorted(expected.difference(record))
+        extra = sorted(set(record).difference(expected))
+        raise ValueError(
+            "formal metric record schema mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
 
     decoder = str(record["decoder"])
     strict = decoder in STRICT_DECODERS
@@ -555,8 +1092,13 @@ def _validate_metric_record(record: Mapping[str, object], *, duplicate: bool) ->
     elif top5_count is not None or top5 is not None:
         raise ValueError("assignment decoder Top-5 must be absent/null")
 
-    if not isinstance(record.get("assignment_metadata"), Mapping):
-        raise ValueError("assignment_metadata must be a mapping")
+    _validate_assignment_metadata(
+        decoder,
+        record.get("assignment_metadata"),
+        matched=values["assigned_count"],
+        unmatched=values["unmatched_count"],
+        total=total,
+    )
     if duplicate:
         _validate_duplicate_metrics(record, total, values["correct"])
 
@@ -621,6 +1163,93 @@ def _recomputed_record(record: Mapping[str, object]) -> dict[str, object]:
     return value
 
 
+def _validate_assignment_metadata(
+    decoder: str,
+    value: object,
+    *,
+    matched: int,
+    unmatched: int,
+    total: int,
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("assignment_metadata must be a mapping")
+    metadata = dict(value)
+    if decoder == "independent":
+        if metadata:
+            raise ValueError("Independent assignment metadata must be empty")
+        return
+    if decoder == "greedy":
+        if metadata != {"matched_count": matched, "unmatched_count": unmatched}:
+            raise ValueError("Greedy assignment metadata is invalid")
+        return
+    if decoder == "hungarian":
+        expected = {
+            "seed",
+            "row_permutation_sha256",
+            "column_permutation_sha256",
+            "matched_count",
+            "unmatched_count",
+            "assigned_sum_similarity",
+        }
+        if (
+            set(metadata) != expected
+            or metadata.get("seed") != 42
+            or metadata.get("matched_count") != matched
+            or metadata.get("unmatched_count") != unmatched
+            or not _is_sha256(metadata.get("row_permutation_sha256"))
+            or not _is_sha256(metadata.get("column_permutation_sha256"))
+            or not _finite_number(metadata.get("assigned_sum_similarity"))
+        ):
+            raise ValueError("Hungarian assignment metadata is invalid")
+        return
+    if decoder == "stable_matching":
+        expected = {"matched_count", "unmatched_count", "proposal_count"}
+        proposal_count = metadata.get("proposal_count")
+        if (
+            set(metadata) != expected
+            or metadata.get("matched_count") != matched
+            or metadata.get("unmatched_count") != unmatched
+            or isinstance(proposal_count, bool)
+            or not isinstance(proposal_count, int)
+            or not 0 <= proposal_count <= total * max(total, 1)
+        ):
+            raise ValueError("Stable Matching assignment metadata is invalid")
+        return
+    expected = {
+        "temperature",
+        "max_iterations",
+        "iterations",
+        "tolerance",
+        "marginal_error",
+        "converged",
+        "plan_min",
+        "plan_max",
+        "plan_sum",
+        "plan_sha256",
+    }
+    iterations = metadata.get("iterations")
+    if (
+        set(metadata) != expected
+        or metadata.get("temperature") != 0.05
+        or metadata.get("max_iterations") != 500
+        or metadata.get("tolerance") != 1e-8
+        or isinstance(iterations, bool)
+        or not isinstance(iterations, int)
+        or not 1 <= iterations <= 500
+        or not isinstance(metadata.get("converged"), bool)
+        or not _finite_number(metadata.get("marginal_error"))
+        or float(metadata["marginal_error"]) < 0
+        or not _finite_number(metadata.get("plan_min"))
+        or not _finite_number(metadata.get("plan_max"))
+        or not _finite_number(metadata.get("plan_sum"))
+        or float(metadata["plan_min"]) < 0
+        or float(metadata["plan_max"]) < float(metadata["plan_min"])
+        or not math.isclose(float(metadata["plan_sum"]), 1.0, abs_tol=1e-6)
+        or not _is_sha256(metadata.get("plan_sha256"))
+    ):
+        raise ValueError("Sinkhorn assignment metadata is invalid")
+
+
 def _record_source_hashes(
     record: Mapping[str, object],
     source_by_role: dict[str, dict[str, str]],
@@ -650,30 +1279,72 @@ def _validate_source_hashes(value: object, suite: str) -> dict[str, str]:
 def _standard_table(aggregate: AggregateBundle, *, language: str) -> str:
     decoders = DECODER_ORDER
     records = {
-        (str(row["model"]), str(row["decoder"])): row
+        (int(row["scenario_index"]), str(row["model"]), str(row["decoder"])): row
         for row in aggregate.records
-        if row["scenario_index"] == 0
+        if row["suite"] == "standard"
     }
     best = {
-        decoder: max(int(records[(model, decoder)]["correct"]) for model in MODEL_ORDER)
+        (index, decoder): max(
+            int(records[(index, model, decoder)]["correct"])
+            for model in MODEL_ORDER
+        )
+        for index in range(27)
         for decoder in decoders
     }
-    top5_best = max(int(records[(model, "independent")]["top5_count"]) for model in MODEL_ORDER)
+    top5_best = {
+        index: max(
+            int(records[(index, model, "independent")]["top5_count"])
+            for model in MODEL_ORDER
+        )
+        for index in range(27)
+    }
     if language == "zh":
-        headers = ("模型", "Independent Top-1", "Independent Top-5", "Greedy Top-1", "Hungarian Top-1", "Stable Matching Top-1", "Sinkhorn Top-1")
+        headers = ("场景", "模型", "Independent Top-1", "Independent Top-5", "Greedy Top-1", "Hungarian Top-1", "Stable Matching Top-1", "Sinkhorn Top-1", "Sinkhorn 收敛")
     else:
-        headers = ("Model", "Independent Top-1", "Independent Top-5", "Greedy Top-1", "Hungarian Top-1", "Stable Matching Top-1", "Sinkhorn Top-1")
+        headers = ("Scenario", "Model", "Independent Top-1", "Independent Top-5", "Greedy Top-1", "Hungarian Top-1", "Stable Matching Top-1", "Sinkhorn Top-1", "Sinkhorn converged")
     rows = []
-    for model in MODEL_ORDER:
-        cells = [model]
-        independent = records[(model, "independent")]
-        cells.append(_score_cell(independent, bold=int(independent["correct"]) == best["independent"]))
-        cells.append(_count_cell(int(independent["top5_count"]), int(independent["total"]), bold=int(independent["top5_count"]) == top5_best))
-        for decoder in decoders[1:]:
-            row = records[(model, decoder)]
-            cells.append(_score_cell(row, bold=int(row["correct"]) == best[decoder]))
-        rows.append(cells)
+    for index, spec in enumerate(standard_scenarios()):
+        for model in MODEL_ORDER:
+            cells = [f"{index:02d} {spec.slug}", model]
+            independent = records[(index, model, "independent")]
+            cells.append(_score_cell(independent, bold=int(independent["correct"]) == best[(index, "independent")]))
+            cells.append(_count_cell(int(independent["top5_count"]), int(independent["total"]), bold=int(independent["top5_count"]) == top5_best[index]))
+            for decoder in decoders[1:]:
+                row = records[(index, model, decoder)]
+                cells.append(_score_cell(row, bold=int(row["correct"]) == best[(index, decoder)]))
+            sinkhorn = records[(index, model, "sinkhorn")]["assignment_metadata"]
+            cells.append("yes" if sinkhorn["converged"] else "NO")
+            rows.append(cells)
     return _markdown_table(headers, rows)
+
+
+def _sinkhorn_summary(aggregate: AggregateBundle) -> dict[str, int]:
+    rows = [row for row in aggregate.records if row["decoder"] == "sinkhorn"]
+    nonconverged = sum(
+        row["assignment_metadata"]["converged"] is False for row in rows
+    )
+    return {
+        "total": len(rows),
+        "converged": len(rows) - nonconverged,
+        "nonconverged": nonconverged,
+    }
+
+
+def _sinkhorn_status(aggregate: AggregateBundle, *, language: str) -> str:
+    summary = _sinkhorn_summary(aggregate)
+    if language == "zh":
+        if summary["nonconverged"]:
+            return (
+                f"**警告：Sinkhorn 有 {summary['nonconverged']}/{summary['total']} 个单元未收敛；"
+                "这些单元保留作透明报告，不应解释为可靠的最优传输解。**"
+            )
+        return f"Sinkhorn 收敛检查：{summary['converged']}/{summary['total']} 个单元收敛。"
+    if summary["nonconverged"]:
+        return (
+            f"**WARNING: {summary['nonconverged']}/{summary['total']} Sinkhorn cells did not converge; "
+            "they are retained for transparency and must not be interpreted as reliable transport optima.**"
+        )
+    return f"Sinkhorn convergence check: {summary['converged']}/{summary['total']} cells converged."
 
 
 def _duplicate_table(aggregate: AggregateBundle, *, language: str) -> str:
@@ -730,9 +1401,9 @@ def _audit_table(rows: Sequence[Mapping[str, object]], *, language: str) -> str:
                 f"{float(row['formal_val_loss']):.6g}",
                 _count_cell(int(row["formal_top1_count"]), int(row["sample_count"])),
                 _count_cell(int(row["formal_top5_count"]), int(row["sample_count"])),
-                f"epoch {row['best_test_epoch']}: "
+                f"epoch {row['best_test_epoch']}: Top-1 "
                 + _count_cell(int(row["best_test_top1_count"]), int(row["sample_count"]))
-                + " / "
+                + ("；Top-5 " if language == "zh" else "; Top-5 ")
                 + _count_cell(int(row["best_test_top5_count"]), int(row["sample_count"])),
                 f"`{row['source_commit']}`" if row.get("source_commit") else "n/a",
             ]
@@ -792,13 +1463,78 @@ def _validated_audit_rows(audits: Sequence[Mapping[str, object]]) -> tuple[dict[
 def _validate_checkpoint_manifest(
     payload: Mapping[str, object], model: str
 ) -> tuple[Mapping[str, object], dict[int, str]]:
-    if payload.get("schema_version") != 1 or payload.get("model") != model or payload.get("subject") != "sub-08" or payload.get("seed") != 42:
+    expected_fields = {
+        "schema_version", "model", "encoder_type", "subject", "seed", "source",
+        "inputs", "hyperparameters", "encoder_behavior", "checkpoints",
+        "selection", "best_checkpoint", "history", "stopped_early",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError("checkpoint manifest must use the exact Task 5 schema")
+    expected_encoder = "NICE" if model == "nice" else "ATMS"
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("model") != model
+        or payload.get("encoder_type") != expected_encoder
+        or payload.get("subject") != "sub-08"
+        or payload.get("seed") != 42
+    ):
         raise ValueError("checkpoint manifest formal identity is invalid")
+    source = payload.get("source")
+    if (
+        not isinstance(source, Mapping)
+        or set(source) != {"url", "branch", "commit", "checkout_sha256"}
+        or not isinstance(source.get("url"), str)
+        or not source["url"]
+        or source.get("branch") != "develop"
+        or re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit", ""))) is None
+        or not _is_sha256(source.get("checkout_sha256"))
+    ):
+        raise ValueError("checkpoint manifest source provenance is invalid")
+    inputs = payload.get("inputs")
+    expected_names = {
+        "training_eeg": "preprocessed_eeg_training.npy",
+        "training_features": "ViT-H-14_features_train.pt",
+    }
+    if not isinstance(inputs, Mapping) or set(inputs) != set(expected_names):
+        raise ValueError("checkpoint manifest training inputs are incomplete")
+    for role, name in expected_names.items():
+        entry = inputs[role]
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"name", "sha256"}
+            or entry.get("name") != name
+            or not _is_sha256(entry.get("sha256"))
+        ):
+            raise ValueError("checkpoint manifest training input provenance is invalid")
+    expected_hyperparameters = {
+        "epochs": 500,
+        "batch_size": 1024,
+        "learning_rate": 3e-4,
+        "val_ratio": 0.1,
+        "early_stopping_patience": 10,
+        "ema_decay": 0.999,
+        "logit_scale_type": "exp",
+        "avg_trials": True,
+        "n_chans": 63,
+        "n_times": 250,
+    }
+    if payload.get("hyperparameters") != expected_hyperparameters:
+        raise ValueError("checkpoint manifest formal hyperparameters are invalid")
+    expected_behavior = {
+        "use_subject_id": model == "atm_s",
+        "normalize_feats": model == "atm_s",
+    }
+    if payload.get("encoder_behavior") != expected_behavior:
+        raise ValueError("checkpoint manifest encoder behavior is invalid")
+    if not isinstance(payload.get("stopped_early"), bool):
+        raise ValueError("checkpoint manifest stopped_early must be boolean")
     selection = payload.get("selection")
     checkpoints = payload.get("checkpoints")
     if not isinstance(selection, Mapping) or set(selection) != {"epoch", "val_loss", "checkpoint"} or not isinstance(checkpoints, list) or not checkpoints:
         raise ValueError("checkpoint manifest selection is incomplete")
     epoch = _integer(selection.get("epoch"), "selected epoch")
+    if epoch <= 0:
+        raise ValueError("selected epoch must be positive")
     loss = selection.get("val_loss")
     if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(float(loss)):
         raise ValueError("selected validation loss is invalid")
@@ -816,19 +1552,170 @@ def _validate_checkpoint_manifest(
             or not isinstance(row_loss, (int, float))
             or not math.isfinite(float(row_loss))
             or not isinstance(row.get("checkpoint"), str)
-            or not row["checkpoint"]
+            or row["checkpoint"] != f"epoch_{row_epoch:04d}.pth"
             or not _is_sha256(row.get("sha256"))
+            or row_epoch <= 0
             or row_epoch in identities
         ):
             raise ValueError("checkpoint manifest checkpoint row is invalid")
         identities[row_epoch] = str(row["sha256"])
+    if list(identities) != sorted(identities):
+        raise ValueError("checkpoint manifest rows must be ordered by epoch")
     selected = min(candidates, key=lambda row: (float(row["val_loss"]), int(row["epoch"])))
     if selection != {"epoch": selected["epoch"], "val_loss": selected["val_loss"], "checkpoint": selected["checkpoint"]} or epoch != int(selected["epoch"]):
         raise ValueError("checkpoint manifest does not select minimum validation loss")
-    source = payload.get("source")
-    if not isinstance(source, Mapping) or not re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit", ""))):
-        raise ValueError("checkpoint manifest source commit is invalid")
+    best = payload.get("best_checkpoint")
+    if (
+        not isinstance(best, Mapping)
+        or set(best) != {"name", "sha256"}
+        or best.get("name") != "best_val.pth"
+        or not _is_sha256(best.get("sha256"))
+        or best.get("sha256") != selected.get("sha256")
+    ):
+        raise ValueError("checkpoint manifest best checkpoint is invalid")
+    history = payload.get("history")
+    if (
+        not isinstance(history, Mapping)
+        or set(history) != {"name", "sha256"}
+        or history.get("name") != "history.csv"
+        or not _is_sha256(history.get("sha256"))
+    ):
+        raise ValueError("checkpoint manifest history provenance is invalid")
     return selection, identities
+
+
+def _score_artifact_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    for name in ("metadata.json", "similarity.npy"):
+        digest.update(name.encode("ascii"))
+        digest.update(bytes.fromhex(sha256_file(Path(path) / name)))
+    return digest.hexdigest()
+
+
+def _validate_native_standard_artifact(
+    artifact: ScoreArtifact,
+    *,
+    model: str,
+    checkpoint: Mapping[str, object],
+    checkpoint_manifest_sha256: str,
+    formal: Mapping[str, object],
+) -> None:
+    if artifact.similarity.shape != (200, 200):
+        raise ValueError("native standard artifact has invalid matrix shape")
+    if not (
+        artifact.query_ids
+        == artifact.target_canonical_ids
+        == artifact.gallery_entry_ids
+        == artifact.gallery_canonical_ids
+    ):
+        raise ValueError("native standard artifact canonical identities disagree")
+    metadata = artifact.metadata
+    expected_fields = {
+        "model_slug", "trial_half", "checkpoint_role", "checkpoint",
+        "checkpoint_sha256", "checkpoint_manifest_sha256", "source_lock",
+        "asset_lock_manifest_sha256", "asset_lock", "input_sha256",
+        "trial_manifest_sha256", "subject", "seed", "logit_scale_type",
+        "effective_logit_scale", "query_embeddings_sha256", "native_metrics",
+    }
+    if set(metadata) != expected_fields:
+        raise ValueError("native standard artifact metadata schema is invalid")
+    best = checkpoint["best_checkpoint"]
+    if (
+        metadata.get("model_slug") != model
+        or metadata.get("trial_half") != "standard"
+        or metadata.get("checkpoint_role") != "val_selected_formal"
+        or not isinstance(metadata.get("checkpoint"), str)
+        or not metadata["checkpoint"]
+        or metadata.get("checkpoint_sha256") != best["sha256"]
+        or metadata.get("checkpoint_manifest_sha256")
+        != checkpoint_manifest_sha256
+        or metadata.get("source_lock") != checkpoint["source"]
+        or metadata.get("subject") != "sub-08"
+        or metadata.get("seed") != 42
+        or metadata.get("logit_scale_type") != "exp"
+        or not _is_sha256(metadata.get("query_embeddings_sha256"))
+        or not _is_sha256(metadata.get("asset_lock_manifest_sha256"))
+    ):
+        raise ValueError("native standard artifact checkpoint provenance is invalid")
+    scale = metadata.get("effective_logit_scale")
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not math.isfinite(float(scale))
+        or float(scale) <= 0
+    ):
+        raise ValueError("native standard artifact logit scale is invalid")
+    _validate_native_asset_lock(metadata.get("asset_lock"))
+    asset_files = metadata["asset_lock"]["files"]
+    training_inputs = checkpoint["inputs"]
+    if (
+        asset_files[
+            "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy"
+        ]["sha256"]
+        != training_inputs["training_eeg"]["sha256"]
+        or asset_files["ViT-H-14_features_train.pt"]["sha256"]
+        != training_inputs["training_features"]["sha256"]
+    ):
+        raise ValueError("native standard artifact training inputs disagree")
+    input_hashes = metadata.get("input_sha256")
+    if (
+        not isinstance(input_hashes, Mapping)
+        or set(input_hashes) != {"test_eeg", "test_features", "trial_manifest"}
+        or not all(_is_sha256(value) for value in input_hashes.values())
+        or input_hashes["test_eeg"]
+        != asset_files[
+            "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy"
+        ]["sha256"]
+        or input_hashes["test_features"]
+        != asset_files["ViT-H-14_features_test.pt"]["sha256"]
+        or input_hashes["trial_manifest"]
+        != metadata.get("trial_manifest_sha256")
+    ):
+        raise ValueError("native standard artifact test input provenance is invalid")
+    ranks = independent_ranks(artifact)
+    expected_metrics = {
+        "top1_count": int((ranks <= 1).sum()),
+        "top5_count": int((ranks <= 5).sum()),
+        "sample_count": len(ranks),
+    }
+    if metadata.get("native_metrics") != expected_metrics:
+        raise ValueError("native standard artifact metric parity failed")
+    if expected_metrics != {
+        "top1_count": formal["correct"],
+        "top5_count": formal["top5_count"],
+        "sample_count": formal["total"],
+    }:
+        raise ValueError("native standard artifact metrics disagree with formal ledger")
+
+
+def _validate_native_asset_lock(value: object) -> None:
+    paths = {
+        "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_training.npy",
+        "Preprocessed_data_250Hz/sub-08/preprocessed_eeg_test.npy",
+        "ViT-H-14_features_train.pt",
+        "ViT-H-14_features_test.pt",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"repo_id", "repo_type", "asset_root", "files"}
+        or value.get("repo_id") != "LidongYang/EEG_Image_decode"
+        or value.get("repo_type") != "dataset"
+        or not isinstance(value.get("asset_root"), str)
+        or not value["asset_root"]
+        or not isinstance(value.get("files"), Mapping)
+        or set(value["files"]) != paths
+    ):
+        raise ValueError("native standard artifact asset lock is incomplete")
+    for entry in value["files"].values():
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"bytes", "sha256"}
+            or isinstance(entry.get("bytes"), bool)
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] < 0
+            or not _is_sha256(entry.get("sha256"))
+        ):
+            raise ValueError("native standard artifact asset entry is invalid")
 
 
 def _validate_audit_manifest(
@@ -838,6 +1725,13 @@ def _validate_audit_manifest(
     dict[tuple[str, str], str],
     dict[int, str],
 ]:
+    expected_fields = {
+        "schema_version", "scope", "model_slug", "checkpoint_policy",
+        "fairness_artifact_created", "formal_artifact_inventory", "runs",
+        "best_test",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError("best-test audit must use the exact Task 6 schema")
     if payload.get("schema_version") != 1 or payload.get("scope") != "best_test_audit_only" or payload.get("model_slug") != model or payload.get("checkpoint_policy") != "every_epoch_checkpoint" or payload.get("fairness_artifact_created") is not False:
         raise ValueError("best-test audit scope/identity is invalid")
     runs = payload.get("runs")
@@ -846,20 +1740,37 @@ def _validate_audit_manifest(
         raise ValueError("best-test audit runs are incomplete")
     identities: dict[int, str] = {}
     for row in runs:
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {
+                "epoch", "checkpoint", "checkpoint_sha256",
+                "effective_logit_scale", "top1_count", "top5_count",
+                "sample_count",
+            }
+        ):
             raise ValueError("best-test audit run row is invalid")
         epoch = _integer(row.get("epoch"), "audit checkpoint epoch")
         top1 = _integer(row.get("top1_count"), "audit Top-1 count")
         top5 = _integer(row.get("top5_count"), "audit Top-5 count")
         sample = _integer(row.get("sample_count"), "audit sample count")
+        scale = row.get("effective_logit_scale")
         if (
             epoch in identities
+            or epoch <= 0
+            or not isinstance(row.get("checkpoint"), str)
+            or not row["checkpoint"]
             or not _is_sha256(row.get("checkpoint_sha256"))
+            or isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(float(scale))
+            or float(scale) <= 0
             or sample != 200
             or not 0 <= top1 <= top5 <= sample
         ):
             raise ValueError("best-test audit run metrics/checkpoint identity is invalid")
         identities[epoch] = str(row["checkpoint_sha256"])
+    if list(identities) != sorted(identities):
+        raise ValueError("best-test audit runs must be ordered by epoch")
     expected_best = max(runs, key=lambda row: (int(row["top1_count"]), int(row["top5_count"]), -int(row["epoch"])))
     if dict(best) != dict(expected_best):
         raise ValueError("best-test audit selector is invalid")
@@ -869,7 +1780,12 @@ def _validate_audit_manifest(
     inventory: dict[tuple[str, str], str] = {}
     role_map = {"standard": "standard", "a": "eeg_a", "b": "eeg_b"}
     for entry in inventory_payload:
-        if not isinstance(entry, Mapping):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"model_slug", "trial_half", "path", "sha256"}
+            or not isinstance(entry.get("path"), str)
+            or not entry["path"]
+        ):
             raise ValueError("audit inventory entry is invalid")
         model_slug = entry.get("model_slug")
         half = entry.get("trial_half")
@@ -1070,18 +1986,26 @@ def _write_exclusive(path: Path, encoded: bytes) -> None:
 def _csv_bytes(records: Sequence[Mapping[str, object]]) -> bytes:
     if not records:
         raise ValueError("aggregate CSV requires records")
-    fields = sorted(set().union(*(record.keys() for record in records)))
     stream = io.StringIO(newline="")
-    writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+    writer = csv.DictWriter(stream, fieldnames=_CSV_FIELDS, lineterminator="\n")
     writer.writeheader()
     for record in records:
-        writer.writerow({field: _csv_value(record.get(field)) for field in fields})
+        if not set(record).issubset(_CSV_FIELDS):
+            raise ValueError("aggregate record contains a field outside fixed CSV schema")
+        writer.writerow(
+            {field: _csv_value(record.get(field)) for field in _CSV_FIELDS}
+        )
     return stream.getvalue().encode("utf-8")
 
 
 def _csv_value(value: object) -> object:
     if isinstance(value, Mapping) or isinstance(value, (list, tuple)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if isinstance(value, str):
+        if value.startswith(("=", "+", "-", "@")) or any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        ):
+            raise ValueError("aggregate CSV contains formula/control text")
     return value
 
 
@@ -1100,6 +2024,14 @@ def _integer(value: object, label: str, *, allow_negative: bool = False) -> int:
     if not allow_negative and value < 0:
         raise ValueError(f"{label} must be non-negative")
     return value
+
+
+def _finite_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
 
 
 def _check_percent(value: object, numerator: int, denominator: int, label: str) -> None:
