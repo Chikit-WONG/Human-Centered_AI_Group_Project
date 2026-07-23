@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import hashlib
 import io
@@ -20,6 +21,12 @@ RUNNER = EXPERIMENT_ROOT / "run_matching_fairness.sh"
 SUBMITTER_PATH = EXPERIMENT_ROOT / "scripts/submit_pipeline.py"
 SLURM_ROOT = EXPERIMENT_ROOT / "slurm"
 LOGS_FRAGMENT = "/test/brain-rw/logs/matching_fairness_v3/"
+SLURM_ENTRYPOINTS = (
+    "train_native_array.slurm",
+    "export_native_array.slurm",
+    "export_brainrw.slurm",
+    "fairness_cpu.slurm",
+)
 
 
 def _load_submitter():
@@ -549,6 +556,99 @@ def test_slurm_resources_logs_offline_flags_and_array_scope() -> None:
         assert "TRANSFORMERS_OFFLINE=1" in text
         assert "HF_HUB_OFFLINE=1" in text
         assert "PYTHONPATH=" in text
+
+
+def test_every_submission_command_exports_exact_layout_experiment_root(
+    tmp_path: Path,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    expected = f"MATCHING_FAIRNESS_EXPERIMENT_ROOT={layout.experiment_root}"
+
+    for entry in module.submission_commands(layout=layout, overwrite=False).values():
+        argv = entry["argv"]
+        export_argument = next(
+            argument for argument in argv if argument.startswith("--export=")
+        )
+        exported = export_argument.removeprefix("--export=").split(",")
+        assert exported[0] == "ALL"
+        assert exported.count(expected) == 1
+
+
+@pytest.mark.parametrize("name", SLURM_ENTRYPOINTS)
+def test_slurm_entrypoints_use_only_explicit_spool_safe_experiment_root(
+    name: str,
+) -> None:
+    text = (SLURM_ROOT / name).read_text(encoding="utf-8")
+    assert "MATCHING_FAIRNESS_EXPERIMENT_ROOT" in text
+    assert "BASH_SOURCE" not in text
+    assert "SCRIPT_DIR" not in text
+    assert "scripts/submit_pipeline.py" in text
+    assert text.index("MATCHING_FAIRNESS_EXPERIMENT_ROOT") < text.index(
+        'source "${CONDA_SH}"'
+    )
+
+
+@pytest.mark.parametrize("name", SLURM_ENTRYPOINTS)
+@pytest.mark.parametrize(
+    ("root_kind", "expected_error"),
+    (
+        ("unset", "must be set"),
+        ("relative", "must be an absolute path"),
+        ("nonexistent", "directory does not exist"),
+        ("missing_submitter", "missing scripts/submit_pipeline.py"),
+    ),
+)
+def test_copied_slurm_entrypoints_reject_invalid_root_before_activation(
+    tmp_path: Path,
+    name: str,
+    root_kind: str,
+    expected_error: str,
+) -> None:
+    spool_script = tmp_path / "spool" / name
+    spool_script.parent.mkdir()
+    shutil.copy2(SLURM_ROOT / name, spool_script)
+    environment = dict(os.environ)
+    environment["SLURM_ARRAY_TASK_ID"] = "0"
+    if root_kind == "unset":
+        environment.pop("MATCHING_FAIRNESS_EXPERIMENT_ROOT", None)
+    elif root_kind == "relative":
+        environment["MATCHING_FAIRNESS_EXPERIMENT_ROOT"] = "relative/root"
+    elif root_kind == "nonexistent":
+        environment["MATCHING_FAIRNESS_EXPERIMENT_ROOT"] = str(
+            tmp_path / "nonexistent"
+        )
+    else:
+        root = tmp_path / "experiment"
+        root.mkdir()
+        environment["MATCHING_FAIRNESS_EXPERIMENT_ROOT"] = str(root)
+
+    result = subprocess.run(
+        ["bash", str(spool_script)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 64
+    assert expected_error in result.stderr
+
+
+def test_export_unsafe_experiment_root_is_rejected_before_scheduler_call(
+    tmp_path: Path,
+) -> None:
+    module = _load_submitter()
+    layout = replace(
+        module.RuntimeLayout.for_test(tmp_path),
+        experiment_root=Path("/tmp/export,unsafe"),
+    )
+    runner = _SubmissionRunner(["101\n"])
+
+    with pytest.raises(ValueError, match="export-safe"):
+        module.submit_all(layout=layout, overwrite=False, runner=runner)
+
+    assert runner.calls == []
 
 
 def test_slurm_scripts_reject_unknown_array_ids_and_use_internal_cells() -> None:

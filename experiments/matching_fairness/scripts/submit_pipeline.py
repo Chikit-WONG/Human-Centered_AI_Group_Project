@@ -294,13 +294,20 @@ def _native_audit_command(layout: RuntimeLayout, model: str) -> list[str]:
 def _sbatch_argv(
     script: Path,
     *,
+    experiment_root: Path,
     dependency: str | None,
     overwrite: bool,
     export_mode: str | None = None,
 ) -> list[str]:
+    experiment_root_value = str(experiment_root)
+    if not experiment_root.is_absolute() or re.search(
+        r"[,\x00-\x1f\x7f]", experiment_root_value
+    ):
+        raise ValueError("experiment root must be an absolute export-safe path")
     variables = [
         "ALL",
         f"MATCHING_FAIRNESS_OVERWRITE={1 if overwrite else 0}",
+        f"MATCHING_FAIRNESS_EXPERIMENT_ROOT={experiment_root_value}",
     ]
     if export_mode is not None:
         if export_mode not in {"main", "audit"}:
@@ -321,6 +328,7 @@ def submission_commands(
         "train": {
             "argv": _sbatch_argv(
                 slurm / "train_native_array.slurm",
+                experiment_root=layout.experiment_root,
                 dependency=None,
                 overwrite=overwrite,
             ),
@@ -329,6 +337,7 @@ def submission_commands(
         "native_export": {
             "argv": _sbatch_argv(
                 slurm / "export_native_array.slurm",
+                experiment_root=layout.experiment_root,
                 dependency="afterok:<train_job_id>",
                 overwrite=overwrite,
                 export_mode="main",
@@ -338,6 +347,7 @@ def submission_commands(
         "brainrw_export": {
             "argv": _sbatch_argv(
                 slurm / "export_brainrw.slurm",
+                experiment_root=layout.experiment_root,
                 dependency=None,
                 overwrite=overwrite,
             ),
@@ -346,6 +356,7 @@ def submission_commands(
         "native_audit": {
             "argv": _sbatch_argv(
                 slurm / "export_native_array.slurm",
+                experiment_root=layout.experiment_root,
                 dependency="afterok:<native_export_job_id>:<brainrw_export_job_id>",
                 overwrite=overwrite,
                 export_mode="audit",
@@ -355,6 +366,7 @@ def submission_commands(
         "final": {
             "argv": _sbatch_argv(
                 slurm / "fairness_cpu.slurm",
+                experiment_root=layout.experiment_root,
                 dependency="afterok:<native_audit_job_id>",
                 overwrite=overwrite,
             ),
@@ -423,6 +435,7 @@ def render_phase_plan(
         # A standalone export phase assumes the sealed training phase already finished.
         native_main = _sbatch_argv(
             layout.experiment_root / "slurm/export_native_array.slurm",
+            experiment_root=layout.experiment_root,
             dependency=None,
             overwrite=overwrite,
             export_mode="main",
@@ -743,7 +756,10 @@ def _workflow_command(
     slurm = layout.experiment_root / "slurm"
     if name == "train":
         command = _sbatch_argv(
-            slurm / "train_native_array.slurm", dependency=None, overwrite=overwrite
+            slurm / "train_native_array.slurm",
+            experiment_root=layout.experiment_root,
+            dependency=None,
+            overwrite=overwrite,
         )
     elif name == "native_export":
         dependency = (
@@ -751,17 +767,22 @@ def _workflow_command(
         )
         command = _sbatch_argv(
             slurm / "export_native_array.slurm",
+            experiment_root=layout.experiment_root,
             dependency=dependency,
             overwrite=overwrite,
             export_mode="main",
         )
     elif name == "brainrw_export":
         command = _sbatch_argv(
-            slurm / "export_brainrw.slurm", dependency=None, overwrite=overwrite
+            slurm / "export_brainrw.slurm",
+            experiment_root=layout.experiment_root,
+            dependency=None,
+            overwrite=overwrite,
         )
     elif name == "native_audit":
         command = _sbatch_argv(
             slurm / "export_native_array.slurm",
+            experiment_root=layout.experiment_root,
             dependency=(
                 f"afterok:{job_ids['native_export']}:{job_ids['brainrw_export']}"
             ),
@@ -771,6 +792,7 @@ def _workflow_command(
     elif name == "final":
         command = _sbatch_argv(
             slurm / "fairness_cpu.slurm",
+            experiment_root=layout.experiment_root,
             dependency=f"afterok:{job_ids['native_audit']}",
             overwrite=overwrite,
         )
