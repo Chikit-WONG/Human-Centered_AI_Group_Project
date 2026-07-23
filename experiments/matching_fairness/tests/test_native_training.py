@@ -358,7 +358,7 @@ def fake_native_inputs(tmp_path: Path) -> FakeNativeInputs:
     torch.save(
         {
             "img_features": torch.ones(16_540, 1),
-            "text_features": torch.ones(16_540, 1),
+            "text_features": torch.ones(1_654, 1),
         },
         training_features,
     )
@@ -549,13 +549,32 @@ def test_cli_maps_only_formal_protocol_and_training_inputs(tmp_path: Path) -> No
     assert config.avg_trials is True
 
 
-def test_post_materialization_text_features_must_keep_all_training_rows(
+def test_training_text_feature_bank_must_have_one_row_per_class(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+) -> None:
+    torch.save(
+        {
+            "img_features": torch.ones(16_540, 1),
+            "text_features": torch.ones(1_653, 1),
+        },
+        fake_native_inputs.training_features,
+    )
+
+    with pytest.raises(ValueError, match="training text_features must have 1,654 rows"):
+        train_native(_config(fake_native_inputs, tmp_path / "wrong-text-bank"))
+
+
+def test_post_materialization_text_features_must_keep_all_class_rows(
     fake_native_inputs: FakeNativeInputs,
     tmp_path: Path,
 ) -> None:
     fake_native_inputs.training_eeg.write_bytes(b"truncate text features")
 
-    with pytest.raises(ValueError, match="text_features length must be 16,540"):
+    with pytest.raises(
+        ValueError,
+        match="official dataset text_features length must be 1,654",
+    ):
         train_native(_config(fake_native_inputs, tmp_path / "truncated"))
 
 
@@ -638,7 +657,7 @@ def _make_additional_fake_inputs(root: Path, *, source_origin: int) -> FakeNativ
     torch.save(
         {
             "img_features": torch.ones(16_540, 1),
-            "text_features": torch.ones(16_540, 1),
+            "text_features": torch.ones(1_654, 1),
         },
         training_features,
     )

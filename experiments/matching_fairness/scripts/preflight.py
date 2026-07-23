@@ -81,7 +81,8 @@ class RuntimeInfo:
 class PreflightExpectations:
     eeg_tail: tuple[int, int] = (63, 250)
     test_shape: tuple[int, int, int, int] = (200, 80, 63, 250)
-    train_feature_rows: int = 16_540
+    train_image_feature_rows: int = 16_540
+    train_text_feature_rows: int = 1_654
     test_feature_rows: int = 200
     session_counts: Mapping[int, int] = field(
         default_factory=lambda: {0: 20, 1: 20, 2: 20, 3: 20}
@@ -175,7 +176,9 @@ def _load_official_eeg(path: Path, numpy: Any) -> Any:
             close()
 
 
-def _require_feature_payload(path: Path, rows: int, torch: Any) -> dict[str, Any]:
+def _require_feature_payload(
+    path: Path, expected_rows: Mapping[str, int], torch: Any
+) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, Mapping):
         raise ValueError(f"official feature file must contain a mapping: {path}")
@@ -188,6 +191,7 @@ def _require_feature_payload(path: Path, rows: int, torch: Any) -> dict[str, Any
         feature = payload[key]
         if not hasattr(feature, "shape") or len(feature.shape) == 0:
             raise ValueError(f"official feature {key} has no row dimension: {path}")
+        rows = expected_rows[key]
         if int(feature.shape[0]) != rows:
             raise ValueError(
                 f"official feature {key} row mismatch: expected {rows}, "
@@ -318,10 +322,20 @@ def run_preflight(
     train_feature_path = asset_root / ASSET_RELATIVE_PATHS[2]
     test_feature_path = asset_root / ASSET_RELATIVE_PATHS[3]
     train_feature_shapes = _require_feature_payload(
-        train_feature_path, expectations.train_feature_rows, torch
+        train_feature_path,
+        {
+            "img_features": expectations.train_image_feature_rows,
+            "text_features": expectations.train_text_feature_rows,
+        },
+        torch,
     )
     test_feature_shapes = _require_feature_payload(
-        test_feature_path, expectations.test_feature_rows, torch
+        test_feature_path,
+        {
+            "img_features": expectations.test_feature_rows,
+            "text_features": expectations.test_feature_rows,
+        },
+        torch,
     )
     brainrw = _validate_brainrw(
         brainrw_test_path,

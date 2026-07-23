@@ -467,8 +467,8 @@ def _load_training_features(path: Path) -> dict[str, torch.Tensor]:
         raise ValueError("training features must be tensors")
     if len(img_features) != _N_TRAINING_SAMPLES:
         raise ValueError("training img_features must have 16,540 rows")
-    if len(text_features) != _N_TRAINING_SAMPLES:
-        raise ValueError("training text_features must have 16,540 rows")
+    if len(text_features) != _N_CLASSES:
+        raise ValueError("training text_features must have 1,654 rows")
     return {"img_features": img_features, "text_features": text_features}
 
 
@@ -510,7 +510,7 @@ def _validate_training_dataset(dataset: Any) -> None:
         "data": _N_TRAINING_SAMPLES,
         "labels": _N_TRAINING_SAMPLES,
         "img_features": _N_TRAINING_SAMPLES,
-        "text_features": _N_TRAINING_SAMPLES,
+        "text_features": _N_CLASSES,
         "text": _N_CLASSES,
         "img": _N_TRAINING_SAMPLES,
     }

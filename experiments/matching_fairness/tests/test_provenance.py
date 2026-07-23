@@ -120,7 +120,7 @@ def _write_tiny_preflight_fixtures(tmp_path: Path) -> dict[str, Path]:
     torch.save(
         {
             "img_features": torch.zeros(6, 2),
-            "text_features": torch.ones(6, 2),
+            "text_features": torch.ones(3, 2),
         },
         assets / "ViT-H-14_features_train.pt",
     )
@@ -380,7 +380,8 @@ def test_preflight_accepts_complete_tiny_fixtures(tmp_path: Path) -> None:
     expectations = PreflightExpectations(
         eeg_tail=(3, 5),
         test_shape=(2, 4, 3, 5),
-        train_feature_rows=6,
+        train_image_feature_rows=6,
+        train_text_feature_rows=3,
         test_feature_rows=2,
         session_counts={0: 1, 1: 1, 2: 1, 3: 1},
     )
@@ -404,6 +405,45 @@ def test_preflight_accepts_complete_tiny_fixtures(tmp_path: Path) -> None:
         "3": 1,
     }
     assert json.loads(manifest.read_text(encoding="utf-8")) == result
+
+
+def test_preflight_rejects_wrong_train_text_class_bank_row_count(
+    tmp_path: Path,
+) -> None:
+    checkout = _make_checkout(tmp_path)
+    paths = _write_tiny_preflight_fixtures(tmp_path)
+    train_features = paths["asset_root"] / "ViT-H-14_features_train.pt"
+    torch.save(
+        {
+            "img_features": torch.zeros(6, 2),
+            "text_features": torch.ones(6, 2),
+        },
+        train_features,
+    )
+    manifest = tmp_path / "preflight.json"
+
+    with pytest.raises(
+        ValueError,
+        match="official feature text_features row mismatch: expected 3, found 6",
+    ):
+        run_preflight(
+            protocol_path=CONFIG,
+            checkout_path=checkout,
+            asset_root=paths["asset_root"],
+            brainrw_test_path=paths["brainrw_test"],
+            official_test_images=paths["image_root"],
+            manifest_path=manifest,
+            runtime=_valid_runtime(),
+            expectations=PreflightExpectations(
+                eeg_tail=(3, 5),
+                test_shape=(2, 4, 3, 5),
+                train_image_feature_rows=6,
+                train_text_feature_rows=3,
+                test_feature_rows=2,
+                session_counts={0: 1, 1: 1, 2: 1, 3: 1},
+            ),
+        )
+    assert not manifest.exists()
 
 
 def test_preflight_rejects_escaping_asset_before_deserialization(
@@ -430,7 +470,8 @@ def test_preflight_rejects_escaping_asset_before_deserialization(
             expectations=PreflightExpectations(
                 eeg_tail=(3, 5),
                 test_shape=(2, 4, 3, 5),
-                train_feature_rows=6,
+                train_image_feature_rows=6,
+                train_text_feature_rows=3,
                 test_feature_rows=2,
                 session_counts={0: 1, 1: 1, 2: 1, 3: 1},
             ),
@@ -454,7 +495,8 @@ def test_preflight_rejects_image_identity_mismatch(tmp_path: Path) -> None:
             expectations=PreflightExpectations(
                 eeg_tail=(3, 5),
                 test_shape=(2, 4, 3, 5),
-                train_feature_rows=6,
+                train_image_feature_rows=6,
+                train_text_feature_rows=3,
                 test_feature_rows=2,
                 session_counts={0: 1, 1: 1, 2: 1, 3: 1},
             ),
