@@ -32,6 +32,20 @@ def _load_runner():
     return module
 
 
+def test_task7_exact_model_entries_require_isolated_native_audits() -> None:
+    runner = _load_runner()
+
+    assert runner._expected_model_entries("nice") == {
+        "standard", "eeg_a", "eeg_b", "best_test_audit.json"
+    }
+    assert runner._expected_model_entries("atm_s") == {
+        "standard", "eeg_a", "eeg_b", "best_test_audit.json"
+    }
+    assert runner._expected_model_entries("our_project") == {
+        "standard", "eeg_a", "eeg_b", "runs", "export_manifest.json"
+    }
+
+
 def _artifact(
     similarity: np.ndarray,
     targets: tuple[str, ...],

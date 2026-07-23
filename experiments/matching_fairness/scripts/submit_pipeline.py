@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import io
 import json
@@ -18,7 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 import uuid
 
 
@@ -501,6 +503,205 @@ _WORKFLOW_ORDER = {
 }
 
 
+@contextmanager
+def _submission_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f"{path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError("could not open the submission ledger lock") from error
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("another submission phase holds the active ledger lock") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _new_submission_request(phase: str, overwrite: bool) -> dict[str, object]:
+    request_id = uuid.uuid4().hex
+    order = _WORKFLOW_ORDER[phase]
+    return {
+        "phase": phase,
+        "state": "active",
+        "overwrite": overwrite,
+        "request_id": request_id,
+        "job_order": list(order),
+        "jobs": {
+            name: {
+                "state": "planned",
+                "token": f"mf-{request_id}-{name.replace('_', '-')}",
+                "argv": None,
+                "job_id": None,
+                "error": None,
+            }
+            for name in order
+        },
+        "failure": None,
+    }
+
+
+def _new_submission_ledger(
+    *,
+    mode: str,
+    phase: str,
+    overwrite: bool,
+) -> dict[str, object]:
+    return {
+        "schema_version": 3,
+        "subject": SUBJECT,
+        "seed": SEED,
+        "models": list(MODELS),
+        "mode": mode,
+        "requests": {phase: _new_submission_request(phase, overwrite)},
+    }
+
+
+def _read_submission_ledger(path: Path) -> dict[str, object]:
+    from matching_fairness.reporting import _canonical_json, _read_regular_file
+
+    payload = _canonical_json(
+        _read_regular_file(path, "submission ledger"),
+        "submission ledger",
+    )
+    if set(payload) != {
+        "schema_version", "subject", "seed", "models", "mode", "requests"
+    } or (
+        payload.get("schema_version") != 3
+        or payload.get("subject") != SUBJECT
+        or payload.get("seed") != SEED
+        or payload.get("models") != list(MODELS)
+        or payload.get("mode") not in {"all", "phased"}
+        or not isinstance(payload.get("requests"), Mapping)
+    ):
+        raise RuntimeError("submission ledger schema/identity is invalid")
+    requests = payload["requests"]
+    assert isinstance(requests, Mapping)
+    expected_request_keys = {"all"} if payload["mode"] == "all" else {"train", "export"}
+    if not set(requests).issubset(expected_request_keys) or not requests:
+        raise RuntimeError("submission ledger phase set is invalid")
+    if payload["mode"] == "all" and set(requests) != {"all"}:
+        raise RuntimeError("all-mode ledger must contain exactly the all request")
+    for phase, request in requests.items():
+        _validate_submission_request(str(phase), request)
+    return dict(payload)
+
+
+def _validate_submission_request(phase: str, value: object) -> None:
+    if phase not in _WORKFLOW_ORDER or not isinstance(value, Mapping):
+        raise RuntimeError("submission request phase is invalid")
+    if set(value) != {
+        "phase", "state", "overwrite", "request_id", "job_order", "jobs", "failure"
+    } or (
+        value.get("phase") != phase
+        or value.get("state") not in {"active", "completed", "failed", "unknown"}
+        or not isinstance(value.get("overwrite"), bool)
+        or re.fullmatch(r"[0-9a-f]{32}", str(value.get("request_id", ""))) is None
+        or value.get("job_order") != list(_WORKFLOW_ORDER[phase])
+        or not isinstance(value.get("jobs"), Mapping)
+    ):
+        raise RuntimeError("submission request schema/identity is invalid")
+    jobs = value["jobs"]
+    assert isinstance(jobs, Mapping)
+    if set(jobs) != set(_WORKFLOW_ORDER[phase]):
+        raise RuntimeError("submission request job set is invalid")
+    request_id = str(value["request_id"])
+    states: list[str] = []
+    for name in _WORKFLOW_ORDER[phase]:
+        row = jobs[name]
+        if not isinstance(row, Mapping) or set(row) != {
+            "state", "token", "argv", "job_id", "error"
+        }:
+            raise RuntimeError("submission job ledger row is invalid")
+        state = str(row["state"])
+        argv = row["argv"]
+        job_id = row["job_id"]
+        error = row["error"]
+        valid_argv = (
+            isinstance(argv, list)
+            and bool(argv)
+            and all(isinstance(argument, str) and argument for argument in argv)
+        )
+        if (
+            state not in {"planned", "submitting", "submitted", "failed", "unknown"}
+            or row["token"]
+            != f"mf-{request_id}-{str(name).replace('_', '-')}"
+            or (
+                state == "planned"
+                and (argv is not None or job_id is not None or error is not None)
+            )
+            or (
+                state == "submitting"
+                and (not valid_argv or job_id is not None or error is not None)
+            )
+            or (
+                state == "submitted"
+                and (
+                    not valid_argv
+                    or isinstance(job_id, bool)
+                    or not isinstance(job_id, int)
+                    or job_id <= 0
+                    or error is not None
+                )
+            )
+            or (
+                state in {"failed", "unknown"}
+                and (
+                    not valid_argv
+                    or job_id is not None
+                    or not isinstance(error, str)
+                    or not error
+                )
+            )
+        ):
+            raise RuntimeError("submission job ledger row value is invalid")
+        states.append(state)
+
+    request_state = str(value["state"])
+    failure = value["failure"]
+    if request_state == "active":
+        if failure is not None or any(state in {"failed", "unknown"} for state in states):
+            raise RuntimeError("active submission request state is inconsistent")
+        unfinished = False
+        submitting_seen = False
+        for state in states:
+            if state == "submitted":
+                if unfinished:
+                    raise RuntimeError("active submission job order is inconsistent")
+            elif state == "submitting":
+                if unfinished or submitting_seen:
+                    raise RuntimeError("active submission job order is inconsistent")
+                unfinished = True
+                submitting_seen = True
+            else:
+                unfinished = True
+    elif request_state == "completed":
+        if failure is not None or any(state != "submitted" for state in states):
+            raise RuntimeError("completed submission request state is inconsistent")
+    else:
+        if (
+            not isinstance(failure, Mapping)
+            or set(failure) != {"stage", "error"}
+            or failure.get("stage") not in _WORKFLOW_ORDER[phase]
+            or not isinstance(failure.get("error"), str)
+            or not failure["error"]
+        ):
+            raise RuntimeError("failed submission request record is invalid")
+        failed_index = _WORKFLOW_ORDER[phase].index(str(failure["stage"]))
+        expected_states = ["submitted"] * failed_index + [request_state]
+        expected_states.extend(
+            ["planned"] * (len(_WORKFLOW_ORDER[phase]) - failed_index - 1)
+        )
+        failed_row = jobs[str(failure["stage"])]
+        assert isinstance(failed_row, Mapping)
+        if states != expected_states or failed_row["error"] != failure["error"]:
+            raise RuntimeError("failed submission request state is inconsistent")
+
+
 def _replace_submission_ledger(path: Path, payload: Mapping[str, object]) -> None:
     if path.is_symlink() or not path.is_file():
         raise ValueError("submission ledger must remain a regular file")
@@ -589,77 +790,87 @@ def _submit_workflow(
     prepare_runtime_directories(layout)
     if phase not in _WORKFLOW_ORDER:
         raise ValueError(f"unknown submission phase: {phase}")
-    if os.path.lexists(layout.submission_manifest):
-        raise FileExistsError(
-            "submission ledger already exists; active, completed, failed, and "
-            "unknown reservations require explicit manual reconciliation: "
-            f"{layout.submission_manifest}"
-        )
-    request_id = uuid.uuid4().hex
-    order = _WORKFLOW_ORDER[phase]
-    ledger: dict[str, object] = {
-        "schema_version": 2,
-        "subject": SUBJECT,
-        "seed": SEED,
-        "models": list(MODELS),
-        "phase": phase,
-        "state": "active",
-        "overwrite": overwrite,
-        "request_id": request_id,
-        "job_order": list(order),
-        "jobs": {
-            name: {
-                "state": "planned",
-                "token": f"mf-{request_id}-{name.replace('_', '-')}",
-                "argv": None,
-                "job_id": None,
-                "error": None,
-            }
-            for name in order
-        },
-        "failure": None,
-    }
-    _atomic_write_json_noclobber(layout.submission_manifest, ledger)
-    job_ids: dict[str, int] = {}
-    jobs = ledger["jobs"]
-    assert isinstance(jobs, dict)
-    for name in order:
-        row = jobs[name]
-        assert isinstance(row, dict)
-        command = _workflow_command(
-            name=name,
-            phase=phase,
-            layout=layout,
-            overwrite=overwrite,
-            job_ids=job_ids,
-            token=str(row["token"]),
-        )
-        row["state"] = "submitting"
-        row["argv"] = command
-        _replace_submission_ledger(layout.submission_manifest, ledger)
-        try:
-            job_id = _submit(command, runner)
-        except subprocess.CalledProcessError as error:
-            row["state"] = "failed"
-            row["error"] = str(error)
-            ledger["state"] = "failed"
-            ledger["failure"] = {"stage": name, "error": str(error)}
+    with _submission_lock(layout.submission_manifest):
+        exists = os.path.lexists(layout.submission_manifest)
+        if phase in {"all", "train"}:
+            if exists:
+                _read_submission_ledger(layout.submission_manifest)
+                raise FileExistsError(
+                    "submission ledger already contains an all/phased request"
+                )
+            ledger = _new_submission_ledger(
+                mode="all" if phase == "all" else "phased",
+                phase=phase,
+                overwrite=overwrite,
+            )
+            _atomic_write_json_noclobber(layout.submission_manifest, ledger)
+        else:
+            if not exists:
+                raise ValueError(
+                    "export submission requires a completed train request and checkpoints"
+                )
+            ledger = _read_submission_ledger(layout.submission_manifest)
+            requests = ledger["requests"]
+            assert isinstance(requests, dict)
+            if ledger["mode"] != "phased" or "all" in requests:
+                raise RuntimeError("all and phased submission modes cannot be mixed")
+            train = requests.get("train")
+            if not isinstance(train, Mapping) or train.get("state") != "completed":
+                raise RuntimeError("export requires a completed train ledger request")
+            if "export" in requests:
+                raise FileExistsError("export submission phase already exists in ledger")
+            if not all(
+                _checkpoint_matches_inputs(layout, model) for model in NATIVE_MODELS
+            ):
+                raise ValueError("export requires both current validation-selected checkpoints")
+            requests["export"] = _new_submission_request("export", overwrite)
             _replace_submission_ledger(layout.submission_manifest, ledger)
-            raise
-        except (OSError, RuntimeError) as error:
-            row["state"] = "unknown"
-            row["error"] = str(error)
-            ledger["state"] = "unknown"
-            ledger["failure"] = {"stage": name, "error": str(error)}
+
+        requests = ledger["requests"]
+        assert isinstance(requests, dict)
+        request = requests[phase]
+        assert isinstance(request, dict)
+        order = _WORKFLOW_ORDER[phase]
+        jobs = request["jobs"]
+        assert isinstance(jobs, dict)
+        job_ids: dict[str, int] = {}
+        for name in order:
+            row = jobs[name]
+            assert isinstance(row, dict)
+            command = _workflow_command(
+                name=name,
+                phase=phase,
+                layout=layout,
+                overwrite=overwrite,
+                job_ids=job_ids,
+                token=str(row["token"]),
+            )
+            row["state"] = "submitting"
+            row["argv"] = command
             _replace_submission_ledger(layout.submission_manifest, ledger)
-            raise
-        row["state"] = "submitted"
-        row["job_id"] = job_id
-        job_ids[name] = job_id
+            try:
+                job_id = _submit(command, runner)
+            except subprocess.CalledProcessError as error:
+                row["state"] = "failed"
+                row["error"] = str(error)
+                request["state"] = "failed"
+                request["failure"] = {"stage": name, "error": str(error)}
+                _replace_submission_ledger(layout.submission_manifest, ledger)
+                raise
+            except (OSError, RuntimeError) as error:
+                row["state"] = "unknown"
+                row["error"] = str(error)
+                request["state"] = "unknown"
+                request["failure"] = {"stage": name, "error": str(error)}
+                _replace_submission_ledger(layout.submission_manifest, ledger)
+                raise
+            row["state"] = "submitted"
+            row["job_id"] = job_id
+            job_ids[name] = job_id
+            _replace_submission_ledger(layout.submission_manifest, ledger)
+        request["state"] = "completed"
         _replace_submission_ledger(layout.submission_manifest, ledger)
-    ledger["state"] = "completed"
-    _replace_submission_ledger(layout.submission_manifest, ledger)
-    return {f"{name}_job_id": job_ids[name] for name in order}
+        return {f"{name}_job_id": job_ids[name] for name in order}
 
 
 def prepare_runtime_directories(layout: RuntimeLayout) -> None:
@@ -1069,36 +1280,12 @@ def _native_matrix_complete(path: Path) -> bool:
 
 
 def _brainrw_matrix_complete(path: Path) -> bool:
-    if path.is_symlink() or not path.is_dir():
-        return False
-    if {entry.name for entry in path.iterdir()} != {
-        *ARTIFACT_HALVES,
-        "runs",
-        "export_manifest.json",
-    }:
-        return False
-    if any(entry.is_symlink() for entry in path.rglob("*")):
-        return False
     try:
-        from matching_fairness.artifacts import read_score_artifact
+        from matching_fairness.formal_artifacts import validate_brainrw_export_tree
 
-        for half in ARTIFACT_HALVES:
-            read_score_artifact(path / half)
-        runs = path / "runs"
-        if not runs.is_dir() or {entry.name for entry in runs.iterdir()} != set(
-            ARTIFACT_HALVES
-        ):
-            return False
-        for half in ARTIFACT_HALVES:
-            run = runs / half
-            if not run.is_dir() or {entry.name for entry in run.iterdir()} != {
-                "metrics.json", "predictions.csv"
-            }:
-                return False
-            if any(not entry.is_file() for entry in run.iterdir()):
-                return False
-        return (path / "export_manifest.json").is_file()
-    except (OSError, ValueError):
+        validate_brainrw_export_tree(path, expected_image_count=200)
+        return True
+    except (OSError, TypeError, ValueError):
         return False
 
 
@@ -1112,43 +1299,8 @@ def _matrix_complete(path: Path) -> bool:
 
 
 def _brainrw_export_manifest_matches(layout: RuntimeLayout) -> bool:
+    from matching_fairness.formal_artifacts import validate_brainrw_export_tree
     from matching_fairness.provenance import sha256_path
-    from matching_fairness.reporting import _canonical_json, _read_regular_file
-
-    root = layout.matrix_dir("our_project")
-    encoded = _read_regular_file(root / "export_manifest.json", "BrainRW export manifest")
-    manifest = _canonical_json(encoded, "BrainRW export manifest")
-    if set(manifest) != {
-        "schema_version", "scope", "checkpoint_role", "model_slug",
-        "subject", "seed", "artifacts", "runs", "inputs",
-    } or (
-        manifest.get("schema_version") != 1
-        or manifest.get("scope") != "fixed_formal_export"
-        or manifest.get("checkpoint_role") != "fixed_formal"
-        or manifest.get("model_slug") != "our_project"
-        or manifest.get("subject") != SUBJECT
-        or manifest.get("seed") != SEED
-    ):
-        return False
-    artifact_inventory = manifest.get("artifacts")
-    run_inventory = manifest.get("runs")
-    if (
-        not isinstance(artifact_inventory, Mapping)
-        or set(artifact_inventory) != set(ARTIFACT_HALVES)
-        or not isinstance(run_inventory, Mapping)
-        or set(run_inventory) != set(ARTIFACT_HALVES)
-    ):
-        return False
-    for half in ARTIFACT_HALVES:
-        if artifact_inventory[half] != {
-            "path": half,
-            "sha256": _score_artifact_sha256(root / half),
-        } or run_inventory[half] != {
-            "path": f"runs/{half}",
-            "sha256": sha256_path(root / "runs" / half),
-        }:
-            return False
-    inputs = manifest.get("inputs")
     expected_inputs = {
         "protocol_sha256": _hash_file(layout.protocol),
         "trial_manifest_sha256": _hash_file(layout.trial_manifest),
@@ -1163,7 +1315,12 @@ def _brainrw_export_manifest_matches(layout: RuntimeLayout) -> bool:
             "pretrained_vision_base": sha256_path(layout.clip_root),
         },
     }
-    return inputs == expected_inputs
+    validate_brainrw_export_tree(
+        layout.matrix_dir("our_project"),
+        expected_image_count=200,
+        expected_inputs=expected_inputs,
+    )
+    return True
 
 
 def _matrix_matches_inputs(layout: RuntimeLayout, model: str) -> bool:

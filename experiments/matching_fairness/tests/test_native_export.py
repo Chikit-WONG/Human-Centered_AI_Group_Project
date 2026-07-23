@@ -28,7 +28,12 @@ from matching_fairness.native_export import (
     export_native_scores,
     native_scores,
 )
-from matching_fairness.provenance import inspect_checkout, sha256_file, sha256_path
+from matching_fairness.provenance import (
+    OFFICIAL_SOURCE_URL,
+    inspect_checkout,
+    sha256_file,
+    sha256_path,
+)
 from matching_fairness.trial_splits import build_trial_manifest
 
 
@@ -976,6 +981,18 @@ def test_brainrw_real_publisher_emits_exact_relative_hash_bound_schema(
     for name, path in model_paths.items():
         path.mkdir()
         (path / "weights.bin").write_bytes(name.encode("ascii"))
+    model_content_sha256 = {
+        "brain_model": sha256_path(model_paths["brain"]),
+        "vision_adapter": sha256_path(model_paths["adapter"]),
+        "pretrained_vision_base": sha256_path(model_paths["base"]),
+    }
+    evaluator_sha256 = sha256_file(
+        Path(__file__).resolve().parents[3] / "scripts/evaluate_retrieval.py"
+    )
+    protocol_sha256 = sha256_file(protocol)
+    trial_manifest_sha256 = sha256_file(trial_manifest)
+    brain_test_sha256 = sha256_file(brain_test)
+    test_image_tree_sha256 = sha256_path(test_images)
     arguments = build_parser().parse_args(
         [
             "--brain-model-path", str(model_paths["brain"]),
@@ -1006,12 +1023,37 @@ def test_brainrw_real_publisher_emits_exact_relative_hash_bound_schema(
                 metadata={
                     "model_slug": "our_project",
                     "trial_half": half,
-                    "trial_manifest_sha256": sha256_file(trial_manifest),
+                    "checkpoint_role": "fixed_formal",
+                    "checkpoint": str(model_paths["brain"]),
+                    "checkpoint_content_sha256": model_content_sha256[
+                        "brain_model"
+                    ],
+                    "similarity": "cosine",
                     "query_embeddings_sha256": {
                         "standard": "1" * 64,
                         "a": "2" * 64,
                         "b": "3" * 64,
                     }[half],
+                    "subject": "sub-08",
+                    "seed": 42,
+                    "trial_manifest_sha256": trial_manifest_sha256,
+                    "protocol_sha256": protocol_sha256,
+                    "brain_test_sha256": brain_test_sha256,
+                    "model_content_sha256": model_content_sha256,
+                    "evaluator_version": "AIAA3800-BRAINRW-FORMAL-v1",
+                    "evaluator_sha256": evaluator_sha256,
+                    "runtime_inputs": {
+                        "test_image_tree_sha256": test_image_tree_sha256,
+                        "selected_channel_indices": [30],
+                        "time_slice": [0, 250],
+                        "dataset_name": "things",
+                        "expected_sample_count": 200,
+                    },
+                    "native_metrics": {
+                        "top1_count": 200,
+                        "top5_count": 200,
+                        "sample_count": 200,
+                    },
                 },
             ),
         )
@@ -1099,6 +1141,115 @@ def test_brainrw_real_publisher_emits_exact_relative_hash_bound_schema(
             )
         return entries
 
+    inventory = formal_inventory(
+        [
+            output.parent / model / directory
+            for model in ("nice", "atm_s", "our_project")
+            for directory in ("standard", "eeg_a", "eeg_b")
+        ],
+        expected_image_count=200,
+    )
+    checkpoint_sha256 = "e" * 64
+    audit_run = {
+        "epoch": 1,
+        "checkpoint": "/sealed/epoch_0001.pth",
+        "checkpoint_sha256": checkpoint_sha256,
+        "effective_logit_scale": 1.0,
+        "top1_count": 200,
+        "top5_count": 200,
+        "sample_count": 200,
+    }
+    for model in ("nice", "atm_s"):
+        checkpoint_manifest = {
+            "schema_version": 1,
+            "model": model,
+            "encoder_type": "NICE" if model == "nice" else "ATMS",
+            "subject": "sub-08",
+            "seed": 42,
+            "source": {
+                "url": OFFICIAL_SOURCE_URL,
+                "branch": "develop",
+                "commit": "f" * 40,
+                "checkout_sha256": "a" * 64,
+            },
+            "inputs": {
+                "training_eeg": {
+                    "name": "preprocessed_eeg_training.npy",
+                    "sha256": "b" * 64,
+                },
+                "training_features": {
+                    "name": "ViT-H-14_features_train.pt",
+                    "sha256": "c" * 64,
+                },
+            },
+            "hyperparameters": {
+                "epochs": 500,
+                "batch_size": 1024,
+                "learning_rate": 3e-4,
+                "val_ratio": 0.1,
+                "early_stopping_patience": 10,
+                "ema_decay": 0.999,
+                "logit_scale_type": "exp",
+                "avg_trials": True,
+                "n_chans": 63,
+                "n_times": 250,
+            },
+            "encoder_behavior": {
+                "use_subject_id": model == "atm_s",
+                "normalize_feats": model == "atm_s",
+            },
+            "checkpoints": [
+                {
+                    "epoch": 1,
+                    "val_loss": 0.1,
+                    "checkpoint": "epoch_0001.pth",
+                    "sha256": checkpoint_sha256,
+                }
+            ],
+            "selection": {
+                "epoch": 1,
+                "val_loss": 0.1,
+                "checkpoint": "epoch_0001.pth",
+            },
+            "best_checkpoint": {
+                "name": "best_val.pth",
+                "sha256": checkpoint_sha256,
+            },
+            "history": {"name": "history.csv", "sha256": "d" * 64},
+            "stopped_early": False,
+        }
+        checkpoint_path = (
+            output.parent.parent
+            / "checkpoints"
+            / model
+            / "checkpoint_manifest.json"
+        )
+        checkpoint_path.parent.mkdir(parents=True)
+        checkpoint_path.write_text(
+            json.dumps(
+                checkpoint_manifest,
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        audit = {
+            "schema_version": 1,
+            "scope": "best_test_audit_only",
+            "model_slug": model,
+            "checkpoint_policy": "every_epoch_checkpoint",
+            "fairness_artifact_created": False,
+            "formal_artifact_inventory": inventory,
+            "runs": [audit_run],
+            "best_test": audit_run,
+        }
+        (output.parent / model / "best_test_audit.json").write_text(
+            json.dumps(audit, allow_nan=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     monkeypatch.setattr(
         scenario_runner_module,
         "_formal_artifact_inventory",
@@ -1113,6 +1264,7 @@ def test_brainrw_real_publisher_emits_exact_relative_hash_bound_schema(
         output.parent,
         trial_manifest_path=trial_manifest,
         expected_image_count=200,
+        protocol_sha256=protocol_sha256,
     )
 
     assert set(loaded) == set(hashes) == {"nice", "atm_s", "our_project"}

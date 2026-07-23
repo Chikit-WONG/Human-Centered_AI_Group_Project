@@ -37,6 +37,9 @@ from matching_fairness.evaluation import (  # noqa: E402
     EvaluationResult,
     evaluate_artifact,
 )
+from matching_fairness.formal_artifacts import (  # noqa: E402
+    validate_brainrw_export_tree,
+)
 from matching_fairness.native_export import (  # noqa: E402
     _formal_artifact_inventory,
     _score_artifact_sha256,
@@ -68,7 +71,9 @@ def _expected_model_entries(model: str) -> set[str]:
     if model not in _MODEL_ORDER:
         raise ValueError(f"unsupported formal artifact model: {model}")
     entries = set(_HALF_DIRECTORIES.values())
-    if model == "our_project":
+    if model in {"nice", "atm_s"}:
+        entries.add("best_test_audit.json")
+    else:
         entries.update({"runs", "export_manifest.json"})
     return entries
 
@@ -464,6 +469,9 @@ def run_scenarios(
         artifact_root,
         trial_manifest_path=trial_manifest_path,
         expected_image_count=200,
+        protocol_sha256=hashlib.sha256(
+            _read_regular_file_nofollow(protocol_path, "formal protocol")
+        ).hexdigest(),
     )
     common_gallery = artifacts["nice"]["standard"].gallery_canonical_ids
     for model in _MODEL_ORDER:
@@ -617,11 +625,59 @@ def _validated_output_directory(path: Path) -> Path:
     return destination
 
 
+def _validate_native_audits(
+    artifact_root: Path,
+    inventory: Sequence[Mapping[str, object]],
+) -> None:
+    from matching_fairness.reporting import (
+        _canonical_json,
+        _read_regular_file,
+        _validate_audit_manifest,
+        _validate_checkpoint_manifest,
+    )
+
+    role_map = {"standard": "standard", "a": "eeg_a", "b": "eeg_b"}
+    expected_inventory = {
+        (str(entry["model_slug"]), role_map[str(entry["trial_half"])]): str(
+            entry["sha256"]
+        )
+        for entry in inventory
+    }
+    if len(expected_inventory) != 9:
+        raise ValueError("native audits require the exact nine-artifact inventory")
+    for model in ("nice", "atm_s"):
+        checkpoint_path = (
+            artifact_root.parent / "checkpoints" / model / "checkpoint_manifest.json"
+        )
+        audit_path = artifact_root / model / "best_test_audit.json"
+        checkpoint = _canonical_json(
+            _read_regular_file(checkpoint_path, "checkpoint manifest"),
+            "checkpoint manifest",
+        )
+        audit = _canonical_json(
+            _read_regular_file(audit_path, "best-test audit"),
+            "best-test audit",
+        )
+        _selection, checkpoint_identities = _validate_checkpoint_manifest(
+            checkpoint, model
+        )
+        _best, audit_inventory, audit_identities = _validate_audit_manifest(
+            audit, model
+        )
+        if checkpoint_identities != audit_identities:
+            raise ValueError("native audit does not bind its checkpoint manifest")
+        if audit_inventory != expected_inventory:
+            raise ValueError("native audit does not bind the current nine artifacts")
+        if audit.get("formal_artifact_inventory") != list(inventory):
+            raise ValueError("native audit inventory ordering/content is not canonical")
+
+
 def _load_formal_artifacts(
     artifact_root: Path,
     *,
     trial_manifest_path: Path,
     expected_image_count: int,
+    protocol_sha256: str,
 ) -> tuple[
     dict[str, dict[str, ScoreArtifact]],
     dict[str, dict[str, str]],
@@ -635,6 +691,8 @@ def _load_formal_artifacts(
         trial_manifest_path,
         "trial manifest",
     )
+    if re.fullmatch(r"[0-9a-f]{64}", protocol_sha256) is None:
+        raise ValueError("formal protocol SHA-256 is invalid")
     if set(path.name for path in artifact_root.iterdir()) != set(_MODEL_ORDER):
         raise ValueError("formal artifact root must contain exactly three model dirs")
     directories: list[Path] = []
@@ -650,12 +708,25 @@ def _load_formal_artifacts(
             model_dir / directory for directory in _HALF_DIRECTORIES.values()
         )
 
+    trial_bytes = _read_regular_file_nofollow(trial_manifest_path, "trial manifest")
+    trial_hash = hashlib.sha256(trial_bytes).hexdigest()
+    brainrw = validate_brainrw_export_tree(
+        artifact_root / "our_project",
+        expected_image_count=expected_image_count,
+    )
+    if (
+        brainrw.inputs.get("protocol_sha256") != protocol_sha256
+        or brainrw.inputs.get("trial_manifest_sha256") != trial_hash
+    ):
+        raise ValueError("BrainRW export does not bind the supplied protocol/trials")
+
     inventory = _formal_artifact_inventory(
         directories,
         expected_image_count=expected_image_count,
     )
     if len(inventory) != 9:
         raise ValueError("strict Task 6 inventory did not return exactly nine artifacts")
+    _validate_native_audits(artifact_root, inventory)
     artifacts: dict[str, dict[str, ScoreArtifact]] = {
         model: {} for model in _MODEL_ORDER
     }
@@ -672,8 +743,6 @@ def _load_formal_artifacts(
     if any(set(artifacts[model]) != {"standard", "a", "b"} for model in _MODEL_ORDER):
         raise ValueError("strict Task 6 inventory roles are incomplete")
 
-    trial_bytes = _read_regular_file_nofollow(trial_manifest_path, "trial manifest")
-    trial_hash = hashlib.sha256(trial_bytes).hexdigest()
     try:
         trial_manifest = json.loads(trial_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

@@ -254,22 +254,25 @@ def test_submit_pipeline_uses_argv_and_exact_afterok_dependencies(tmp_path: Path
     submission = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
     assert submission["subject"] == "sub-08"
     assert submission["seed"] == 42
-    assert submission["schema_version"] == 2
-    assert submission["phase"] == "all"
-    assert submission["state"] == "completed"
-    assert submission["failure"] is None
-    assert submission["job_order"] == [
+    assert submission["schema_version"] == 3
+    assert submission["mode"] == "all"
+    assert set(submission["requests"]) == {"all"}
+    request = submission["requests"]["all"]
+    assert request["phase"] == "all"
+    assert request["state"] == "completed"
+    assert request["failure"] is None
+    assert request["job_order"] == [
         "train", "native_export", "brainrw_export", "native_audit", "final"
     ]
     assert {
-        f"{name}_job_id": submission["jobs"][name]["job_id"]
-        for name in submission["job_order"]
+        f"{name}_job_id": request["jobs"][name]["job_id"]
+        for name in request["job_order"]
     } == result
     assert all(
         row["state"] == "submitted"
         and row["token"].startswith("mf-")
         and isinstance(row["argv"], list)
-        for row in submission["jobs"].values()
+        for row in request["jobs"].values()
     )
 
 
@@ -279,7 +282,7 @@ def test_existing_submission_manifest_prevents_duplicate_submit(tmp_path: Path) 
     layout.submission_manifest.parent.mkdir(parents=True)
     layout.submission_manifest.write_text("{}\n", encoding="utf-8")
     runner = _SubmissionRunner(["1\n"])
-    with pytest.raises(FileExistsError, match="submission"):
+    with pytest.raises((FileExistsError, RuntimeError), match="submission|ledger"):
         module.submit_all(layout=layout, overwrite=False, runner=runner)
     assert runner.calls == []
 
@@ -296,7 +299,9 @@ def test_preexisting_submission_state_never_auto_resubmits(
         encoding="utf-8",
     )
     runner = _SubmissionRunner(["1\n"])
-    with pytest.raises((FileExistsError, RuntimeError), match="submission|ledger"):
+    with pytest.raises(
+        (FileExistsError, RuntimeError, ValueError), match="submission|ledger"
+    ):
         module.submit_all(layout=layout, overwrite=True, runner=runner)
     assert runner.calls == []
 
@@ -311,11 +316,12 @@ def test_submission_failure_persists_every_known_id_and_stops_dag(
     with pytest.raises(subprocess.CalledProcessError):
         module.submit_all(layout=layout, overwrite=False, runner=runner)
     ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
-    assert ledger["state"] == "failed"
-    assert ledger["failure"]["stage"] == ledger["job_order"][fail_index]
+    request = ledger["requests"]["all"]
+    assert request["state"] == "failed"
+    assert request["failure"]["stage"] == request["job_order"][fail_index]
     assert len(runner.calls) == fail_index + 1
-    for index, name in enumerate(ledger["job_order"]):
-        row = ledger["jobs"][name]
+    for index, name in enumerate(request["job_order"]):
+        row = request["jobs"][name]
         if index < fail_index:
             assert row["state"] == "submitted"
             assert row["job_id"] == 100 + index
@@ -340,11 +346,12 @@ def test_submission_intent_is_durable_before_each_scheduler_call(tmp_path: Path)
 
     def runner(argv, **_kwargs):
         ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
-        name = ledger["job_order"][len(calls)]
-        assert ledger["state"] == "active"
-        assert ledger["jobs"][name]["state"] == "submitting"
-        assert ledger["jobs"][name]["token"].startswith("mf-")
-        assert ledger["jobs"][name]["argv"] == list(argv)
+        request = ledger["requests"]["all"]
+        name = request["job_order"][len(calls)]
+        assert request["state"] == "active"
+        assert request["jobs"][name]["state"] == "submitting"
+        assert request["jobs"][name]["token"].startswith("mf-")
+        assert request["jobs"][name]["argv"] == list(argv)
         calls.append(list(argv))
         return subprocess.CompletedProcess(argv, 0, stdout=f"{201 + len(calls)}\n", stderr="")
 
@@ -372,10 +379,11 @@ def test_job_id_ledger_write_failure_stops_with_durable_token(
     with pytest.raises(OSError, match="job-id ledger"):
         module.submit_all(layout=layout, overwrite=False, runner=runner)
     ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+    request = ledger["requests"]["all"]
     assert len(runner.calls) == 1
-    assert ledger["jobs"]["train"]["state"] == "submitting"
-    assert ledger["jobs"]["train"]["token"].startswith("mf-")
-    assert ledger["jobs"]["train"]["job_id"] is None
+    assert request["jobs"]["train"]["state"] == "submitting"
+    assert request["jobs"]["train"]["token"].startswith("mf-")
+    assert request["jobs"]["train"]["job_id"] is None
 
 
 def test_no_clobber_reservation_fsyncs_parent_directory(
@@ -418,20 +426,22 @@ def test_audit_and_final_dependencies_cannot_be_bypassed(tmp_path: Path) -> None
     assert commands["final"]["depends_on"] == ("native_audit",)
 
 
-def test_phase_submit_supports_train_and_corrected_export_dag(tmp_path: Path) -> None:
+def test_phase_submit_supports_train_and_corrected_export_dag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = _load_submitter()
-    train_layout = module.RuntimeLayout.for_test(tmp_path / "train")
+    layout = module.RuntimeLayout.for_test(tmp_path)
     train_runner = _SubmissionRunner(["11\n"])
     train = module.submit_phase(
-        phase="train", layout=train_layout, overwrite=False, runner=train_runner
+        phase="train", layout=layout, overwrite=False, runner=train_runner
     )
     assert train == {"train_job_id": 11}
     assert "train_native_array.slurm" in train_runner.calls[0][-1]
 
-    export_layout = module.RuntimeLayout.for_test(tmp_path / "export")
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
     export_runner = _SubmissionRunner(["21\n", "22\n", "23\n"])
     export = module.submit_phase(
-        phase="export", layout=export_layout, overwrite=False, runner=export_runner
+        phase="export", layout=layout, overwrite=False, runner=export_runner
     )
     assert export == {
         "native_export_job_id": 21,
@@ -440,6 +450,189 @@ def test_phase_submit_supports_train_and_corrected_export_dag(tmp_path: Path) ->
     }
     assert "--dependency=afterok:21:22" in export_runner.calls[2]
     assert any("MODE=audit" in item for item in export_runner.calls[2])
+
+
+def test_same_layout_completed_train_then_export_uses_phase_scoped_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    train = module.submit_phase(
+        phase="train",
+        layout=layout,
+        overwrite=False,
+        runner=_SubmissionRunner(["11\n"]),
+    )
+    monkeypatch.setattr(
+        module,
+        "_checkpoint_matches_inputs",
+        lambda _layout, model: model in {"nice", "atm_s"},
+    )
+    export_runner = _SubmissionRunner(["21\n", "22\n", "23\n"])
+
+    export = module.submit_phase(
+        phase="export",
+        layout=layout,
+        overwrite=False,
+        runner=export_runner,
+    )
+
+    assert train == {"train_job_id": 11}
+    assert export == {
+        "native_export_job_id": 21,
+        "brainrw_export_job_id": 22,
+        "native_audit_job_id": 23,
+    }
+    ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+    assert ledger["schema_version"] == 3
+    assert ledger["mode"] == "phased"
+    assert set(ledger["requests"]) == {"train", "export"}
+    assert ledger["requests"]["train"]["state"] == "completed"
+    assert ledger["requests"]["export"]["state"] == "completed"
+
+
+def test_same_layout_export_rejects_missing_current_checkpoints_before_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    module.submit_phase(
+        phase="train",
+        layout=layout,
+        overwrite=False,
+        runner=_SubmissionRunner(["11\n"]),
+    )
+    monkeypatch.setattr(
+        module,
+        "_checkpoint_matches_inputs",
+        lambda _layout, _model: False,
+    )
+    runner = _SubmissionRunner(["21\n"])
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        module.submit_phase(
+            phase="export",
+            layout=layout,
+            overwrite=False,
+            runner=runner,
+        )
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("completed_with_planned_job", "foreign_token", "completed_with_failure"),
+)
+def test_phase_ledger_rejects_cross_field_tamper_before_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    module.submit_phase(
+        phase="train",
+        layout=layout,
+        overwrite=False,
+        runner=_SubmissionRunner(["11\n"]),
+    )
+    ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+    request = ledger["requests"]["train"]
+    job = request["jobs"]["train"]
+    if tamper == "completed_with_planned_job":
+        job.update(
+            {
+                "state": "planned",
+                "argv": None,
+                "job_id": None,
+                "error": None,
+            }
+        )
+    elif tamper == "foreign_token":
+        job["token"] = f"mf-{'0' * 32}-train"
+    else:
+        request["failure"] = {"stage": "train", "error": "forged"}
+    layout.submission_manifest.write_text(
+        json.dumps(ledger, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
+    runner = _SubmissionRunner(["21\n"])
+
+    with pytest.raises(RuntimeError, match="ledger|request|job"):
+        module.submit_phase(
+            phase="export",
+            layout=layout,
+            overwrite=False,
+            runner=runner,
+        )
+
+    assert runner.calls == []
+
+
+def test_same_layout_repeat_export_and_all_phased_mix_are_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
+    module.submit_phase(
+        phase="train",
+        layout=layout,
+        overwrite=False,
+        runner=_SubmissionRunner(["11\n"]),
+    )
+    module.submit_phase(
+        phase="export",
+        layout=layout,
+        overwrite=False,
+        runner=_SubmissionRunner(["21\n", "22\n", "23\n"]),
+    )
+
+    for submit in (
+        lambda runner: module.submit_phase(
+            phase="export", layout=layout, overwrite=True, runner=runner
+        ),
+        lambda runner: module.submit_all(
+            layout=layout, overwrite=True, runner=runner
+        ),
+    ):
+        runner = _SubmissionRunner(["99\n"])
+        with pytest.raises((FileExistsError, RuntimeError), match="ledger|phase|submission"):
+            submit(runner)
+        assert runner.calls == []
+
+
+def test_active_train_request_blocks_concurrent_export_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
+    nested = _SubmissionRunner(["21\n"])
+
+    def train_runner(argv, **_kwargs):
+        with pytest.raises((FileExistsError, RuntimeError), match="active|ledger|phase"):
+            module.submit_phase(
+                phase="export",
+                layout=layout,
+                overwrite=False,
+                runner=nested,
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="11\n", stderr="")
+
+    module.submit_phase(
+        phase="train",
+        layout=layout,
+        overwrite=False,
+        runner=train_runner,
+    )
+    assert nested.calls == []
 
 
 def test_native_audit_fails_before_all_nine_artifacts(tmp_path: Path) -> None:
@@ -563,10 +756,11 @@ def test_submit_pipeline_rejects_non_exact_parsable_job_ids(
     with pytest.raises(RuntimeError, match="job ID"):
         module.submit_all(layout=layout, overwrite=False, runner=runner)
     ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
-    assert ledger["state"] == "unknown"
-    assert ledger["jobs"]["train"]["state"] == "unknown"
-    assert ledger["jobs"]["train"]["token"].startswith("mf-")
-    assert ledger["jobs"]["train"]["job_id"] is None
+    request = ledger["requests"]["all"]
+    assert request["state"] == "unknown"
+    assert request["jobs"]["train"]["state"] == "unknown"
+    assert request["jobs"]["train"]["token"].startswith("mf-")
+    assert request["jobs"]["train"]["job_id"] is None
 
 
 def test_dry_run_never_invokes_submission_runner(tmp_path: Path) -> None:
@@ -890,6 +1084,26 @@ def test_orchestrator_accepts_real_brainrw_publisher_schema(tmp_path: Path) -> N
     layout = module.RuntimeLayout.for_test(tmp_path)
     _publish_real_brainrw_fixture(module, layout)
     assert module._matrix_matches_inputs(layout, "our_project") is True
+
+
+def test_orchestrator_delegates_to_shared_brainrw_tree_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import matching_fairness.formal_artifacts as formal_artifacts
+
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _publish_real_brainrw_fixture(module, layout)
+    monkeypatch.setattr(
+        formal_artifacts,
+        "validate_brainrw_export_tree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("shared validator sentinel")
+        ),
+    )
+
+    assert module._matrix_matches_inputs(layout, "our_project") is False
 
 
 @pytest.mark.parametrize(
