@@ -35,38 +35,39 @@
 
 Update `test_standard_presentation_represents_all_27_scenarios` and the English assertions in `test_chinese_report_uses_readable_scenario_labels_only` so the tests exercise all 27 standard labels, all three duplicate-EEG labels, and absence of internal slugs:
 
-First update the scenario import:
-
-```python
-from matching_fairness.scenarios import ScenarioSpec, standard_scenarios
-```
-
 ```python
 def test_english_report_uses_readable_scenario_labels_only() -> None:
     aggregate = aggregate_records(valid_records())
     english = render_english_report(aggregate, audit_rows())
 
-    def expected_standard_label(spec: ScenarioSpec) -> str:
-        operations = []
-        if spec.drop_query:
-            operations.append(f"remove {spec.drop_query} EEG queries")
-        if spec.drop_gallery:
-            operations.append(f"remove {spec.drop_gallery} images")
-        if spec.duplicate_gallery:
-            operations.append(f"duplicate {spec.duplicate_gallery} images")
-        description = ", ".join(operations)
-        if description:
-            description = description[0].upper() + description[1:]
-        else:
-            description = "Baseline one-to-one matching"
-        query_count = 200 - spec.drop_query - spec.drop_pair
-        gallery_count = (
-            200 - spec.drop_gallery - spec.drop_pair + spec.duplicate_gallery
-        )
-        return f"{description} ({query_count} EEG queries × {gallery_count} images)"
-
     expected_standard = {
-        expected_standard_label(spec) for spec in standard_scenarios()
+        "Baseline one-to-one matching (200 EEG queries × 200 images)",
+        "Duplicate 10 images (200 EEG queries × 210 images)",
+        "Duplicate 20 images (200 EEG queries × 220 images)",
+        "Remove 5 images (200 EEG queries × 195 images)",
+        "Remove 5 images, duplicate 10 images (200 EEG queries × 205 images)",
+        "Remove 5 images, duplicate 20 images (200 EEG queries × 215 images)",
+        "Remove 10 images (200 EEG queries × 190 images)",
+        "Remove 10 images, duplicate 10 images (200 EEG queries × 200 images)",
+        "Remove 10 images, duplicate 20 images (200 EEG queries × 210 images)",
+        "Remove 5 EEG queries (195 EEG queries × 200 images)",
+        "Remove 5 EEG queries, duplicate 10 images (195 EEG queries × 210 images)",
+        "Remove 5 EEG queries, duplicate 20 images (195 EEG queries × 220 images)",
+        "Remove 5 EEG queries, remove 5 images (195 EEG queries × 195 images)",
+        "Remove 5 EEG queries, remove 5 images, duplicate 10 images (195 EEG queries × 205 images)",
+        "Remove 5 EEG queries, remove 5 images, duplicate 20 images (195 EEG queries × 215 images)",
+        "Remove 5 EEG queries, remove 10 images (195 EEG queries × 190 images)",
+        "Remove 5 EEG queries, remove 10 images, duplicate 10 images (195 EEG queries × 200 images)",
+        "Remove 5 EEG queries, remove 10 images, duplicate 20 images (195 EEG queries × 210 images)",
+        "Remove 10 EEG queries (190 EEG queries × 200 images)",
+        "Remove 10 EEG queries, duplicate 10 images (190 EEG queries × 210 images)",
+        "Remove 10 EEG queries, duplicate 20 images (190 EEG queries × 220 images)",
+        "Remove 10 EEG queries, remove 5 images (190 EEG queries × 195 images)",
+        "Remove 10 EEG queries, remove 5 images, duplicate 10 images (190 EEG queries × 205 images)",
+        "Remove 10 EEG queries, remove 5 images, duplicate 20 images (190 EEG queries × 215 images)",
+        "Remove 10 EEG queries, remove 10 images (190 EEG queries × 190 images)",
+        "Remove 10 EEG queries, remove 10 images, duplicate 10 images (190 EEG queries × 200 images)",
+        "Remove 10 EEG queries, remove 10 images, duplicate 20 images (190 EEG queries × 210 images)",
     }
     assert len(expected_standard) == 27
     for label in expected_standard:
