@@ -111,19 +111,55 @@ cd /hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Cent
 source /hpc2hdd/home/ckwong627/miniconda3/etc/profile.d/conda.sh
 ```
 
+环境声明使用显式官方 URL `https://conda.anaconda.org/conda-forge` 并加入
+`nodefaults`，因此用户级 channel alias 无法把依赖求解重定向到镜像，而且本环境
+不会用 Anaconda Defaults 求解或下载依赖。Conda 26 在读取文件前仍可能为全局配置
+频道查询 notices/ToS 元数据；命令不会启用或执行 ToS 接受。Conda 只创建隔离的
+Python 3.12/pip 骨架；构建工具链另固定 setuptools 75.8.0，因为锁定的 CLIP
+setup 仍会 import `pkg_resources`。同一条
+环境创建命令随后会安装精确版本的 pip 依赖。PyTorch 三件套从官方 CUDA 12.4
+wheel 索引严格固定为 `2.5.0+cu124` / `0.20.0+cu124` / `2.5.0+cu124`，OpenAI
+CLIP 则固定到 commit `a9b1bf5920416aaeaec965c25dd9e8f98c864f16`。命令关闭 pip
+build isolation，让 CLIP 使用该锁定工具链，并仅在 pip 调用系统 Git 客户端时清除
+继承的 `LD_LIBRARY_PATH`，避免 Conda 的 libffi 被注入 Git；它不会修改任何已有环境。
+
 首次创建独立原生环境：
 
 ```bash
-conda env create -n atm_native \
+PIP_NO_BUILD_ISOLATION=1 env -u LD_LIBRARY_PATH conda env create -n atm_native \
   -f experiments/matching_fairness/configs/atm_native_environment.yml
 ```
 
 如果 `atm_native` 已经存在，则按声明更新，而不是再次创建：
 
 ```bash
-conda env update -n atm_native --prune \
+PIP_NO_BUILD_ISOLATION=1 env -u LD_LIBRARY_PATH conda env update -n atm_native --prune \
   -f experiments/matching_fairness/configs/atm_native_environment.yml
 ```
+
+仅当命令在 Git 获取锁定 CLIP commit 时，因相同的 GitHub TLS/传输错误反复失败，
+才使用下面已预取的精确 checkout。先确认 HEAD 等于预期 commit，且工作区干净：
+
+```bash
+git -C /hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/openai_clip_a9b1bf5920416aaeaec965c25dd9e8f98c864f16_shallow \
+  rev-parse HEAD
+git -C /hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/openai_clip_a9b1bf5920416aaeaec965c25dd9e8f98c864f16_shallow \
+  status --short
+```
+
+`rev-parse` 必须输出 `a9b1bf5920416aaeaec965c25dd9e8f98c864f16`，而
+`status --short` 必须没有输出。然后在不访问包索引的情况下，仅安装这个缺失的
+VCS 包：
+
+```bash
+PIP_NO_INDEX=1 PIP_NO_BUILD_ISOLATION=1 env -u LD_LIBRARY_PATH \
+  conda run -n atm_native python -m pip install \
+  --no-build-isolation --no-deps \
+  "git+file:///hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/openai_clip_a9b1bf5920416aaeaec965c25dd9e8f98c864f16_shallow@a9b1bf5920416aaeaec965c25dd9e8f98c864f16"
+```
+
+本次 `atm_native` 在 Conda 骨架及声明的科学计算 wheels 成功安装后，通过该
+fallback 完成；本次远程 VCS 步骤本身没有稳定地完整成功。
 
 然后运行精确版本与 import 门禁：
 

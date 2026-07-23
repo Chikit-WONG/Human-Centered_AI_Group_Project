@@ -128,10 +128,28 @@ cd /hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Cent
 source /hpc2hdd/home/ckwong627/miniconda3/etc/profile.d/conda.sh
 ```
 
+The environment declaration uses the explicit official
+`https://conda.anaconda.org/conda-forge` URL plus `nodefaults`, so user-level
+channel aliases cannot redirect dependency resolution to a mirror and
+Anaconda Defaults are never used to resolve or download this environment.
+Conda 26 may still query notice/ToS metadata for globally configured channels
+before reading the file; the command never enables or performs ToS acceptance.
+Conda creates only the isolated Python 3.12/pip skeleton; setuptools 75.8.0
+is pinned as part of that build toolchain because the locked CLIP setup still
+imports `pkg_resources`. The
+same one-command environment creation then installs exact pip versions. The
+PyTorch trio is pinned to `2.5.0+cu124` / `0.20.0+cu124` / `2.5.0+cu124` from
+the official CUDA 12.4 PyTorch wheel index, and OpenAI CLIP is pinned to commit
+`a9b1bf5920416aaeaec965c25dd9e8f98c864f16`. The command disables pip build
+isolation so CLIP uses that pinned toolchain, and clears only an inherited
+`LD_LIBRARY_PATH` while pip invokes the system Git client. This prevents
+Conda's libffi from being injected into Git and does not modify any existing
+environment.
+
 Create the isolated native environment once:
 
 ```bash
-conda env create -n atm_native \
+PIP_NO_BUILD_ISOLATION=1 env -u LD_LIBRARY_PATH conda env create -n atm_native \
   -f experiments/matching_fairness/configs/atm_native_environment.yml
 ```
 
@@ -139,9 +157,36 @@ If `atm_native` already exists, reconcile it with the declaration instead of
 creating it again:
 
 ```bash
-conda env update -n atm_native --prune \
+PIP_NO_BUILD_ISOLATION=1 env -u LD_LIBRARY_PATH conda env update -n atm_native --prune \
   -f experiments/matching_fairness/configs/atm_native_environment.yml
 ```
+
+Only if the command repeatedly fails while Git fetches the locked CLIP commit
+with the same GitHub TLS/transport error, use the already prefetched exact
+checkout below. First verify that its HEAD is the expected commit and that the
+checkout is clean:
+
+```bash
+git -C /hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/openai_clip_a9b1bf5920416aaeaec965c25dd9e8f98c864f16_shallow \
+  rev-parse HEAD
+git -C /hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/openai_clip_a9b1bf5920416aaeaec965c25dd9e8f98c864f16_shallow \
+  status --short
+```
+
+`rev-parse` must print `a9b1bf5920416aaeaec965c25dd9e8f98c864f16`, and
+`status --short` must print nothing. Then install only that missing VCS package
+without contacting a package index:
+
+```bash
+PIP_NO_INDEX=1 PIP_NO_BUILD_ISOLATION=1 env -u LD_LIBRARY_PATH \
+  conda run -n atm_native python -m pip install \
+  --no-build-isolation --no-deps \
+  "git+file:///hpc2hdd/home/ckwong627/workdir/new_sub_workdir/EEG_Project/models/openai_clip_a9b1bf5920416aaeaec965c25dd9e8f98c864f16_shallow@a9b1bf5920416aaeaec965c25dd9e8f98c864f16"
+```
+
+The current `atm_native` was completed with this fallback after the Conda
+skeleton and all declared scientific wheels had installed successfully; the
+remote VCS step itself did not complete reliably in this run.
 
 Then run the exact version/import gate:
 
