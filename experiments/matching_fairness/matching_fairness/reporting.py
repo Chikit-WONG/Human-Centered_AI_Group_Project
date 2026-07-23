@@ -23,7 +23,7 @@ from .artifacts import (
     read_score_artifact,
 )
 from .provenance import OFFICIAL_SOURCE_URL, sha256_file
-from .scenarios import build_standard_manifest, standard_scenarios
+from .scenarios import ScenarioSpec, build_standard_manifest, standard_scenarios
 from .trial_splits import select_duplicate_image_ids
 
 
@@ -1286,6 +1286,32 @@ def _validate_source_hashes(value: object, suite: str) -> dict[str, str]:
     return result
 
 
+def _chinese_standard_scenario_label(spec: ScenarioSpec) -> str:
+    operations = []
+    if spec.drop_query:
+        operations.append(f"删除 {spec.drop_query} 条 EEG")
+    if spec.drop_gallery:
+        operations.append(f"删除 {spec.drop_gallery} 张图片")
+    if spec.duplicate_gallery:
+        operations.append(f"重复 {spec.duplicate_gallery} 张图片")
+    description = "、".join(operations) if operations else "标准一一匹配"
+    query_count = 200 - spec.drop_query - spec.drop_pair
+    gallery_count = 200 - spec.drop_gallery - spec.drop_pair + spec.duplicate_gallery
+    return f"{description}（{query_count} 条 EEG × {gallery_count} 张图片）"
+
+
+def _chinese_duplicate_scenario_label(index: int) -> str:
+    labels = {
+        27: "真实重复 EEG 基准（200 条 EEG-A × 200 张图片）",
+        28: "加入 10 条真实重复 EEG-B（210 条 EEG × 200 张图片）",
+        29: "加入 20 条真实重复 EEG-B（220 条 EEG × 200 张图片）",
+    }
+    try:
+        return labels[index]
+    except KeyError:
+        raise ValueError(f"invalid duplicate-EEG scenario index: {index}") from None
+
+
 def _standard_table(aggregate: AggregateBundle, *, language: str) -> str:
     decoders = DECODER_ORDER
     records = {
@@ -1315,7 +1341,12 @@ def _standard_table(aggregate: AggregateBundle, *, language: str) -> str:
     rows = []
     for index, spec in enumerate(standard_scenarios()):
         for model in MODEL_ORDER:
-            cells = [f"{index:02d} {spec.slug}", model]
+            scenario_label = (
+                _chinese_standard_scenario_label(spec)
+                if language == "zh"
+                else f"{index:02d} {spec.slug}"
+            )
+            cells = [scenario_label, model]
             independent = records[(index, model, "independent")]
             cells.append(_score_cell(independent, bold=int(independent["correct"]) == best[(index, "independent")]))
             cells.append(_count_cell(int(independent["top5_count"]), int(independent["total"]), bold=int(independent["top5_count"]) == top5_best[index]))
@@ -1379,7 +1410,11 @@ def _duplicate_table(aggregate: AggregateBundle, *, language: str) -> str:
         rows.append(
             [
                 str(row["model"]),
-                str(row["scenario"]),
+                (
+                    _chinese_duplicate_scenario_label(int(row["scenario_index"]))
+                    if language == "zh"
+                    else str(row["scenario"])
+                ),
                 str(row["decoder"]),
                 _score_cell(row, bold=int(row["correct"]) == best[key]),
                 _count_cell(int(row["theoretical_ceiling_count"]), int(row["total"])),

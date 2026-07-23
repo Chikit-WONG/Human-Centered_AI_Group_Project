@@ -310,6 +310,29 @@ def test_standard_presentation_represents_all_27_scenarios() -> None:
         assert f"{index:02d} {scenario.slug}" in report
 
 
+def test_chinese_report_uses_readable_scenario_labels_only() -> None:
+    aggregate = aggregate_records(valid_records())
+    chinese = render_chinese_report(aggregate, audit_rows())
+    english = render_english_report(aggregate, audit_rows())
+
+    expected_standard = {
+        0: "标准一一匹配（200 条 EEG × 200 张图片）",
+        1: "重复 10 张图片（200 条 EEG × 210 张图片）",
+        15: "删除 5 条 EEG、删除 10 张图片（195 条 EEG × 190 张图片）",
+        17: "删除 5 条 EEG、删除 10 张图片、重复 20 张图片（195 条 EEG × 210 张图片）",
+        26: "删除 10 条 EEG、删除 10 张图片、重复 20 张图片（190 条 EEG × 210 张图片）",
+    }
+    for label in expected_standard.values():
+        assert chinese.count(label) == 3
+
+    assert chinese.count("真实重复 EEG 基准（200 条 EEG-A × 200 张图片）") == 15
+    assert chinese.count("加入 10 条真实重复 EEG-B（210 条 EEG × 200 张图片）") == 15
+    assert chinese.count("加入 20 条真实重复 EEG-B（220 条 EEG × 200 张图片）") == 15
+    assert all(token not in chinese for token in ("dropq", "dropp", "dupg", "dupq"))
+    assert "00 dropq0_dropg0_dropp0_dupg0" in english
+    assert "dupq20" in english
+
+
 def test_reports_contain_bilingual_single_cell_limitations_and_audit_warning() -> None:
     aggregate = aggregate_records(valid_records())
     english = render_english_report(aggregate, audit_rows())
