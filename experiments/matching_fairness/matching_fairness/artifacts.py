@@ -6,11 +6,13 @@ from collections.abc import Mapping, Sequence
 import ctypes
 from dataclasses import dataclass
 import errno
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 
 import numpy as np
@@ -295,7 +297,26 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _rename_directory_noreplace(source: Path, destination: Path) -> None:
-    """Atomically publish ``source`` only when ``destination`` is absent."""
+    """Atomically publish a sibling directory without cooperative clobbering.
+
+    Linux ``RENAME_NOREPLACE`` supplies the preferred kernel-enforced guarantee.
+    Filesystems that reject that capability use an atomic ordinary rename while
+    holding the shared parent-directory lock; that fallback excludes only other
+    publishers that cooperate through this helper.
+    """
+
+    source = Path(source)
+    destination = Path(destination)
+    if source.name in {"", ".", ".."} or destination.name in {"", ".", ".."}:
+        raise ValueError("source and destination must be ordinary basenames")
+    if source.parent != destination.parent:
+        raise ValueError("source and destination must be siblings")
+    source_status = os.lstat(source)
+    if not stat.S_ISDIR(source_status.st_mode) or stat.S_ISLNK(
+        source_status.st_mode
+    ):
+        raise ValueError("source must be a non-symlink directory")
+    source_identity = (source_status.st_dev, source_status.st_ino)
 
     libc = ctypes.CDLL(None, use_errno=True)
     try:
@@ -321,10 +342,10 @@ def _rename_directory_noreplace(source: Path, destination: Path) -> None:
         os.fsencode(destination),
         _RENAME_NOREPLACE,
     )
+    error_number = ctypes.get_errno()
     if result == 0:
         return
 
-    error_number = ctypes.get_errno()
     if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
         raise FileExistsError(
             error_number,
@@ -338,10 +359,77 @@ def _rename_directory_noreplace(source: Path, destination: Path) -> None:
         getattr(errno, "EOPNOTSUPP", errno.EINVAL),
     }
     if error_number in unavailable_errors:
-        raise RuntimeError(
-            "atomic score publication requires Linux renameat2(RENAME_NOREPLACE)"
-        ) from OSError(error_number, os.strerror(error_number))
+        _rename_directory_cooperatively(
+            source,
+            destination,
+            source_identity=source_identity,
+        )
+        return
     raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+
+
+def _rename_directory_cooperatively(
+    source: Path,
+    destination: Path,
+    *,
+    source_identity: tuple[int, int],
+) -> None:
+    """Fallback for publishers sharing this parent-directory advisory lock."""
+
+    open_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_descriptor = os.open(source.parent, open_flags)
+    locked = False
+    try:
+        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
+        locked = True
+        try:
+            current_source = os.stat(
+                source.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise RuntimeError("source changed during publication") from error
+        if (
+            not stat.S_ISDIR(current_source.st_mode)
+            or stat.S_ISLNK(current_source.st_mode)
+            or (current_source.st_dev, current_source.st_ino) != source_identity
+        ):
+            raise RuntimeError("source changed during publication")
+
+        try:
+            os.stat(
+                destination.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                errno.EEXIST,
+                os.strerror(errno.EEXIST),
+                os.fspath(destination),
+            )
+
+        os.rename(
+            source.name,
+            destination.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
+    finally:
+        try:
+            if locked:
+                fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(parent_descriptor)
 
 
 def _lexists(path: Path) -> bool:

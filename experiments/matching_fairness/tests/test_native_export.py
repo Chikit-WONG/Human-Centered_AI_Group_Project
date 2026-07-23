@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import io
 import json
 import math
@@ -13,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+import matching_fairness.artifacts as artifact_module
 import matching_fairness.native_export as native_export_module
 from matching_fairness.artifacts import (
     ScoreArtifact,
@@ -959,6 +962,23 @@ def test_brainrw_real_publisher_emits_exact_relative_hash_bound_schema(
 ) -> None:
     from scripts.export_brainrw_scores import build_parser, export_brainrw_scores
     import scripts.run_scenarios as scenario_runner_module
+
+    class UnsupportedRenameAt2:
+        argtypes: object | None = None
+        restype: object | None = None
+
+        def __call__(self, *args: object) -> int:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+    class UnsupportedLibc:
+        renameat2 = UnsupportedRenameAt2()
+
+    monkeypatch.setattr(
+        artifact_module.ctypes,
+        "CDLL",
+        lambda *args, **kwargs: UnsupportedLibc(),
+    )
 
     output = tmp_path / "matrices" / "our_project"
     protocol = tmp_path / "protocol.json"
