@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import io
@@ -138,6 +139,10 @@ class RuntimeLayout:
     @property
     def submission_manifest(self) -> Path:
         return self.manifests_root / "submission.json"
+
+    @property
+    def submission_recovery_manifest(self) -> Path:
+        return self.manifests_root / "submission_recovery.json"
 
     @property
     def matrices_root(self) -> Path:
@@ -581,6 +586,11 @@ def _read_submission_ledger(path: Path) -> dict[str, object]:
         _read_regular_file(path, "submission ledger"),
         "submission ledger",
     )
+    _validate_submission_ledger_payload(payload)
+    return dict(payload)
+
+
+def _validate_submission_ledger_payload(payload: Mapping[str, object]) -> None:
     if set(payload) != {
         "schema_version", "subject", "seed", "models", "mode", "requests"
     } or (
@@ -601,7 +611,6 @@ def _read_submission_ledger(path: Path) -> dict[str, object]:
         raise RuntimeError("all-mode ledger must contain exactly the all request")
     for phase, request in requests.items():
         _validate_submission_request(str(phase), request)
-    return dict(payload)
 
 
 def _validate_submission_request(phase: str, value: object) -> None:
@@ -800,6 +809,421 @@ def _workflow_command(
         raise ValueError(f"unknown submission job: {name}")
     command.insert(-1, f"--job-name={token}")
     return command
+
+
+_RECOVERY_REASON = "spool-entrypoint-bug"
+_TERMINAL_UNSUCCESSFUL_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "SPECIAL_EXIT",
+        "TIMEOUT",
+    }
+)
+_SACCT_FORMAT = "JobIDRaw,JobName%128,State%64,ExitCode,Submit,Start,End"
+
+
+def _validate_recovery_cli(
+    *,
+    phase: str,
+    submit: bool,
+    dry_run: bool,
+    overwrite: bool,
+    internal_cell: str | None,
+    array_id: int | None,
+    export_mode: str,
+    recover_failed_all: bool,
+    original_request_id: str | None,
+    original_ledger_sha256: str | None,
+    recovery_reason: str | None,
+) -> None:
+    metadata_present = any(
+        value is not None
+        for value in (
+            original_request_id,
+            original_ledger_sha256,
+            recovery_reason,
+        )
+    )
+    if not recover_failed_all:
+        if metadata_present:
+            raise ValueError("recovery metadata requires --recover-failed-all")
+        return
+    if phase != "all" or not submit:
+        raise ValueError("--recover-failed-all requires --phase all --submit")
+    if dry_run or overwrite:
+        raise ValueError("recovery forbids --dry-run and --overwrite")
+    if internal_cell is not None or array_id is not None or export_mode != "main":
+        raise ValueError(
+            "recovery forbids --internal-cell/--array-id and requires main export mode"
+        )
+    if re.fullmatch(r"[0-9a-f]{32}", original_request_id or "") is None:
+        raise ValueError(
+            "recovery original request ID must be exactly 32 lowercase hex"
+        )
+    if _SHA256.fullmatch(original_ledger_sha256 or "") is None:
+        raise ValueError(
+            "recovery original ledger SHA-256 must be exactly 64 lowercase hex"
+        )
+    if recovery_reason != _RECOVERY_REASON:
+        raise ValueError(f"recovery reason must be exactly {_RECOVERY_REASON!r}")
+
+
+def _read_original_submission_snapshot(
+    *,
+    path: Path,
+    expected_sha256: str,
+    expected_request_id: str,
+) -> tuple[bytes, dict[str, object], dict[str, dict[str, object]]]:
+    from matching_fairness.reporting import _canonical_json, _read_regular_file
+
+    encoded = _read_regular_file(path, "original submission ledger")
+    actual_sha256 = hashlib.sha256(encoded).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("original submission ledger SHA-256 does not match caller")
+    payload = _canonical_json(encoded, "original submission ledger")
+    _validate_submission_ledger_payload(payload)
+    if payload["mode"] != "all" or set(payload["requests"]) != {"all"}:
+        raise RuntimeError("original submission ledger must use exact all mode")
+    request = payload["requests"]["all"]
+    assert isinstance(request, Mapping)
+    if request["request_id"] != expected_request_id:
+        raise ValueError("original submission request ID does not match caller")
+    if request["state"] != "completed" or request["overwrite"] is not False:
+        raise RuntimeError("original all request must be completed without overwrite")
+    if request["job_order"] != list(_WORKFLOW_ORDER["all"]):
+        raise RuntimeError("original all request job order is invalid")
+    jobs = request["jobs"]
+    assert isinstance(jobs, Mapping)
+    snapshot: dict[str, dict[str, object]] = {}
+    observed_ids: list[int] = []
+    for name in _WORKFLOW_ORDER["all"]:
+        row = jobs[name]
+        assert isinstance(row, Mapping)
+        job_id = row["job_id"]
+        if (
+            row["state"] != "submitted"
+            or isinstance(job_id, bool)
+            or not isinstance(job_id, int)
+            or job_id <= 0
+        ):
+            raise RuntimeError("original all request must have five submitted jobs")
+        observed_ids.append(job_id)
+        snapshot[name] = {
+            "state": row["state"],
+            "job_id": job_id,
+            "token": row["token"],
+            "argv": list(row["argv"]),
+            "error": row["error"],
+        }
+    if len(set(observed_ids)) != len(observed_ids):
+        raise RuntimeError("original submission job IDs must be positive and unique")
+    return encoded, dict(payload), snapshot
+
+
+def _require_recovery_outputs_absent_or_empty(layout: RuntimeLayout) -> None:
+    roots = (
+        layout.results_root / "checkpoints",
+        layout.matrices_root,
+        layout.runs_root,
+        layout.aggregate_root,
+    )
+    for path in roots:
+        _reject_symlink_target(path)
+        if not os.path.lexists(path):
+            continue
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(
+                f"recovery derived output root must be a non-symlink directory: {path}"
+            )
+        try:
+            with os.scandir(path) as entries:
+                nonempty = next(entries, None) is not None
+        except OSError as error:
+            raise ValueError(
+                f"could not inspect recovery output root: {path}"
+            ) from error
+        if nonempty:
+            raise ValueError(f"recovery derived output root must be empty: {path}")
+
+
+def _sacct_argv(job_ids: Sequence[int]) -> list[str]:
+    return [
+        "sacct",
+        "-X",
+        "--duplicates",
+        "--noheader",
+        "--parsable2",
+        "--jobs",
+        ",".join(str(job_id) for job_id in job_ids),
+        f"--format={_SACCT_FORMAT}",
+    ]
+
+
+def _normalize_terminal_unsuccessful_state(raw_state: str) -> str:
+    if re.fullmatch(r"CANCELLED by [0-9]+", raw_state):
+        return "CANCELLED"
+    if raw_state in _TERMINAL_UNSUCCESSFUL_STATES:
+        return raw_state
+    raise ValueError(
+        f"sacct state is not an allowed terminal-unsuccessful state: {raw_state!r}"
+    )
+
+
+def _parse_sacct_terminal_records(
+    stdout: str,
+    *,
+    original_jobs: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    expected_token_by_id = {
+        int(row["job_id"]): str(row["token"]) for row in original_jobs.values()
+    }
+    records: dict[int, dict[str, object]] = {}
+    for line in stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) != 8 or fields[-1] != "":
+            raise ValueError("sacct output record must use exact parsable2 fields")
+        job_id_raw, job_name, raw_state, exit_code, submitted, started, ended, _ = (
+            fields
+        )
+        if re.fullmatch(r"[1-9][0-9]*", job_id_raw) is None:
+            # Job steps are not root allocation records and are irrelevant under -X.
+            continue
+        job_id = int(job_id_raw)
+        if job_id not in expected_token_by_id:
+            raise ValueError(
+                f"sacct returned an unexpected exact root record: {job_id}"
+            )
+        if job_id in records:
+            raise ValueError(f"sacct returned a duplicate exact root record: {job_id}")
+        if job_name != expected_token_by_id[job_id]:
+            raise ValueError(f"sacct job name does not match original token: {job_id}")
+        if re.fullmatch(r"[0-9]+:[0-9]+", exit_code) is None:
+            raise ValueError(f"sacct exit code is malformed: {exit_code!r}")
+        normalized = _normalize_terminal_unsuccessful_state(raw_state)
+        records[job_id] = {
+            "job_id": job_id,
+            "job_name": job_name,
+            "raw_state": raw_state,
+            "normalized_state": normalized,
+            "exit_code": exit_code,
+            "submit": submitted,
+            "start": started,
+            "end": ended,
+        }
+    missing = set(expected_token_by_id) - set(records)
+    if missing:
+        raise ValueError(f"sacct is missing exact root records: {sorted(missing)}")
+    return {
+        name: records[int(original_jobs[name]["job_id"])]
+        for name in _WORKFLOW_ORDER["all"]
+    }
+
+
+def _verify_terminal_scheduler_state(
+    *,
+    original_jobs: Mapping[str, Mapping[str, object]],
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, object]:
+    job_ids = [int(original_jobs[name]["job_id"]) for name in _WORKFLOW_ORDER["all"]]
+    argv = _sacct_argv(job_ids)
+    checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    completed = runner(argv, check=True, text=True, capture_output=True)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            argv,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    if not isinstance(completed.stdout, str):
+        raise ValueError("sacct stdout must be text")
+    jobs = _parse_sacct_terminal_records(
+        completed.stdout,
+        original_jobs=original_jobs,
+    )
+    return {
+        "argv": argv,
+        "checked_at_utc": checked_at,
+        "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
+        "jobs": jobs,
+    }
+
+
+def _assert_original_ledger_unchanged(
+    *, path: Path, expected_bytes: bytes, expected_sha256: str
+) -> None:
+    from matching_fairness.reporting import _read_regular_file
+
+    current = _read_regular_file(path, "original submission ledger")
+    if (
+        current != expected_bytes
+        or hashlib.sha256(current).hexdigest() != expected_sha256
+    ):
+        raise ValueError("original submission ledger changed during recovery")
+
+
+def _new_recovery_ledger(
+    *,
+    layout: RuntimeLayout,
+    original_sha256: str,
+    original_request_id: str,
+    original_jobs: Mapping[str, Mapping[str, object]],
+    scheduler_verification: Mapping[str, object],
+) -> dict[str, object]:
+    request = _new_submission_request("all", False)
+    while request["request_id"] == original_request_id:
+        request = _new_submission_request("all", False)
+    return {
+        "schema_version": 1,
+        "kind": "matching_fairness_submission_recovery",
+        "subject": SUBJECT,
+        "seed": SEED,
+        "models": list(MODELS),
+        "recovery_reason": _RECOVERY_REASON,
+        "original_ledger": {
+            "path": str(layout.submission_manifest),
+            "sha256": original_sha256,
+            "schema_version": 3,
+            "mode": "all",
+            "request_id": original_request_id,
+            "request_state": "completed",
+            "overwrite": False,
+            "job_order": list(_WORKFLOW_ORDER["all"]),
+            "jobs": {
+                name: dict(original_jobs[name]) for name in _WORKFLOW_ORDER["all"]
+            },
+        },
+        "scheduler_verification": dict(scheduler_verification),
+        "request": request,
+    }
+
+
+def recover_failed_all(
+    *,
+    layout: RuntimeLayout,
+    original_request_id: str,
+    original_ledger_sha256: str,
+    recovery_reason: str,
+    overwrite: bool,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, int]:
+    _validate_recovery_cli(
+        phase="all",
+        submit=True,
+        dry_run=False,
+        overwrite=overwrite,
+        internal_cell=None,
+        array_id=None,
+        export_mode="main",
+        recover_failed_all=True,
+        original_request_id=original_request_id,
+        original_ledger_sha256=original_ledger_sha256,
+        recovery_reason=recovery_reason,
+    )
+    with _submission_lock(layout.submission_manifest):
+        if os.path.lexists(layout.submission_recovery_manifest):
+            raise FileExistsError("submission recovery ledger already exists")
+        original_bytes, _original_ledger, original_jobs = (
+            _read_original_submission_snapshot(
+                path=layout.submission_manifest,
+                expected_sha256=original_ledger_sha256,
+                expected_request_id=original_request_id,
+            )
+        )
+        _require_recovery_outputs_absent_or_empty(layout)
+        verification = _verify_terminal_scheduler_state(
+            original_jobs=original_jobs,
+            runner=runner,
+        )
+        recovery = _new_recovery_ledger(
+            layout=layout,
+            original_sha256=original_ledger_sha256,
+            original_request_id=original_request_id,
+            original_jobs=original_jobs,
+            scheduler_verification=verification,
+        )
+        _validate_submission_request("all", recovery["request"])
+        _atomic_write_json_noclobber(layout.submission_recovery_manifest, recovery)
+
+        request = recovery["request"]
+        assert isinstance(request, dict)
+        jobs = request["jobs"]
+        assert isinstance(jobs, dict)
+        original_ids = {int(row["job_id"]) for row in original_jobs.values()}
+        job_ids: dict[str, int] = {}
+        for name in _WORKFLOW_ORDER["all"]:
+            row = jobs[name]
+            assert isinstance(row, dict)
+            command = _workflow_command(
+                name=name,
+                phase="all",
+                layout=layout,
+                overwrite=False,
+                job_ids=job_ids,
+                token=str(row["token"]),
+            )
+            row["state"] = "submitting"
+            row["argv"] = command
+            _validate_submission_request("all", request)
+            _replace_submission_ledger(layout.submission_recovery_manifest, recovery)
+            try:
+                _assert_original_ledger_unchanged(
+                    path=layout.submission_manifest,
+                    expected_bytes=original_bytes,
+                    expected_sha256=original_ledger_sha256,
+                )
+            except (OSError, ValueError) as error:
+                row["state"] = "failed"
+                row["error"] = str(error)
+                request["state"] = "failed"
+                request["failure"] = {"stage": name, "error": str(error)}
+                _validate_submission_request("all", request)
+                _replace_submission_ledger(
+                    layout.submission_recovery_manifest, recovery
+                )
+                raise
+            try:
+                job_id = _submit(command, runner)
+                if job_id in original_ids or job_id in job_ids.values():
+                    raise RuntimeError(
+                        "recovery scheduler returned a non-distinct job ID"
+                    )
+            except subprocess.CalledProcessError as error:
+                row["state"] = "failed"
+                row["error"] = str(error)
+                request["state"] = "failed"
+                request["failure"] = {"stage": name, "error": str(error)}
+                _validate_submission_request("all", request)
+                _replace_submission_ledger(
+                    layout.submission_recovery_manifest, recovery
+                )
+                raise
+            except (OSError, RuntimeError) as error:
+                row["state"] = "unknown"
+                row["error"] = str(error)
+                request["state"] = "unknown"
+                request["failure"] = {"stage": name, "error": str(error)}
+                _validate_submission_request("all", request)
+                _replace_submission_ledger(
+                    layout.submission_recovery_manifest, recovery
+                )
+                raise
+            row["state"] = "submitted"
+            row["job_id"] = job_id
+            job_ids[name] = job_id
+            _validate_submission_request("all", request)
+            _replace_submission_ledger(layout.submission_recovery_manifest, recovery)
+        request["state"] = "completed"
+        _validate_submission_request("all", request)
+        _replace_submission_ledger(layout.submission_recovery_manifest, recovery)
+        return {f"{name}_job_id": job_ids[name] for name in _WORKFLOW_ORDER["all"]}
 
 
 def _submit_workflow(
@@ -2023,6 +2447,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
+        "--recover-failed-all",
+        action="store_true",
+        help="audited one-time recovery of a terminal-unsuccessful all-mode DAG",
+    )
+    parser.add_argument("--original-request-id")
+    parser.add_argument("--original-ledger-sha256")
+    parser.add_argument("--recovery-reason")
+    parser.add_argument(
         "--internal-cell",
         choices=("train-native", "export-native", "export-brainrw", "match", "aggregate", "final", "trial-manifest"),
         help=argparse.SUPPRESS,
@@ -2035,11 +2467,39 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    arguments = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
     if arguments.submit and arguments.dry_run:
-        build_parser().error("--submit and --dry-run are mutually exclusive")
+        parser.error("--submit and --dry-run are mutually exclusive")
+    try:
+        _validate_recovery_cli(
+            phase=arguments.phase,
+            submit=arguments.submit,
+            dry_run=arguments.dry_run,
+            overwrite=arguments.overwrite,
+            internal_cell=arguments.internal_cell,
+            array_id=arguments.array_id,
+            export_mode=arguments.export_mode,
+            recover_failed_all=arguments.recover_failed_all,
+            original_request_id=arguments.original_request_id,
+            original_ledger_sha256=arguments.original_ledger_sha256,
+            recovery_reason=arguments.recovery_reason,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     layout = RuntimeLayout.fixed()
-    if arguments.internal_cell is not None:
+    if arguments.recover_failed_all:
+        result: object = {
+            "mode": "submitted",
+            **recover_failed_all(
+                layout=layout,
+                original_request_id=arguments.original_request_id,
+                original_ledger_sha256=arguments.original_ledger_sha256,
+                recovery_reason=arguments.recovery_reason,
+                overwrite=arguments.overwrite,
+            ),
+        }
+    elif arguments.internal_cell is not None:
         result: object = run_internal_cell(
             layout=layout,
             cell=arguments.internal_cell,

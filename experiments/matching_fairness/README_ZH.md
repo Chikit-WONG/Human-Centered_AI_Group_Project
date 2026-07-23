@@ -242,6 +242,29 @@ bash experiments/matching_fairness/run_matching_fairness.sh --phase aggregate
 恢复前必须检查 ledger 与日志。`--overwrite` 只用于经过审阅后有意识地替换派生产物；
 它不是通用重试/恢复开关，也不会清除 submission ledger 历史。
 
+### 经过审计的一次性失败 DAG 恢复
+
+下面的命令只用于已经审阅的 spool-entrypoint 故障，是固定的事故恢复路径；它**不是**
+overwrite、resume 或通用重试。流程会在同一个提交锁内验证不可变的原始 ledger，并用
+权威 `sacct -X` 记录确认五个精确 root job 都处于失败终态；同时要求 checkpoint、
+matrix、run 与 aggregate 根目录不存在或为空。通过后，它会在第一次新 `sbatch` 前先
+保留 `manifests/submission_recovery.json`，而原始 `submission.json` 必须逐字节不变。
+
+```bash
+bash experiments/matching_fairness/run_matching_fairness.sh \
+  --phase all \
+  --submit \
+  --recover-failed-all \
+  --original-request-id 3ae8dc60c2df4166b7d4021f48146487 \
+  --original-ledger-sha256 2125615c73c156bea4137c1c764aba6b7893e94cb64d819b6856b8a93b4042be \
+  --recovery-reason spool-entrypoint-bug
+```
+
+只要 recovery 路径已经存在——即使它为空、格式错误、处于 failed/completed 状态或是
+symlink——都永久禁止第二次恢复。调度器记录不匹配、旧作业仍未终止或已经成功、派生
+输出根目录不安全、原始 ledger 被修改，都会 fail closed；不得通过删除或编辑任一
+ledger 来强行重试。
+
 匹配树完整后，也可以直接执行汇总器：
 
 ```bash

@@ -278,6 +278,31 @@ logs before recovery. `--overwrite` is only for an intentional, reviewed
 replacement of derived artifacts; it is not a generic retry or resume switch
 and does not erase submission-ledger history.
 
+### Audited one-time failed-DAG recovery
+
+The recovery command below is a fixed incident path for the reviewed
+spool-entrypoint failure only. It is **not** overwrite, resume, or a generic
+retry. Under the submission lock it verifies the immutable original ledger and
+all five exact root jobs against authoritative `sacct -X` terminal-unsuccessful
+records, requires the checkpoint/matrix/run/aggregate roots to be absent or
+empty, and then reserves `manifests/submission_recovery.json` before the first
+new `sbatch` call. The original `submission.json` remains byte-identical.
+
+```bash
+bash experiments/matching_fairness/run_matching_fairness.sh \
+  --phase all \
+  --submit \
+  --recover-failed-all \
+  --original-request-id 3ae8dc60c2df4166b7d4021f48146487 \
+  --original-ledger-sha256 2125615c73c156bea4137c1c764aba6b7893e94cb64d819b6856b8a93b4042be \
+  --recovery-reason spool-entrypoint-bug
+```
+
+Any existing recovery path—even empty, malformed, failed, completed, or a
+symlink—permanently blocks another recovery attempt. A scheduler mismatch,
+nonterminal/successful old job, unsafe output root, or original-ledger mutation
+fails closed; do not delete or edit either ledger to force a retry.
+
 The aggregation phase can also be invoked directly after a complete matching
 tree:
 
