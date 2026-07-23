@@ -88,10 +88,7 @@ class PreflightExpectations:
     )
 
 
-def _installed_version(module: Any, distribution: str) -> str:
-    value = getattr(module, "__version__", None)
-    if value is not None:
-        return str(value)
+def _installed_version(_module: Any, distribution: str) -> str:
     return importlib.metadata.version(distribution)
 
 

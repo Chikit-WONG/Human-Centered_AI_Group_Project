@@ -18,6 +18,7 @@ from scripts.fetch_assets import (
 from scripts.preflight import (
     PreflightExpectations,
     RuntimeInfo,
+    _installed_version,
     _load_official_eeg,
     run_preflight,
 )
@@ -174,6 +175,21 @@ def _valid_runtime() -> RuntimeInfo:
             "clip": "a9b1bf5920416aaeaec965c25dd9e8f98c864f16",
         },
     )
+
+
+def test_installed_version_prefers_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = type("BraindecodeModule", (), {"__version__": "0.8"})()
+    requested: list[str] = []
+
+    def distribution_version(distribution: str) -> str:
+        requested.append(distribution)
+        return "0.8.1"
+
+    monkeypatch.setattr("scripts.preflight.importlib.metadata.version", distribution_version)
+    assert _installed_version(module, "braindecode") == "0.8.1"
+    assert requested == ["braindecode"]
 
 
 def test_official_pickle_fixture_loads_as_direct_mapping(tmp_path: Path) -> None:

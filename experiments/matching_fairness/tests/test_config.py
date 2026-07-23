@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from matching_fairness.config import Protocol
+from scripts.preflight import EXPECTED_PACKAGE_VERSIONS
 
 
 CONFIG = Path("experiments/matching_fairness/configs/protocol_sub08_seed42.json")
@@ -47,6 +48,20 @@ def test_atm_native_environment_uses_official_channels_and_pinned_wheels() -> No
         "git+https://github.com/openai/CLIP.git@"
         "a9b1bf5920416aaeaec965c25dd9e8f98c864f16",
     ]
+    pinned = {
+        dependency.split("==", 1)[0]: dependency.split("==", 1)[1]
+        for dependency in pip_dependencies
+        if "==" in dependency
+    }
+    for package, expected in EXPECTED_PACKAGE_VERSIONS.items():
+        if package in {"clip", "pytorch-cuda"}:
+            continue
+        assert pinned[package].split("+", 1)[0] == expected
+    expected_cuda_suffix = "+cu" + EXPECTED_PACKAGE_VERSIONS["pytorch-cuda"].replace(
+        ".", ""
+    )
+    assert pinned["torch"].endswith(expected_cuda_suffix)
+    assert pip_dependencies[-1].endswith("@" + EXPECTED_PACKAGE_VERSIONS["clip"])
 
 
 def test_atm_native_readmes_clear_inherited_library_path_for_git() -> None:
