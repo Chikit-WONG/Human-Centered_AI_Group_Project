@@ -287,6 +287,11 @@ all five exact root jobs against authoritative `sacct -X` terminal-unsuccessful
 records, requires the checkpoint/matrix/run/aggregate roots to be absent or
 empty, and then reserves `manifests/submission_recovery.json` before the first
 new `sbatch` call. The original `submission.json` remains byte-identical.
+The implementation is hard-bound to request
+`3ae8dc60c2df4166b7d4021f48146487` and ledger SHA-256
+`2125615c73c156bea4137c1c764aba6b7893e94cb64d819b6856b8a93b4042be`;
+any other caller-self-consistent ledger is rejected before `sacct` or recovery
+reservation.
 
 ```bash
 bash experiments/matching_fairness/run_matching_fairness.sh \

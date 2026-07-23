@@ -14,7 +14,9 @@ import pytest
 EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
 SUBMITTER_PATH = EXPERIMENT_ROOT / "scripts/submit_pipeline.py"
 REQUEST_ID = "3ae8dc60c2df4166b7d4021f48146487"
+LEDGER_SHA256 = "2125615c73c156bea4137c1c764aba6b7893e94cb64d819b6856b8a93b4042be"
 REASON = "spool-entrypoint-bug"
+APPROVED_LEDGER = Path(__file__).with_name("fixtures") / "approved_submission.json"
 ORDER = ("train", "native_export", "brainrw_export", "native_audit", "final")
 OLD_IDS = (10047830, 10047831, 10047832, 10047833, 10047834)
 RAW_STATES = (
@@ -38,23 +40,15 @@ def _load_submitter():
 
 
 def _write_original(module, layout, *, mutate=None) -> tuple[bytes, str]:
-    ledger = module._new_submission_ledger(mode="all", phase="all", overwrite=False)
-    request = ledger["requests"]["all"]
-    request["request_id"] = REQUEST_ID
-    request["state"] = "completed"
-    for name, job_id in zip(ORDER, OLD_IDS):
-        request["jobs"][name] = {
-            "state": "submitted",
-            "token": f"mf-{REQUEST_ID}-{name.replace('_', '-')}",
-            "argv": ["sbatch", f"old-{name}.slurm"],
-            "job_id": job_id,
-            "error": None,
-        }
+    del module
+    encoded = APPROVED_LEDGER.read_bytes()
+    assert hashlib.sha256(encoded).hexdigest() == LEDGER_SHA256
     if mutate is not None:
+        ledger = json.loads(encoded)
         mutate(ledger)
-    encoded = (
-        json.dumps(ledger, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    ).encode()
+        encoded = (
+            json.dumps(ledger, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        ).encode()
     layout.submission_manifest.parent.mkdir(parents=True, exist_ok=True)
     layout.submission_manifest.write_bytes(encoded)
     return encoded, hashlib.sha256(encoded).hexdigest()
@@ -91,23 +85,26 @@ class _RecoveryRunner:
         before_sbatch=None,
     ) -> None:
         self.layout = layout
-        self.sacct_stdout = _sacct_stdout() if sacct_stdout is None else sacct_stdout
+        stdout = _sacct_stdout() if sacct_stdout is None else sacct_stdout
+        self.sacct_stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
         self.new_ids = new_ids
         self.fail_sacct = fail_sacct
         self.fail_sbatch_at = fail_sbatch_at
         self.uncertain_sbatch_at = uncertain_sbatch_at
         self.before_sbatch = before_sbatch
         self.calls: list[list[str]] = []
+        self.call_kwargs: list[dict[str, object]] = []
         self.sbatch_calls = 0
 
-    def __call__(self, argv, **_kwargs):
+    def __call__(self, argv, **kwargs):
         call = list(argv)
         self.calls.append(call)
+        self.call_kwargs.append(dict(kwargs))
         if call[0] == "sacct":
             if self.fail_sacct is not None:
                 raise self.fail_sacct
             return subprocess.CompletedProcess(
-                call, 0, stdout=self.sacct_stdout, stderr=""
+                call, 0, stdout=self.sacct_stdout, stderr=b""
             )
         assert call[0] == "sbatch"
         index = self.sbatch_calls
@@ -175,6 +172,8 @@ def test_successful_recovery_is_audited_noclobber_and_uses_only_new_dag(
         "--format=JobIDRaw,JobName%128,State%64,ExitCode,Submit,Start,End",
     ]
     assert len(runner.calls) == 6
+    assert runner.call_kwargs[0]["text"] is False
+    assert all(kwargs["text"] is True for kwargs in runner.call_kwargs[1:])
     ledger = json.loads(layout.submission_recovery_manifest.read_text())
     assert ledger["schema_version"] == 1
     assert ledger["kind"] == "matching_fairness_submission_recovery"
@@ -185,16 +184,9 @@ def test_successful_recovery_is_audited_noclobber_and_uses_only_new_dag(
     assert ledger["original_ledger"]["request_state"] == "completed"
     assert ledger["original_ledger"]["overwrite"] is False
     assert ledger["original_ledger"]["job_order"] == list(ORDER)
-    assert ledger["original_ledger"]["jobs"] == {
-        name: {
-            "state": "submitted",
-            "job_id": job_id,
-            "token": f"mf-{REQUEST_ID}-{name.replace('_', '-')}",
-            "argv": ["sbatch", f"old-{name}.slurm"],
-            "error": None,
-        }
-        for name, job_id in zip(ORDER, OLD_IDS)
-    }
+    assert ledger["original_ledger"]["jobs"] == json.loads(original)["requests"]["all"][
+        "jobs"
+    ]
     evidence = ledger["scheduler_verification"]
     assert evidence["argv"] == runner.calls[0]
     assert (
@@ -226,6 +218,89 @@ def test_successful_recovery_is_audited_noclobber_and_uses_only_new_dag(
     assert not any(value.startswith("--dependency=") for value in sbatches[2])
     assert "--dependency=afterok:2002:2003" in sbatches[3]
     assert "--dependency=afterok:2004" in sbatches[4]
+
+
+def test_recovery_is_hard_bound_to_the_approved_incident_constants() -> None:
+    module = _load_submitter()
+    assert module._APPROVED_RECOVERY_REQUEST_ID == REQUEST_ID
+    assert module._APPROVED_RECOVERY_LEDGER_SHA256 == LEDGER_SHA256
+
+
+def test_self_consistent_substituted_completed_ledger_is_rejected_before_scheduler(
+    tmp_path: Path,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    substituted_id = "1" * 32
+    ledger = module._new_submission_ledger(mode="all", phase="all", overwrite=False)
+    request = ledger["requests"]["all"]
+    request["request_id"] = substituted_id
+    request["state"] = "completed"
+    for name, job_id in zip(ORDER, OLD_IDS):
+        request["jobs"][name] = {
+            "state": "submitted",
+            "token": f"mf-{substituted_id}-{name.replace('_', '-')}",
+            "argv": ["sbatch", f"substituted-{name}.slurm"],
+            "job_id": job_id,
+            "error": None,
+        }
+    encoded = (
+        json.dumps(ledger, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
+    substituted_sha = hashlib.sha256(encoded).hexdigest()
+    layout.submission_manifest.parent.mkdir(parents=True, exist_ok=True)
+    layout.submission_manifest.write_bytes(encoded)
+    names = tuple(
+        f"mf-{substituted_id}-{name.replace('_', '-')}" for name in ORDER
+    )
+    runner = _RecoveryRunner(layout, sacct_stdout=_sacct_stdout(names=names))
+
+    with pytest.raises(ValueError, match="approved|incident|request|SHA"):
+        module.recover_failed_all(
+            layout=layout,
+            original_request_id=substituted_id,
+            original_ledger_sha256=substituted_sha,
+            recovery_reason=REASON,
+            overwrite=False,
+            runner=runner,
+        )
+
+    assert runner.calls == []
+    assert not os.path.lexists(layout.submission_recovery_manifest)
+
+
+def test_scheduler_evidence_hashes_exact_raw_crlf_bytes(tmp_path: Path) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _original, sha256 = _write_original(module, layout)
+    raw_stdout = _sacct_stdout().replace("\n", "\r\n").encode("utf-8")
+    runner = _RecoveryRunner(layout, sacct_stdout=raw_stdout)
+
+    _recover(module, layout, sha256, runner)
+
+    evidence = json.loads(layout.submission_recovery_manifest.read_text())[
+        "scheduler_verification"
+    ]
+    assert runner.call_kwargs[0]["text"] is False
+    assert evidence["stdout_sha256"] == hashlib.sha256(raw_stdout).hexdigest()
+
+
+def test_invalid_utf8_sacct_bytes_fail_before_recovery_or_submission(
+    tmp_path: Path,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _original, sha256 = _write_original(module, layout)
+    runner = _RecoveryRunner(
+        layout,
+        sacct_stdout=_sacct_stdout().encode("utf-8") + b"\xff",
+    )
+
+    with pytest.raises(ValueError, match="UTF-8|utf-8"):
+        _recover(module, layout, sha256, runner)
+
+    assert len(runner.calls) == 1 and runner.calls[0][0] == "sacct"
+    assert not os.path.lexists(layout.submission_recovery_manifest)
 
 
 @pytest.mark.parametrize("state", ("CANCELLED by 203817", "FAILED"))
@@ -502,7 +577,9 @@ def test_normal_all_submit_remains_blocked_by_original_ledger(tmp_path: Path) ->
         {"array_id": 0},
         {"export_mode": "audit"},
         {"original_request_id": "bad"},
+        {"original_request_id": "0" * 32},
         {"original_ledger_sha256": "bad"},
+        {"original_ledger_sha256": "a" * 64},
         {"recovery_reason": "generic-retry"},
     ),
 )
@@ -520,7 +597,7 @@ def test_invalid_recovery_cli_combinations_fail_before_scheduler(
         "export_mode": "main",
         "recover_failed_all": True,
         "original_request_id": REQUEST_ID,
-        "original_ledger_sha256": "a" * 64,
+        "original_ledger_sha256": LEDGER_SHA256,
         "recovery_reason": REASON,
     }
     values.update(overrides)

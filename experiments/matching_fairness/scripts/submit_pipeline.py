@@ -812,6 +812,10 @@ def _workflow_command(
 
 
 _RECOVERY_REASON = "spool-entrypoint-bug"
+_APPROVED_RECOVERY_REQUEST_ID = "3ae8dc60c2df4166b7d4021f48146487"
+_APPROVED_RECOVERY_LEDGER_SHA256 = (
+    "2125615c73c156bea4137c1c764aba6b7893e94cb64d819b6856b8a93b4042be"
+)
 _TERMINAL_UNSUCCESSFUL_STATES = frozenset(
     {
         "BOOT_FAIL",
@@ -867,9 +871,17 @@ def _validate_recovery_cli(
         raise ValueError(
             "recovery original request ID must be exactly 32 lowercase hex"
         )
+    if original_request_id != _APPROVED_RECOVERY_REQUEST_ID:
+        raise ValueError(
+            "recovery original request ID does not match the approved incident"
+        )
     if _SHA256.fullmatch(original_ledger_sha256 or "") is None:
         raise ValueError(
             "recovery original ledger SHA-256 must be exactly 64 lowercase hex"
+        )
+    if original_ledger_sha256 != _APPROVED_RECOVERY_LEDGER_SHA256:
+        raise ValueError(
+            "recovery original ledger SHA-256 does not match the approved incident"
         )
     if recovery_reason != _RECOVERY_REASON:
         raise ValueError(f"recovery reason must be exactly {_RECOVERY_REASON!r}")
@@ -885,16 +897,26 @@ def _read_original_submission_snapshot(
 
     encoded = _read_regular_file(path, "original submission ledger")
     actual_sha256 = hashlib.sha256(encoded).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ValueError("original submission ledger SHA-256 does not match caller")
+    if (
+        expected_sha256 != _APPROVED_RECOVERY_LEDGER_SHA256
+        or actual_sha256 != _APPROVED_RECOVERY_LEDGER_SHA256
+    ):
+        raise ValueError(
+            "original submission ledger SHA-256 does not match the approved incident"
+        )
     payload = _canonical_json(encoded, "original submission ledger")
     _validate_submission_ledger_payload(payload)
     if payload["mode"] != "all" or set(payload["requests"]) != {"all"}:
         raise RuntimeError("original submission ledger must use exact all mode")
     request = payload["requests"]["all"]
     assert isinstance(request, Mapping)
-    if request["request_id"] != expected_request_id:
-        raise ValueError("original submission request ID does not match caller")
+    if (
+        expected_request_id != _APPROVED_RECOVERY_REQUEST_ID
+        or request["request_id"] != _APPROVED_RECOVERY_REQUEST_ID
+    ):
+        raise ValueError(
+            "original submission request ID does not match the approved incident"
+        )
     if request["state"] != "completed" or request["overwrite"] is not False:
         raise RuntimeError("original all request must be completed without overwrite")
     if request["job_order"] != list(_WORKFLOW_ORDER["all"]):
@@ -1029,12 +1051,12 @@ def _parse_sacct_terminal_records(
 def _verify_terminal_scheduler_state(
     *,
     original_jobs: Mapping[str, Mapping[str, object]],
-    runner: Callable[..., subprocess.CompletedProcess[str]],
+    runner: Callable[..., subprocess.CompletedProcess[bytes]],
 ) -> dict[str, object]:
     job_ids = [int(original_jobs[name]["job_id"]) for name in _WORKFLOW_ORDER["all"]]
     argv = _sacct_argv(job_ids)
     checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    completed = runner(argv, check=True, text=True, capture_output=True)
+    completed = runner(argv, check=True, text=False, capture_output=True)
     if completed.returncode != 0:
         raise subprocess.CalledProcessError(
             completed.returncode,
@@ -1042,16 +1064,21 @@ def _verify_terminal_scheduler_state(
             output=completed.stdout,
             stderr=completed.stderr,
         )
-    if not isinstance(completed.stdout, str):
-        raise ValueError("sacct stdout must be text")
+    if not isinstance(completed.stdout, bytes):
+        raise ValueError("sacct stdout must be exact raw bytes")
+    stdout_sha256 = hashlib.sha256(completed.stdout).hexdigest()
+    try:
+        stdout = completed.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("sacct stdout must be valid UTF-8") from error
     jobs = _parse_sacct_terminal_records(
-        completed.stdout,
+        stdout,
         original_jobs=original_jobs,
     )
     return {
         "argv": argv,
         "checked_at_utc": checked_at,
-        "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
+        "stdout_sha256": stdout_sha256,
         "jobs": jobs,
     }
 
@@ -1144,8 +1171,8 @@ def recover_failed_all(
         )
         recovery = _new_recovery_ledger(
             layout=layout,
-            original_sha256=original_ledger_sha256,
-            original_request_id=original_request_id,
+            original_sha256=_APPROVED_RECOVERY_LEDGER_SHA256,
+            original_request_id=_APPROVED_RECOVERY_REQUEST_ID,
             original_jobs=original_jobs,
             scheduler_verification=verification,
         )
@@ -1177,7 +1204,7 @@ def recover_failed_all(
                 _assert_original_ledger_unchanged(
                     path=layout.submission_manifest,
                     expected_bytes=original_bytes,
-                    expected_sha256=original_ledger_sha256,
+                    expected_sha256=_APPROVED_RECOVERY_LEDGER_SHA256,
                 )
             except (OSError, ValueError) as error:
                 row["state"] = "failed"

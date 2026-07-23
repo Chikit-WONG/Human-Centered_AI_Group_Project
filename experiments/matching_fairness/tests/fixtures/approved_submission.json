@@ -1,0 +1,97 @@
+{
+  "mode": "all",
+  "models": [
+    "nice",
+    "atm_s",
+    "our_project"
+  ],
+  "requests": {
+    "all": {
+      "failure": null,
+      "job_order": [
+        "train",
+        "native_export",
+        "brainrw_export",
+        "native_audit",
+        "final"
+      ],
+      "jobs": {
+        "brainrw_export": {
+          "argv": [
+            "sbatch",
+            "--parsable",
+            "--export=ALL,MATCHING_FAIRNESS_OVERWRITE=0",
+            "--job-name=mf-3ae8dc60c2df4166b7d4021f48146487-brainrw-export",
+            "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Centered_Artificial_Intelligence/Final_Project/Human-Centered_AI_Group_Project/experiments/matching_fairness/slurm/export_brainrw.slurm"
+          ],
+          "error": null,
+          "job_id": 10047832,
+          "state": "submitted",
+          "token": "mf-3ae8dc60c2df4166b7d4021f48146487-brainrw-export"
+        },
+        "final": {
+          "argv": [
+            "sbatch",
+            "--parsable",
+            "--export=ALL,MATCHING_FAIRNESS_OVERWRITE=0",
+            "--dependency=afterok:10047833",
+            "--job-name=mf-3ae8dc60c2df4166b7d4021f48146487-final",
+            "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Centered_Artificial_Intelligence/Final_Project/Human-Centered_AI_Group_Project/experiments/matching_fairness/slurm/fairness_cpu.slurm"
+          ],
+          "error": null,
+          "job_id": 10047834,
+          "state": "submitted",
+          "token": "mf-3ae8dc60c2df4166b7d4021f48146487-final"
+        },
+        "native_audit": {
+          "argv": [
+            "sbatch",
+            "--parsable",
+            "--export=ALL,MATCHING_FAIRNESS_OVERWRITE=0,MATCHING_FAIRNESS_EXPORT_MODE=audit",
+            "--dependency=afterok:10047831:10047832",
+            "--job-name=mf-3ae8dc60c2df4166b7d4021f48146487-native-audit",
+            "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Centered_Artificial_Intelligence/Final_Project/Human-Centered_AI_Group_Project/experiments/matching_fairness/slurm/export_native_array.slurm"
+          ],
+          "error": null,
+          "job_id": 10047833,
+          "state": "submitted",
+          "token": "mf-3ae8dc60c2df4166b7d4021f48146487-native-audit"
+        },
+        "native_export": {
+          "argv": [
+            "sbatch",
+            "--parsable",
+            "--export=ALL,MATCHING_FAIRNESS_OVERWRITE=0,MATCHING_FAIRNESS_EXPORT_MODE=main",
+            "--dependency=afterok:10047830",
+            "--job-name=mf-3ae8dc60c2df4166b7d4021f48146487-native-export",
+            "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Centered_Artificial_Intelligence/Final_Project/Human-Centered_AI_Group_Project/experiments/matching_fairness/slurm/export_native_array.slurm"
+          ],
+          "error": null,
+          "job_id": 10047831,
+          "state": "submitted",
+          "token": "mf-3ae8dc60c2df4166b7d4021f48146487-native-export"
+        },
+        "train": {
+          "argv": [
+            "sbatch",
+            "--parsable",
+            "--export=ALL,MATCHING_FAIRNESS_OVERWRITE=0",
+            "--job-name=mf-3ae8dc60c2df4166b7d4021f48146487-train",
+            "/hpc2hdd/home/ckwong627/workdir/new_sub_workdir/Class/AIAA3800_L01-Human-Centered_Artificial_Intelligence/Final_Project/Human-Centered_AI_Group_Project/experiments/matching_fairness/slurm/train_native_array.slurm"
+          ],
+          "error": null,
+          "job_id": 10047830,
+          "state": "submitted",
+          "token": "mf-3ae8dc60c2df4166b7d4021f48146487-train"
+        }
+      },
+      "overwrite": false,
+      "phase": "all",
+      "request_id": "3ae8dc60c2df4166b7d4021f48146487",
+      "state": "completed"
+    }
+  },
+  "schema_version": 3,
+  "seed": 42,
+  "subject": "sub-08"
+}
