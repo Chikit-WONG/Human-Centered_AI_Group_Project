@@ -28,7 +28,7 @@ from matching_fairness.native_export import (
     export_native_scores,
     native_scores,
 )
-from matching_fairness.provenance import inspect_checkout, sha256_file
+from matching_fairness.provenance import inspect_checkout, sha256_file, sha256_path
 from matching_fairness.trial_splits import build_trial_manifest
 
 
@@ -946,3 +946,175 @@ def test_brainrw_export_failure_leaves_no_partial_publication(
         export_brainrw_scores(arguments, runner=runner)
     assert not output.exists()
     assert not list(output.parent.glob(f".{output.name}.tmp-*"))
+
+
+def test_brainrw_real_publisher_emits_exact_relative_hash_bound_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.export_brainrw_scores import build_parser, export_brainrw_scores
+    import scripts.run_scenarios as scenario_runner_module
+
+    output = tmp_path / "matrices" / "our_project"
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text('{"formal":true}\n', encoding="utf-8")
+    trial_manifest = tmp_path / "trials.json"
+    trial_manifest.write_text('{"seed":42}\n', encoding="utf-8")
+    brain_directory = tmp_path / "brain"
+    brain_test = brain_directory / "sub-08/test.pt"
+    brain_test.parent.mkdir(parents=True)
+    brain_test.write_bytes(b"brain-test")
+    image_directory = tmp_path / "images"
+    test_images = image_directory / "test_images"
+    test_images.mkdir(parents=True)
+    (test_images / "image-000.jpg").write_bytes(b"image")
+    model_paths = {
+        "brain": tmp_path / "brain-model",
+        "adapter": tmp_path / "vision-adapter",
+        "base": tmp_path / "vision-base",
+    }
+    for name, path in model_paths.items():
+        path.mkdir()
+        (path / "weights.bin").write_bytes(name.encode("ascii"))
+    arguments = build_parser().parse_args(
+        [
+            "--brain-model-path", str(model_paths["brain"]),
+            "--vision-adapter-path", str(model_paths["adapter"]),
+            "--pretrained-model-name-or-path", str(model_paths["base"]),
+            "--brain-directory", str(brain_directory),
+            "--image-directory", str(image_directory),
+            "--selected-channels", "Cz",
+            "--trial-split-manifest", str(trial_manifest),
+            "--protocol", str(protocol),
+            "--output-dir", str(output),
+        ]
+    )
+    ids = tuple(f"image-{index:03d}" for index in range(200))
+
+    def runner(command: list[str], *, check: bool) -> object:
+        assert check is True
+        half = command[command.index("--trial-half") + 1]
+        artifact = Path(command[command.index("--score-artifact-output") + 1])
+        write_score_artifact(
+            artifact,
+            ScoreArtifact(
+                similarity=np.eye(200, dtype=np.float32),
+                query_ids=ids,
+                gallery_entry_ids=ids,
+                gallery_canonical_ids=ids,
+                target_canonical_ids=ids,
+                metadata={
+                    "model_slug": "our_project",
+                    "trial_half": half,
+                    "trial_manifest_sha256": sha256_file(trial_manifest),
+                    "query_embeddings_sha256": {
+                        "standard": "1" * 64,
+                        "a": "2" * 64,
+                        "b": "3" * 64,
+                    }[half],
+                },
+            ),
+        )
+        metrics = Path(command[command.index("--metrics-output") + 1])
+        predictions = Path(command[command.index("--predictions-output") + 1])
+        metrics.parent.mkdir(parents=True, exist_ok=True)
+        metrics.write_text('{"top1_count":200}\n', encoding="utf-8")
+        predictions.write_text("query,prediction\n", encoding="utf-8")
+        return object()
+
+    export_brainrw_scores(arguments, runner=runner)
+
+    assert {path.name for path in output.iterdir()} == {
+        "standard", "eeg_a", "eeg_b", "runs", "export_manifest.json"
+    }
+    manifest = json.loads((output / "export_manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {
+        "schema_version", "scope", "checkpoint_role", "model_slug",
+        "subject", "seed", "artifacts", "runs", "inputs",
+    }
+    assert manifest["scope"] == "fixed_formal_export"
+    assert manifest["checkpoint_role"] == "fixed_formal"
+    assert manifest["model_slug"] == "our_project"
+    assert manifest["subject"] == "sub-08"
+    assert manifest["seed"] == 42
+    assert set(manifest["artifacts"]) == {"standard", "eeg_a", "eeg_b"}
+    assert set(manifest["runs"]) == {"standard", "eeg_a", "eeg_b"}
+    for name in ("standard", "eeg_a", "eeg_b"):
+        assert manifest["artifacts"][name]["path"] == name
+        assert manifest["runs"][name] == {
+            "path": f"runs/{name}",
+            "sha256": sha256_path(output / "runs" / name),
+        }
+    assert set(manifest["inputs"]) == {
+        "protocol_sha256", "trial_manifest_sha256", "brain_test_sha256",
+        "evaluator_sha256", "test_image_tree_sha256", "model_content_sha256",
+    }
+    assert manifest["inputs"]["protocol_sha256"] == sha256_file(protocol)
+    assert manifest["inputs"]["trial_manifest_sha256"] == sha256_file(trial_manifest)
+    assert manifest["inputs"]["brain_test_sha256"] == sha256_file(brain_test)
+    assert manifest["inputs"]["test_image_tree_sha256"] == sha256_path(test_images)
+    assert manifest["inputs"]["model_content_sha256"] == {
+        "brain_model": sha256_path(model_paths["brain"]),
+        "vision_adapter": sha256_path(model_paths["adapter"]),
+        "pretrained_vision_base": sha256_path(model_paths["base"]),
+    }
+    assert "/hpc" not in (output / "export_manifest.json").read_text(encoding="utf-8")
+
+    # Exercise the real Task 7 directory loader against the tree emitted by
+    # the BrainRW publisher.  The strict Task 6 inventory itself is covered by
+    # its dedicated tests; this integration isolates the shared tree contract.
+    for model in ("nice", "atm_s"):
+        for directory, half in (("standard", "standard"), ("eeg_a", "a"), ("eeg_b", "b")):
+            source = read_score_artifact(output / directory)
+            metadata = dict(source.metadata)
+            metadata.update({"model_slug": model, "trial_half": half})
+            write_score_artifact(
+                output.parent / model / directory,
+                ScoreArtifact(
+                    similarity=source.similarity,
+                    query_ids=source.query_ids,
+                    gallery_entry_ids=source.gallery_entry_ids,
+                    gallery_canonical_ids=source.gallery_canonical_ids,
+                    target_canonical_ids=source.target_canonical_ids,
+                    metadata=metadata,
+                ),
+            )
+
+    def formal_inventory(
+        directories: tuple[Path, ...] | list[Path],
+        *,
+        expected_image_count: int,
+    ) -> list[dict[str, object]]:
+        assert expected_image_count == 200
+        entries = []
+        for path in directories:
+            artifact = read_score_artifact(path)
+            entries.append(
+                {
+                    "model_slug": artifact.metadata["model_slug"],
+                    "trial_half": artifact.metadata["trial_half"],
+                    "path": str(path),
+                    "sha256": native_export_module._score_artifact_sha256(path),
+                }
+            )
+        return entries
+
+    monkeypatch.setattr(
+        scenario_runner_module,
+        "_formal_artifact_inventory",
+        formal_inventory,
+    )
+    monkeypatch.setattr(
+        scenario_runner_module,
+        "validate_trial_manifest",
+        lambda _manifest, _ids: {},
+    )
+    loaded, hashes, trial_hash = scenario_runner_module._load_formal_artifacts(
+        output.parent,
+        trial_manifest_path=trial_manifest,
+        expected_image_count=200,
+    )
+
+    assert set(loaded) == set(hashes) == {"nice", "atm_s", "our_project"}
+    assert all(set(loaded[model]) == {"standard", "a", "b"} for model in loaded)
+    assert trial_hash == sha256_file(trial_manifest)

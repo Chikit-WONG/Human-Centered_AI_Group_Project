@@ -20,7 +20,7 @@ from matching_fairness.artifacts import (  # noqa: E402
     publish_staged_directory,
     read_score_artifact,
 )
-from matching_fairness.provenance import sha256_file  # noqa: E402
+from matching_fairness.provenance import sha256_file, sha256_path  # noqa: E402
 
 
 DEFAULT_PROTOCOL = EXPERIMENT_ROOT / "configs/protocol_sub08_seed42.json"
@@ -144,6 +144,8 @@ def export_brainrw_scores(
     *,
     runner=subprocess.run,
 ) -> dict[str, dict[str, str]]:
+    if arguments.subject_id != 8 or arguments.seed != 42:
+        raise ValueError("formal BrainRW export requires subject 8 and seed 42")
     if arguments.output_dir.exists():
         raise FileExistsError(f"output directory already exists: {arguments.output_dir}")
     arguments.output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -189,13 +191,58 @@ def export_brainrw_scores(
             for name in commands
         }
         manifest = staging / "export_manifest.json"
+        evaluator = REPOSITORY_ROOT / "scripts/evaluate_retrieval.py"
+        brain_test = (
+            Path(arguments.brain_directory)
+            / f"sub-{arguments.subject_id:02d}"
+            / "test.pt"
+        )
+        test_images = Path(arguments.image_directory) / "test_images"
+        manifest_artifacts = {
+            name: {
+                "path": name,
+                "sha256": _artifact_sha256(staging / name),
+            }
+            for name in commands
+        }
+        manifest_runs = {
+            name: {
+                "path": f"runs/{name}",
+                "sha256": sha256_path(staging / "runs" / name),
+            }
+            for name in commands
+        }
         encoded = (
             json.dumps(
                 {
                     "schema_version": 1,
+                    "scope": "fixed_formal_export",
+                    "checkpoint_role": "fixed_formal",
                     "model_slug": "our_project",
-                    "artifacts": inventory,
+                    "subject": "sub-08",
+                    "seed": 42,
+                    "artifacts": manifest_artifacts,
+                    "runs": manifest_runs,
+                    "inputs": {
+                        "protocol_sha256": sha256_file(arguments.protocol),
+                        "trial_manifest_sha256": sha256_file(
+                            arguments.trial_split_manifest
+                        ),
+                        "brain_test_sha256": sha256_file(brain_test),
+                        "evaluator_sha256": sha256_file(evaluator),
+                        "test_image_tree_sha256": sha256_path(test_images),
+                        "model_content_sha256": {
+                            "brain_model": sha256_path(arguments.brain_model_path),
+                            "vision_adapter": sha256_path(
+                                arguments.vision_adapter_path
+                            ),
+                            "pretrained_vision_base": sha256_path(
+                                arguments.pretrained_model_name_or_path
+                            ),
+                        },
+                    },
                 },
+                allow_nan=False,
                 indent=2,
                 sort_keys=True,
             )

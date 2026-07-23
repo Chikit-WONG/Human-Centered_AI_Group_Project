@@ -64,6 +64,15 @@ _EXPECTED_RECORDS = 3 * 30 * 5
 _RUN_MANIFEST_ALGORITHM = "AIAA3800-MATCHING-FAIRNESS-RUN-v1"
 
 
+def _expected_model_entries(model: str) -> set[str]:
+    if model not in _MODEL_ORDER:
+        raise ValueError(f"unsupported formal artifact model: {model}")
+    entries = set(_HALF_DIRECTORIES.values())
+    if model == "our_project":
+        entries.update({"runs", "export_manifest.json"})
+    return entries
+
+
 @dataclass(frozen=True)
 class ScenarioCell:
     suite: str
@@ -633,10 +642,10 @@ def _load_formal_artifacts(
         model_dir = artifact_root / model
         if model_dir.is_symlink() or not model_dir.is_dir():
             raise ValueError(f"formal model directory is invalid: {model}")
-        if set(path.name for path in model_dir.iterdir()) != set(
-            _HALF_DIRECTORIES.values()
+        if set(path.name for path in model_dir.iterdir()) != _expected_model_entries(
+            model
         ):
-            raise ValueError(f"formal model {model} must contain exactly three artifacts")
+            raise ValueError(f"formal model {model} has an invalid exact entry set")
         directories.extend(
             model_dir / directory for directory in _HALF_DIRECTORIES.values()
         )

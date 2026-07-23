@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 import os
@@ -13,10 +14,12 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from typing import Callable, Mapping, Sequence
+import uuid
 
 
 EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
@@ -464,79 +467,12 @@ def submit_all(
     overwrite: bool,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, int]:
-    prepare_runtime_directories(layout)
-    if os.path.lexists(layout.submission_manifest):
-        raise FileExistsError(
-            f"submission manifest already exists; refusing duplicate submit: "
-            f"{layout.submission_manifest}"
-        )
-    slurm = layout.experiment_root / "slurm"
-    train = _submit(
-        _sbatch_argv(
-            slurm / "train_native_array.slurm",
-            dependency=None,
-            overwrite=overwrite,
-        ),
-        runner,
+    return _submit_workflow(
+        phase="all",
+        layout=layout,
+        overwrite=overwrite,
+        runner=runner,
     )
-    native_export = _submit(
-        _sbatch_argv(
-            slurm / "export_native_array.slurm",
-            dependency=f"afterok:{train}",
-            overwrite=overwrite,
-            export_mode="main",
-        ),
-        runner,
-    )
-    brainrw_export = _submit(
-        _sbatch_argv(
-            slurm / "export_brainrw.slurm",
-            dependency=None,
-            overwrite=overwrite,
-        ),
-        runner,
-    )
-    native_audit = _submit(
-        _sbatch_argv(
-            slurm / "export_native_array.slurm",
-            dependency=f"afterok:{native_export}:{brainrw_export}",
-            overwrite=overwrite,
-            export_mode="audit",
-        ),
-        runner,
-    )
-    final = _submit(
-        _sbatch_argv(
-            slurm / "fairness_cpu.slurm",
-            dependency=f"afterok:{native_audit}",
-            overwrite=overwrite,
-        ),
-        runner,
-    )
-    result = {
-        "train_job_id": train,
-        "native_export_job_id": native_export,
-        "brainrw_export_job_id": brainrw_export,
-        "native_audit_job_id": native_audit,
-        "final_job_id": final,
-    }
-    _atomic_write_json_noclobber(
-        layout.submission_manifest,
-        {
-            "schema_version": 1,
-            "subject": SUBJECT,
-            "seed": SEED,
-            "jobs": result,
-            "dependency_order": [
-                "train",
-                "native_export",
-                "brainrw_export",
-                "native_audit",
-                "final",
-            ],
-        },
-    )
-    return result
 
 
 def submit_phase(
@@ -546,51 +482,184 @@ def submit_phase(
     overwrite: bool,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, int]:
-    prepare_runtime_directories(layout)
+    if phase not in {"train", "export"}:
+        raise ValueError("phase submission is supported only for train or export")
+    return _submit_workflow(
+        phase=phase,
+        layout=layout,
+        overwrite=overwrite,
+        runner=runner,
+    )
+
+
+_WORKFLOW_ORDER = {
+    "train": ("train",),
+    "export": ("native_export", "brainrw_export", "native_audit"),
+    "all": (
+        "train", "native_export", "brainrw_export", "native_audit", "final"
+    ),
+}
+
+
+def _replace_submission_ledger(path: Path, payload: Mapping[str, object]) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("submission ledger must remain a regular file")
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.replace-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _workflow_command(
+    *,
+    name: str,
+    phase: str,
+    layout: RuntimeLayout,
+    overwrite: bool,
+    job_ids: Mapping[str, int],
+    token: str,
+) -> list[str]:
     slurm = layout.experiment_root / "slurm"
-    if phase == "train":
-        train = _submit(
-            _sbatch_argv(
-                slurm / "train_native_array.slurm",
-                dependency=None,
-                overwrite=overwrite,
-            ),
-            runner,
+    if name == "train":
+        command = _sbatch_argv(
+            slurm / "train_native_array.slurm", dependency=None, overwrite=overwrite
         )
-        return {"train_job_id": train}
-    if phase == "export":
-        native_export = _submit(
-            _sbatch_argv(
-                slurm / "export_native_array.slurm",
-                dependency=None,
-                overwrite=overwrite,
-                export_mode="main",
-            ),
-            runner,
+    elif name == "native_export":
+        dependency = (
+            f"afterok:{job_ids['train']}" if phase == "all" else None
         )
-        brainrw_export = _submit(
-            _sbatch_argv(
-                slurm / "export_brainrw.slurm",
-                dependency=None,
-                overwrite=overwrite,
-            ),
-            runner,
+        command = _sbatch_argv(
+            slurm / "export_native_array.slurm",
+            dependency=dependency,
+            overwrite=overwrite,
+            export_mode="main",
         )
-        native_audit = _submit(
-            _sbatch_argv(
-                slurm / "export_native_array.slurm",
-                dependency=f"afterok:{native_export}:{brainrw_export}",
-                overwrite=overwrite,
-                export_mode="audit",
-            ),
-            runner,
+    elif name == "brainrw_export":
+        command = _sbatch_argv(
+            slurm / "export_brainrw.slurm", dependency=None, overwrite=overwrite
         )
-        return {
-            "native_export_job_id": native_export,
-            "brainrw_export_job_id": brainrw_export,
-            "native_audit_job_id": native_audit,
-        }
-    raise ValueError("phase submission is supported only for train or export")
+    elif name == "native_audit":
+        command = _sbatch_argv(
+            slurm / "export_native_array.slurm",
+            dependency=(
+                f"afterok:{job_ids['native_export']}:{job_ids['brainrw_export']}"
+            ),
+            overwrite=overwrite,
+            export_mode="audit",
+        )
+    elif name == "final":
+        command = _sbatch_argv(
+            slurm / "fairness_cpu.slurm",
+            dependency=f"afterok:{job_ids['native_audit']}",
+            overwrite=overwrite,
+        )
+    else:
+        raise ValueError(f"unknown submission job: {name}")
+    command.insert(-1, f"--job-name={token}")
+    return command
+
+
+def _submit_workflow(
+    *,
+    phase: str,
+    layout: RuntimeLayout,
+    overwrite: bool,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, int]:
+    prepare_runtime_directories(layout)
+    if phase not in _WORKFLOW_ORDER:
+        raise ValueError(f"unknown submission phase: {phase}")
+    if os.path.lexists(layout.submission_manifest):
+        raise FileExistsError(
+            "submission ledger already exists; active, completed, failed, and "
+            "unknown reservations require explicit manual reconciliation: "
+            f"{layout.submission_manifest}"
+        )
+    request_id = uuid.uuid4().hex
+    order = _WORKFLOW_ORDER[phase]
+    ledger: dict[str, object] = {
+        "schema_version": 2,
+        "subject": SUBJECT,
+        "seed": SEED,
+        "models": list(MODELS),
+        "phase": phase,
+        "state": "active",
+        "overwrite": overwrite,
+        "request_id": request_id,
+        "job_order": list(order),
+        "jobs": {
+            name: {
+                "state": "planned",
+                "token": f"mf-{request_id}-{name.replace('_', '-')}",
+                "argv": None,
+                "job_id": None,
+                "error": None,
+            }
+            for name in order
+        },
+        "failure": None,
+    }
+    _atomic_write_json_noclobber(layout.submission_manifest, ledger)
+    job_ids: dict[str, int] = {}
+    jobs = ledger["jobs"]
+    assert isinstance(jobs, dict)
+    for name in order:
+        row = jobs[name]
+        assert isinstance(row, dict)
+        command = _workflow_command(
+            name=name,
+            phase=phase,
+            layout=layout,
+            overwrite=overwrite,
+            job_ids=job_ids,
+            token=str(row["token"]),
+        )
+        row["state"] = "submitting"
+        row["argv"] = command
+        _replace_submission_ledger(layout.submission_manifest, ledger)
+        try:
+            job_id = _submit(command, runner)
+        except subprocess.CalledProcessError as error:
+            row["state"] = "failed"
+            row["error"] = str(error)
+            ledger["state"] = "failed"
+            ledger["failure"] = {"stage": name, "error": str(error)}
+            _replace_submission_ledger(layout.submission_manifest, ledger)
+            raise
+        except (OSError, RuntimeError) as error:
+            row["state"] = "unknown"
+            row["error"] = str(error)
+            ledger["state"] = "unknown"
+            ledger["failure"] = {"stage": name, "error": str(error)}
+            _replace_submission_ledger(layout.submission_manifest, ledger)
+            raise
+        row["state"] = "submitted"
+        row["job_id"] = job_id
+        job_ids[name] = job_id
+        _replace_submission_ledger(layout.submission_manifest, ledger)
+    ledger["state"] = "completed"
+    _replace_submission_ledger(layout.submission_manifest, ledger)
+    return {f"{name}_job_id": job_ids[name] for name in order}
 
 
 def prepare_runtime_directories(layout: RuntimeLayout) -> None:
@@ -710,6 +779,7 @@ def _atomic_write_json_noclobber(path: Path, payload: Mapping[str, object]) -> N
             raise FileExistsError(f"manifest already exists: {path}") from None
     finally:
         temporary.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
 
 
 def write_phase_manifest(layout: RuntimeLayout, phase: str) -> Path:
@@ -981,11 +1051,12 @@ def _checkpoint_matches_inputs(layout: RuntimeLayout, model: str) -> bool:
         return False
 
 
-def _matrix_complete(path: Path) -> bool:
+def _native_matrix_complete(path: Path) -> bool:
     if path.is_symlink() or not path.is_dir():
         return False
-    allowed = set(ARTIFACT_HALVES) | {"best_test_audit.json"}
-    if not set(entry.name for entry in path.iterdir()).issubset(allowed):
+    names = {entry.name for entry in path.iterdir()}
+    allowed = [set(ARTIFACT_HALVES), set(ARTIFACT_HALVES) | {"best_test_audit.json"}]
+    if names not in allowed or any(entry.is_symlink() for entry in path.iterdir()):
         return False
     try:
         from matching_fairness.artifacts import read_score_artifact
@@ -997,13 +1068,116 @@ def _matrix_complete(path: Path) -> bool:
     return True
 
 
-def _matrix_matches_inputs(layout: RuntimeLayout, model: str) -> bool:
-    """Require complete artifacts to bind the current fixed formal inputs."""
-    path = layout.matrix_dir(model)
-    if not _matrix_complete(path):
+def _brainrw_matrix_complete(path: Path) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    if {entry.name for entry in path.iterdir()} != {
+        *ARTIFACT_HALVES,
+        "runs",
+        "export_manifest.json",
+    }:
+        return False
+    if any(entry.is_symlink() for entry in path.rglob("*")):
         return False
     try:
         from matching_fairness.artifacts import read_score_artifact
+
+        for half in ARTIFACT_HALVES:
+            read_score_artifact(path / half)
+        runs = path / "runs"
+        if not runs.is_dir() or {entry.name for entry in runs.iterdir()} != set(
+            ARTIFACT_HALVES
+        ):
+            return False
+        for half in ARTIFACT_HALVES:
+            run = runs / half
+            if not run.is_dir() or {entry.name for entry in run.iterdir()} != {
+                "metrics.json", "predictions.csv"
+            }:
+                return False
+            if any(not entry.is_file() for entry in run.iterdir()):
+                return False
+        return (path / "export_manifest.json").is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _matrix_complete(path: Path) -> bool:
+    """Backward-compatible structural dispatcher used by older unit fixtures."""
+    return (
+        _brainrw_matrix_complete(path)
+        if path.name == "our_project"
+        else _native_matrix_complete(path)
+    )
+
+
+def _brainrw_export_manifest_matches(layout: RuntimeLayout) -> bool:
+    from matching_fairness.provenance import sha256_path
+    from matching_fairness.reporting import _canonical_json, _read_regular_file
+
+    root = layout.matrix_dir("our_project")
+    encoded = _read_regular_file(root / "export_manifest.json", "BrainRW export manifest")
+    manifest = _canonical_json(encoded, "BrainRW export manifest")
+    if set(manifest) != {
+        "schema_version", "scope", "checkpoint_role", "model_slug",
+        "subject", "seed", "artifacts", "runs", "inputs",
+    } or (
+        manifest.get("schema_version") != 1
+        or manifest.get("scope") != "fixed_formal_export"
+        or manifest.get("checkpoint_role") != "fixed_formal"
+        or manifest.get("model_slug") != "our_project"
+        or manifest.get("subject") != SUBJECT
+        or manifest.get("seed") != SEED
+    ):
+        return False
+    artifact_inventory = manifest.get("artifacts")
+    run_inventory = manifest.get("runs")
+    if (
+        not isinstance(artifact_inventory, Mapping)
+        or set(artifact_inventory) != set(ARTIFACT_HALVES)
+        or not isinstance(run_inventory, Mapping)
+        or set(run_inventory) != set(ARTIFACT_HALVES)
+    ):
+        return False
+    for half in ARTIFACT_HALVES:
+        if artifact_inventory[half] != {
+            "path": half,
+            "sha256": _score_artifact_sha256(root / half),
+        } or run_inventory[half] != {
+            "path": f"runs/{half}",
+            "sha256": sha256_path(root / "runs" / half),
+        }:
+            return False
+    inputs = manifest.get("inputs")
+    expected_inputs = {
+        "protocol_sha256": _hash_file(layout.protocol),
+        "trial_manifest_sha256": _hash_file(layout.trial_manifest),
+        "brain_test_sha256": _hash_file(layout.brainrw_test),
+        "evaluator_sha256": _hash_file(
+            layout.repository_root / "scripts/evaluate_retrieval.py"
+        ),
+        "test_image_tree_sha256": sha256_path(layout.official_test_images),
+        "model_content_sha256": {
+            "brain_model": sha256_path(layout.brainrw_model_root / "brain_model"),
+            "vision_adapter": sha256_path(layout.brainrw_model_root / "vision_model"),
+            "pretrained_vision_base": sha256_path(layout.clip_root),
+        },
+    }
+    return inputs == expected_inputs
+
+
+def _matrix_matches_inputs(layout: RuntimeLayout, model: str) -> bool:
+    """Require complete artifacts to bind the current fixed formal inputs."""
+    path = layout.matrix_dir(model)
+    complete = (
+        _brainrw_matrix_complete(path)
+        if model == "our_project"
+        else _native_matrix_complete(path)
+    )
+    if not complete:
+        return False
+    try:
+        from matching_fairness.artifacts import independent_ranks, read_score_artifact
         from matching_fairness.provenance import sha256_path
 
         artifacts = {
@@ -1073,6 +1247,7 @@ def _matrix_matches_inputs(layout: RuntimeLayout, model: str) -> bool:
             "expected_sample_count": 200,
         }
         identity = {
+            "checkpoint": str(layout.brainrw_model_root / "brain_model"),
             "checkpoint_role": "fixed_formal",
             "checkpoint_content_sha256": content["brain_model"],
             "model_content_sha256": content,
@@ -1083,11 +1258,34 @@ def _matrix_matches_inputs(layout: RuntimeLayout, model: str) -> bool:
             "runtime_inputs": expected_runtime,
             "similarity": "cosine",
         }
-        for artifact in artifacts.values():
+        expected_fields = {
+            "model_slug", "trial_half", "checkpoint_role", "checkpoint",
+            "checkpoint_content_sha256", "similarity", "query_embeddings_sha256",
+            "subject", "seed", "trial_manifest_sha256", "protocol_sha256",
+            "brain_test_sha256", "model_content_sha256", "evaluator_version",
+            "evaluator_sha256", "runtime_inputs", "native_metrics",
+        }
+        for directory, artifact in artifacts.items():
             metadata = artifact.metadata
-            if any(metadata.get(key) != value for key, value in identity.items()):
+            ranks = independent_ranks(artifact)
+            expected_metrics = {
+                "top1_count": int((ranks <= 1).sum()),
+                "top5_count": int((ranks <= 5).sum()),
+                "sample_count": len(ranks),
+            }
+            if (
+                set(metadata) != expected_fields
+                or artifact.similarity.shape != (200, 200)
+                or metadata.get("trial_half") != expected_halves[directory]
+                or metadata.get("native_metrics") != expected_metrics
+                or any(metadata.get(key) != value for key, value in identity.items())
+            ):
                 return False
-        return True
+        return (
+            artifacts["eeg_a"].metadata["query_embeddings_sha256"]
+            != artifacts["eeg_b"].metadata["query_embeddings_sha256"]
+            and _brainrw_export_manifest_matches(layout)
+        )
     except (OSError, TypeError, ValueError):
         return False
 
@@ -1105,35 +1303,53 @@ def _audit_matches_inputs(layout: RuntimeLayout, model: str) -> bool:
         return False
     audit_path = layout.matrix_dir(model) / "best_test_audit.json"
     try:
-        payload = _read_json(audit_path)
-        if (
-            not isinstance(payload, Mapping)
-            or payload.get("schema_version") != 1
-            or payload.get("scope") != "best_test_audit_only"
-            or payload.get("model_slug") != model
-            or payload.get("fairness_artifact_created") is not False
-            or not isinstance(payload.get("runs"), list)
-            or not payload["runs"]
-            or not isinstance(payload.get("best_test"), Mapping)
+        from matching_fairness.reporting import (
+            _canonical_json,
+            _read_regular_file,
+            _validate_audit_manifest,
+            _validate_checkpoint_manifest,
+        )
+
+        if not _checkpoint_matches_inputs(layout, model) or not _matrix_matches_inputs(
+            layout, model
         ):
             return False
-        expected_inventory = []
+        checkpoint_path = layout.checkpoint_dir(model) / "checkpoint_manifest.json"
+        checkpoint = _canonical_json(
+            _read_regular_file(checkpoint_path, "checkpoint manifest"),
+            "checkpoint manifest",
+        )
+        audit = _canonical_json(
+            _read_regular_file(audit_path, "best-test audit"),
+            "best-test audit",
+        )
+        _selection, checkpoint_identities = _validate_checkpoint_manifest(
+            checkpoint, model
+        )
+        _best, inventory, audit_identities = _validate_audit_manifest(audit, model)
+        if checkpoint_identities != audit_identities:
+            return False
+        expected_inventory: list[dict[str, object]] = []
+        expected_digests: dict[tuple[str, str], str] = {}
         trial_half = {"standard": "standard", "eeg_a": "a", "eeg_b": "b"}
         for artifact_model in MODELS:
             for half in ARTIFACT_HALVES:
                 artifact = layout.matrix_dir(artifact_model) / half
-                expected_inventory.append(
-                    {
-                        "model_slug": artifact_model,
-                        "trial_half": trial_half[half],
-                        "path": str(artifact),
-                        "sha256": _score_artifact_sha256(artifact),
-                    }
-                )
+                digest = _score_artifact_sha256(artifact)
+                expected_inventory.append({
+                    "model_slug": artifact_model,
+                    "trial_half": trial_half[half],
+                    "path": str(artifact),
+                    "sha256": digest,
+                })
+                expected_digests[(artifact_model, half)] = digest
         expected_inventory.sort(
             key=lambda entry: (entry["model_slug"], entry["trial_half"])
         )
-        return payload.get("formal_artifact_inventory") == expected_inventory
+        return (
+            audit.get("formal_artifact_inventory") == expected_inventory
+            and inventory == expected_digests
+        )
     except (OSError, TypeError, ValueError):
         return False
 
@@ -1186,8 +1402,14 @@ def _ensure_source_and_assets(layout: RuntimeLayout) -> None:
         ).to_dict() != dict(expected):
             raise ValueError("source checkout does not match immutable source lock")
 
-    if not layout.asset_lock.exists():
+    asset_pair = (
+        os.path.lexists(layout.asset_root),
+        os.path.lexists(layout.asset_lock),
+    )
+    if asset_pair == (False, False):
         _run(commands["fetch_assets"][0])
+    elif asset_pair != (True, True):
+        raise ValueError("asset root/lock is partial; refusing implicit replacement")
     else:
         from scripts.fetch_assets import inventory_assets
 
@@ -1200,19 +1422,100 @@ def _ensure_source_and_assets(layout: RuntimeLayout) -> None:
             raise ValueError("official assets do not match immutable asset lock")
 
 
+def _verified_brainrw_snapshot(layout: RuntimeLayout) -> bytes:
+    preflight = _read_json(layout.preflight_manifest)
+    if not isinstance(preflight, Mapping):
+        raise ValueError("preflight manifest must be a mapping")
+    brainrw = preflight.get("brainrw")
+    expected_keys = {
+        "path", "sha256", "eeg_shape", "image_count", "session_counts"
+    }
+    if (
+        not isinstance(brainrw, Mapping)
+        or set(brainrw) != expected_keys
+        or brainrw.get("path") != str(layout.brainrw_test)
+        or _SHA256.fullmatch(str(brainrw.get("sha256", ""))) is None
+        or brainrw.get("eeg_shape") != [200, 80, 63, 250]
+        or brainrw.get("image_count") != 200
+        or brainrw.get("session_counts")
+        != {"0": 20, "1": 20, "2": 20, "3": 20}
+    ):
+        raise ValueError("preflight BrainRW identity/hash schema is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(layout.brainrw_test, flags)
+    except OSError as error:
+        raise ValueError("BrainRW test snapshot must be a non-symlink regular file") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("BrainRW test snapshot must be a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise ValueError("BrainRW test snapshot changed while it was being read")
+    encoded = b"".join(chunks)
+    if hashlib.sha256(encoded).hexdigest() != brainrw["sha256"]:
+        raise ValueError("BrainRW test snapshot SHA-256 does not match preflight")
+    return encoded
+
+
 def _trial_manifest_payload(layout: RuntimeLayout) -> dict[str, object]:
     import numpy as np
     import torch
 
     from matching_fairness.trial_splits import build_trial_manifest
 
-    payload = torch.load(layout.brainrw_test, map_location="cpu", weights_only=False)
-    if not isinstance(payload, Mapping) or "img" not in payload or "session" not in payload:
-        raise ValueError("BrainRW test.pt lacks image/session identities")
+    encoded = _verified_brainrw_snapshot(layout)
+    payload = torch.load(io.BytesIO(encoded), map_location="cpu", weights_only=False)
+    expected_keys = {"eeg", "label", "img", "text", "session", "ch_names", "times"}
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise ValueError("BrainRW test.pt does not use the expected exact data schema")
+    eeg_shape = tuple(int(value) for value in getattr(payload["eeg"], "shape", ()))
+    if eeg_shape != (200, 80, 63, 250):
+        raise ValueError("BrainRW EEG must have shape (200, 80, 63, 250)")
     images = np.asarray(payload["img"])
     sessions = np.asarray(payload["session"])
-    if images.ndim != 2 or sessions.shape != images.shape:
-        raise ValueError("BrainRW image/session arrays must share a 2-D shape")
+    labels = np.asarray(payload["label"])
+    texts = np.asarray(payload["text"])
+    if (
+        images.shape != (200, 80)
+        or sessions.shape != images.shape
+        or labels.shape != images.shape
+        or texts.shape != images.shape
+    ):
+        raise ValueError("BrainRW label/image/text/session arrays must have shape (200, 80)")
+    channels = payload["ch_names"]
+    times = np.asarray(payload["times"])
+    if (
+        not isinstance(channels, (list, tuple))
+        or len(channels) != 63
+        or any(not isinstance(value, str) or not value for value in channels)
+        or len(set(channels)) != 63
+        or times.shape != (250,)
+    ):
+        raise ValueError("BrainRW channel/time metadata schema is invalid")
     pairs: list[tuple[str, object]] = []
     for image_row, session_row in zip(images, sessions):
         ids = {Path(str(value)).stem for value in image_row.tolist()}
@@ -1242,10 +1545,17 @@ def _ensure_trial_manifest(layout: RuntimeLayout) -> None:
 
 
 def run_preflight(layout: RuntimeLayout, *, overwrite: bool) -> str:
+    phase_manifest = phase_manifest_path(layout, "preflight")
+    state = (
+        os.path.lexists(layout.preflight_manifest),
+        os.path.lexists(layout.trial_manifest),
+        os.path.lexists(phase_manifest),
+    )
+    if any(state) and not all(state):
+        raise ValueError("preflight output is partial or orphaned")
     prepare_runtime_directories(layout)
     _ensure_source_and_assets(layout)
-    phase_manifest = phase_manifest_path(layout, "preflight")
-    outputs_exist = layout.preflight_manifest.exists() or layout.trial_manifest.exists()
+    outputs_exist = all(state)
     if outputs_exist and not overwrite:
         if (
             layout.preflight_manifest.is_file()
@@ -1418,6 +1728,10 @@ def execute_pipeline(
             layout=layout, phase=phase, overwrite=overwrite
         )
         return {"mode": "dry-run", "phase": phase, "rendered": rendered}
+    if not submit and phase in {"train", "export", "all"}:
+        raise ValueError(
+            f"heavy phase {phase!r} requires --submit or --dry-run"
+        )
     if submit:
         if phase == "all":
             run_preflight(layout, overwrite=overwrite)

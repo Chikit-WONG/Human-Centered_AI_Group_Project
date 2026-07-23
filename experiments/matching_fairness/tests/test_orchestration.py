@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,6 +218,19 @@ class _SubmissionRunner:
         return subprocess.CompletedProcess(argv, 0, stdout=next(self.outputs), stderr="")
 
 
+class _FailAtRunner:
+    def __init__(self, fail_index: int) -> None:
+        self.fail_index = fail_index
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **_kwargs):
+        index = len(self.calls)
+        self.calls.append(list(argv))
+        if index == self.fail_index:
+            raise subprocess.CalledProcessError(1, argv, stderr="scheduler rejected")
+        return subprocess.CompletedProcess(argv, 0, stdout=f"{100 + index}\n", stderr="")
+
+
 def test_submit_pipeline_uses_argv_and_exact_afterok_dependencies(tmp_path: Path) -> None:
     module = _load_submitter()
     layout = module.RuntimeLayout.for_test(tmp_path)
@@ -238,7 +254,23 @@ def test_submit_pipeline_uses_argv_and_exact_afterok_dependencies(tmp_path: Path
     submission = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
     assert submission["subject"] == "sub-08"
     assert submission["seed"] == 42
-    assert submission["jobs"] == result
+    assert submission["schema_version"] == 2
+    assert submission["phase"] == "all"
+    assert submission["state"] == "completed"
+    assert submission["failure"] is None
+    assert submission["job_order"] == [
+        "train", "native_export", "brainrw_export", "native_audit", "final"
+    ]
+    assert {
+        f"{name}_job_id": submission["jobs"][name]["job_id"]
+        for name in submission["job_order"]
+    } == result
+    assert all(
+        row["state"] == "submitted"
+        and row["token"].startswith("mf-")
+        and isinstance(row["argv"], list)
+        for row in submission["jobs"].values()
+    )
 
 
 def test_existing_submission_manifest_prevents_duplicate_submit(tmp_path: Path) -> None:
@@ -250,6 +282,130 @@ def test_existing_submission_manifest_prevents_duplicate_submit(tmp_path: Path) 
     with pytest.raises(FileExistsError, match="submission"):
         module.submit_all(layout=layout, overwrite=False, runner=runner)
     assert runner.calls == []
+
+
+@pytest.mark.parametrize("state", ("active", "completed", "failed", "unknown"))
+def test_preexisting_submission_state_never_auto_resubmits(
+    tmp_path: Path, state: str
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    layout.submission_manifest.parent.mkdir(parents=True)
+    layout.submission_manifest.write_text(
+        json.dumps({"schema_version": 2, "state": state}) + "\n",
+        encoding="utf-8",
+    )
+    runner = _SubmissionRunner(["1\n"])
+    with pytest.raises((FileExistsError, RuntimeError), match="submission|ledger"):
+        module.submit_all(layout=layout, overwrite=True, runner=runner)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("fail_index", range(5))
+def test_submission_failure_persists_every_known_id_and_stops_dag(
+    tmp_path: Path, fail_index: int
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    runner = _FailAtRunner(fail_index)
+    with pytest.raises(subprocess.CalledProcessError):
+        module.submit_all(layout=layout, overwrite=False, runner=runner)
+    ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+    assert ledger["state"] == "failed"
+    assert ledger["failure"]["stage"] == ledger["job_order"][fail_index]
+    assert len(runner.calls) == fail_index + 1
+    for index, name in enumerate(ledger["job_order"]):
+        row = ledger["jobs"][name]
+        if index < fail_index:
+            assert row["state"] == "submitted"
+            assert row["job_id"] == 100 + index
+        elif index == fail_index:
+            assert row["state"] == "failed"
+            assert row["token"].startswith("mf-")
+            assert row["job_id"] is None
+        else:
+            assert row["state"] == "planned"
+    with pytest.raises((FileExistsError, RuntimeError)):
+        module.submit_all(
+            layout=layout,
+            overwrite=True,
+            runner=_SubmissionRunner(["999\n"]),
+        )
+
+
+def test_submission_intent_is_durable_before_each_scheduler_call(tmp_path: Path) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+        name = ledger["job_order"][len(calls)]
+        assert ledger["state"] == "active"
+        assert ledger["jobs"][name]["state"] == "submitting"
+        assert ledger["jobs"][name]["token"].startswith("mf-")
+        assert ledger["jobs"][name]["argv"] == list(argv)
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout=f"{201 + len(calls)}\n", stderr="")
+
+    module.submit_all(layout=layout, overwrite=False, runner=runner)
+    assert len(calls) == 5
+
+
+def test_job_id_ledger_write_failure_stops_with_durable_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    real_replace = module._replace_submission_ledger
+    calls = 0
+
+    def fail_second_write(path: Path, payload: dict[str, object]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected job-id ledger failure")
+        real_replace(path, payload)
+
+    monkeypatch.setattr(module, "_replace_submission_ledger", fail_second_write)
+    runner = _SubmissionRunner(["301\n", "302\n"])
+    with pytest.raises(OSError, match="job-id ledger"):
+        module.submit_all(layout=layout, overwrite=False, runner=runner)
+    ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+    assert len(runner.calls) == 1
+    assert ledger["jobs"]["train"]["state"] == "submitting"
+    assert ledger["jobs"]["train"]["token"].startswith("mf-")
+    assert ledger["jobs"]["train"]["job_id"] is None
+
+
+def test_no_clobber_reservation_fsyncs_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_submitter()
+    destination = tmp_path / "manifests/submission.json"
+    observed: list[Path] = []
+    monkeypatch.setattr(
+        module, "_fsync_directory", lambda path: observed.append(Path(path))
+    )
+    module._atomic_write_json_noclobber(destination, {"state": "active"})
+    assert observed == [destination.parent]
+
+
+def test_repeat_phase_submit_is_guarded_by_same_durable_ledger(tmp_path: Path) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    module.submit_phase(
+        phase="train",
+        layout=layout,
+        overwrite=False,
+        runner=_SubmissionRunner(["401\n"]),
+    )
+    duplicate = _SubmissionRunner(["402\n"])
+    with pytest.raises((FileExistsError, RuntimeError), match="submission|ledger"):
+        module.submit_phase(
+            phase="train", layout=layout, overwrite=True, runner=duplicate
+        )
+    assert duplicate.calls == []
 
 
 def test_audit_and_final_dependencies_cannot_be_bypassed(tmp_path: Path) -> None:
@@ -406,6 +562,11 @@ def test_submit_pipeline_rejects_non_exact_parsable_job_ids(
     runner = _SubmissionRunner([output])
     with pytest.raises(RuntimeError, match="job ID"):
         module.submit_all(layout=layout, overwrite=False, runner=runner)
+    ledger = json.loads(layout.submission_manifest.read_text(encoding="utf-8"))
+    assert ledger["state"] == "unknown"
+    assert ledger["jobs"]["train"]["state"] == "unknown"
+    assert ledger["jobs"]["train"]["token"].startswith("mf-")
+    assert ledger["jobs"]["train"]["job_id"] is None
 
 
 def test_dry_run_never_invokes_submission_runner(tmp_path: Path) -> None:
@@ -428,12 +589,508 @@ def test_dry_run_never_invokes_submission_runner(tmp_path: Path) -> None:
     assert result["mode"] == "dry-run"
 
 
+@pytest.mark.parametrize("phase", ("train", "export", "all"))
+def test_public_heavy_phase_requires_submit_or_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    monkeypatch.setattr(
+        module,
+        "run_internal_cell",
+        lambda **_kwargs: pytest.fail("heavy phase attempted local execution"),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_preflight",
+        lambda *_args, **_kwargs: pytest.fail("all phase attempted local execution"),
+    )
+    with pytest.raises(ValueError, match="submit|dry-run"):
+        module.execute_pipeline(
+            phase=phase,
+            submit=False,
+            dry_run=False,
+            overwrite=False,
+            layout=layout,
+        )
+
+
+def test_orphan_preflight_phase_manifest_fails_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    orphan = module.phase_manifest_path(layout, "preflight")
+    orphan.parent.mkdir(parents=True)
+    orphan.write_text("{}\n", encoding="utf-8")
+    assert not layout.logs_root.exists()
+    monkeypatch.setattr(module, "_ensure_source_and_assets", lambda _layout: None)
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda _command: pytest.fail("orphan state was mutated before rejection"),
+    )
+    with pytest.raises(ValueError, match="preflight|partial|orphan"):
+        module.run_preflight(layout, overwrite=False)
+    assert not layout.logs_root.exists()
+
+
+@pytest.mark.parametrize("present", ("root", "lock"))
+def test_asset_root_and_lock_partial_pair_fails_without_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    present: str,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    layout.source_checkout.mkdir(parents=True)
+    layout.source_lock.parent.mkdir(parents=True, exist_ok=True)
+    layout.source_lock.write_text("{}\n", encoding="utf-8")
+    import matching_fairness.provenance as provenance
+
+    monkeypatch.setattr(
+        provenance,
+        "inspect_checkout",
+        lambda _path: SimpleNamespace(to_dict=lambda: {}),
+    )
+    if present == "root":
+        layout.asset_root.mkdir(parents=True)
+    else:
+        layout.asset_lock.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda _command: pytest.fail("partial asset state triggered a fetch"),
+    )
+    with pytest.raises(ValueError, match="asset|partial"):
+        module._ensure_source_and_assets(layout)
+
+
+def _write_brainrw_snapshot_fixture(layout) -> bytes:
+    import numpy as np
+    import torch
+
+    image_ids = [f"image-{index:03d}" for index in range(200)]
+    sessions = np.tile(np.repeat(np.arange(4), 20), (200, 1))
+    payload = {
+        "eeg": torch.empty((200, 80, 63, 250), device="meta"),
+        "label": np.tile(np.arange(200)[:, None], (1, 80)),
+        "img": np.asarray([[f"{image_id}.jpg"] * 80 for image_id in image_ids]),
+        "text": np.asarray([[image_id] * 80 for image_id in image_ids]),
+        "session": sessions,
+        "ch_names": [f"channel-{index}" for index in range(63)],
+        "times": np.arange(250),
+    }
+    layout.brainrw_test.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, layout.brainrw_test)
+    encoded = layout.brainrw_test.read_bytes()
+    layout.preflight_manifest.parent.mkdir(parents=True, exist_ok=True)
+    layout.preflight_manifest.write_text(
+        json.dumps(
+            {
+                "brainrw": {
+                    "path": str(layout.brainrw_test),
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "eeg_shape": [200, 80, 63, 250],
+                    "image_count": 200,
+                    "session_counts": {"0": 20, "1": 20, "2": 20, "3": 20},
+                }
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return encoded
+
+
+def test_trial_manifest_deserializes_only_verified_snapshot_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    expected = _write_brainrw_snapshot_fixture(layout)
+    real_load = torch.load
+    observed: list[bytes] = []
+
+    def guarded_load(source, *args, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        observed.append(source.getvalue())
+        return real_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", guarded_load)
+    manifest = module._trial_manifest_payload(layout)
+    assert manifest["seed"] == 42
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize("mutation", ("replace", "in_place"))
+def test_trial_snapshot_mutation_is_rejected_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    import torch
+
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_brainrw_snapshot_fixture(layout)
+    if mutation == "replace":
+        replacement = layout.brainrw_test.with_suffix(".replacement")
+        replacement.write_bytes(b"replacement")
+        os.replace(replacement, layout.brainrw_test)
+    else:
+        with layout.brainrw_test.open("ab") as stream:
+            stream.write(b"in-place mutation")
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("unverified bytes were deserialized"),
+    )
+    with pytest.raises(ValueError, match="hash|SHA-256|preflight"):
+        module._trial_manifest_payload(layout)
+
+
+def test_trial_snapshot_rejects_symlink_before_deserialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_brainrw_snapshot_fixture(layout)
+    target = layout.brainrw_test.with_suffix(".real")
+    layout.brainrw_test.rename(target)
+    layout.brainrw_test.symlink_to(target)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("symlinked bytes were deserialized"),
+    )
+    with pytest.raises(ValueError, match="symlink|regular file|nofollow"):
+        module._trial_manifest_payload(layout)
+
+
+def test_trial_snapshot_hash_mismatch_never_reaches_deserializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_brainrw_snapshot_fixture(layout)
+    preflight = json.loads(layout.preflight_manifest.read_text(encoding="utf-8"))
+    preflight["brainrw"]["sha256"] = "0" * 64
+    layout.preflight_manifest.write_text(json.dumps(preflight) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("hash mismatch was deserialized"),
+    )
+    with pytest.raises(ValueError, match="hash|SHA-256|preflight"):
+        module._trial_manifest_payload(layout)
+
+
+def _publish_real_brainrw_fixture(module, layout) -> None:
+    import numpy as np
+
+    from matching_fairness.artifacts import ScoreArtifact, write_score_artifact
+    from matching_fairness.provenance import sha256_file, sha256_path
+
+    layout.protocol.parent.mkdir(parents=True, exist_ok=True)
+    layout.protocol.write_text('{"formal":true}\n', encoding="utf-8")
+    layout.trial_manifest.parent.mkdir(parents=True, exist_ok=True)
+    layout.trial_manifest.write_text('{"seed":42}\n', encoding="utf-8")
+    layout.brainrw_test.parent.mkdir(parents=True, exist_ok=True)
+    layout.brainrw_test.write_bytes(b"brainrw-test")
+    layout.official_test_images.mkdir(parents=True, exist_ok=True)
+    (layout.official_test_images / "image-000.jpg").write_bytes(b"image")
+    for name in ("brain_model", "vision_model"):
+        path = layout.brainrw_model_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "weights.bin").write_bytes(name.encode("ascii"))
+    layout.clip_root.mkdir(parents=True, exist_ok=True)
+    (layout.clip_root / "weights.bin").write_bytes(b"clip")
+    evaluator = layout.repository_root / "scripts/evaluate_retrieval.py"
+    model_content = {
+        "brain_model": sha256_path(layout.brainrw_model_root / "brain_model"),
+        "vision_adapter": sha256_path(layout.brainrw_model_root / "vision_model"),
+        "pretrained_vision_base": sha256_path(layout.clip_root),
+    }
+    ids = tuple(f"image-{index:03d}" for index in range(200))
+    exporter = _load_script("export_brainrw_scores")
+    arguments = exporter.build_parser().parse_args(
+        module.phase_commands(layout)["export_brainrw"][0][2:]
+    )
+
+    def runner(command: list[str], *, check: bool) -> object:
+        assert check is True
+        half = command[command.index("--trial-half") + 1]
+        artifact_path = Path(command[command.index("--score-artifact-output") + 1])
+        metadata = {
+            "model_slug": "our_project",
+            "trial_half": half,
+            "checkpoint_role": "fixed_formal",
+            "checkpoint": str(layout.brainrw_model_root / "brain_model"),
+            "checkpoint_content_sha256": model_content["brain_model"],
+            "similarity": "cosine",
+            "query_embeddings_sha256": {
+                "standard": "1" * 64,
+                "a": "2" * 64,
+                "b": "3" * 64,
+            }[half],
+            "subject": "sub-08",
+            "seed": 42,
+            "trial_manifest_sha256": sha256_file(layout.trial_manifest),
+            "protocol_sha256": sha256_file(layout.protocol),
+            "brain_test_sha256": sha256_file(layout.brainrw_test),
+            "model_content_sha256": model_content,
+            "evaluator_version": "AIAA3800-BRAINRW-FORMAL-v1",
+            "evaluator_sha256": sha256_file(evaluator),
+            "runtime_inputs": {
+                "test_image_tree_sha256": sha256_path(layout.official_test_images),
+                "selected_channel_indices": list(range(46, 63)),
+                "time_slice": [0, 250],
+                "dataset_name": "things",
+                "expected_sample_count": 200,
+            },
+            "native_metrics": {
+                "top1_count": 200,
+                "top5_count": 200,
+                "sample_count": 200,
+            },
+        }
+        write_score_artifact(
+            artifact_path,
+            ScoreArtifact(
+                similarity=np.eye(200, dtype=np.float32),
+                query_ids=ids,
+                gallery_entry_ids=ids,
+                gallery_canonical_ids=ids,
+                target_canonical_ids=ids,
+                metadata=metadata,
+            ),
+        )
+        metrics = Path(command[command.index("--metrics-output") + 1])
+        predictions = Path(command[command.index("--predictions-output") + 1])
+        metrics.parent.mkdir(parents=True, exist_ok=True)
+        metrics.write_text('{"top1_count":200,"top5_count":200}\n', encoding="utf-8")
+        predictions.write_text("query,prediction\n", encoding="utf-8")
+        return object()
+
+    exporter.export_brainrw_scores(arguments, runner=runner)
+
+
+def test_orchestrator_accepts_real_brainrw_publisher_schema(tmp_path: Path) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _publish_real_brainrw_fixture(module, layout)
+    assert module._matrix_matches_inputs(layout, "our_project") is True
+
+
+@pytest.mark.parametrize(
+    "tamper", ("missing", "extra", "artifact_hash", "run_hash", "symlink")
+)
+def test_orchestrator_rejects_brainrw_export_tree_tampering(
+    tmp_path: Path, tamper: str
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _publish_real_brainrw_fixture(module, layout)
+    root = layout.matrix_dir("our_project")
+    manifest_path = root / "export_manifest.json"
+    if tamper == "missing":
+        manifest_path.unlink()
+    elif tamper == "extra":
+        (root / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+    elif tamper in {"artifact_hash", "run_hash"}:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if tamper == "artifact_hash":
+            payload["artifacts"]["standard"]["sha256"] = "0" * 64
+        else:
+            payload["runs"]["standard"]["sha256"] = "0" * 64
+        manifest_path.write_text(
+            json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        member = root / "runs/standard/predictions.csv"
+        outside = tmp_path / "outside.csv"
+        outside.write_text("outside", encoding="utf-8")
+        member.unlink()
+        member.symlink_to(outside)
+    assert module._matrix_matches_inputs(layout, "our_project") is False
+
+
 def _write_complete_artifact(path: Path, token: str) -> None:
     path.mkdir(parents=True)
     (path / "metadata.json").write_text(
         json.dumps({"token": token}, sort_keys=True) + "\n", encoding="utf-8"
     )
     (path / "similarity.npy").write_bytes(b"matrix")
+
+
+def _write_exact_audit_fixture(module, layout, model: str = "nice") -> None:
+    checkpoint = {
+        "schema_version": 1,
+        "model": model,
+        "encoder_type": "NICE" if model == "nice" else "ATMS",
+        "subject": "sub-08",
+        "seed": 42,
+        "source": {
+            "url": "https://github.com/dongyangli-del/EEG_Image_decode.git",
+            "branch": "develop",
+            "commit": "1" * 40,
+            "checkout_sha256": "2" * 64,
+        },
+        "inputs": {
+            "training_eeg": {
+                "name": "preprocessed_eeg_training.npy", "sha256": "3" * 64
+            },
+            "training_features": {
+                "name": "ViT-H-14_features_train.pt", "sha256": "4" * 64
+            },
+        },
+        "hyperparameters": {
+            "epochs": 500, "batch_size": 1024, "learning_rate": 3e-4,
+            "val_ratio": 0.1, "early_stopping_patience": 10,
+            "ema_decay": 0.999, "logit_scale_type": "exp",
+            "avg_trials": True, "n_chans": 63, "n_times": 250,
+        },
+        "encoder_behavior": {
+            "use_subject_id": model == "atm_s",
+            "normalize_feats": model == "atm_s",
+        },
+        "checkpoints": [
+            {
+                "epoch": 1, "val_loss": 0.3,
+                "checkpoint": "epoch_0001.pth", "sha256": "5" * 64,
+            },
+            {
+                "epoch": 2, "val_loss": 0.2,
+                "checkpoint": "epoch_0002.pth", "sha256": "6" * 64,
+            },
+        ],
+        "selection": {
+            "epoch": 2, "val_loss": 0.2, "checkpoint": "epoch_0002.pth"
+        },
+        "best_checkpoint": {"name": "best_val.pth", "sha256": "6" * 64},
+        "history": {"name": "history.csv", "sha256": "7" * 64},
+        "stopped_early": True,
+    }
+    checkpoint_path = layout.checkpoint_dir(model) / "checkpoint_manifest.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        json.dumps(checkpoint, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    inventory = []
+    trial_half = {"standard": "standard", "eeg_a": "a", "eeg_b": "b"}
+    for artifact_model in ("nice", "atm_s", "our_project"):
+        for half in ("standard", "eeg_a", "eeg_b"):
+            artifact = layout.matrix_dir(artifact_model) / half
+            _write_complete_artifact(artifact, f"{artifact_model}-{half}")
+            inventory.append(
+                {
+                    "model_slug": artifact_model,
+                    "trial_half": trial_half[half],
+                    "path": str(artifact),
+                    "sha256": module._score_artifact_sha256(artifact),
+                }
+            )
+    inventory.sort(key=lambda row: (row["model_slug"], row["trial_half"]))
+    runs = [
+        {
+            "epoch": 1, "checkpoint": "epoch_0001.pth",
+            "checkpoint_sha256": "5" * 64, "effective_logit_scale": 1.0,
+            "top1_count": 100, "top5_count": 150, "sample_count": 200,
+        },
+        {
+            "epoch": 2, "checkpoint": "epoch_0002.pth",
+            "checkpoint_sha256": "6" * 64, "effective_logit_scale": 1.1,
+            "top1_count": 101, "top5_count": 151, "sample_count": 200,
+        },
+    ]
+    audit = {
+        "schema_version": 1,
+        "scope": "best_test_audit_only",
+        "model_slug": model,
+        "checkpoint_policy": "every_epoch_checkpoint",
+        "fairness_artifact_created": False,
+        "formal_artifact_inventory": inventory,
+        "runs": runs,
+        "best_test": dict(runs[1]),
+    }
+    audit_path = layout.matrix_dir(model) / "best_test_audit.json"
+    audit_path.write_text(
+        json.dumps(audit, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_audit_resume_accepts_task8_exact_current_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_exact_audit_fixture(module, layout)
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
+    monkeypatch.setattr(module, "_matrix_matches_inputs", lambda *_args: True)
+    assert module._audit_matches_inputs(layout, "nice") is True
+
+
+@pytest.mark.parametrize(
+    "tamper", ("epoch", "hash", "order", "count", "policy", "best", "extra")
+)
+def test_audit_resume_rejects_task8_contract_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_exact_audit_fixture(module, layout)
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
+    monkeypatch.setattr(module, "_matrix_matches_inputs", lambda *_args: True)
+    path = layout.matrix_dir("nice") / "best_test_audit.json"
+    audit = json.loads(path.read_text(encoding="utf-8"))
+    if tamper == "epoch":
+        audit["runs"][1]["epoch"] = 1
+    elif tamper == "hash":
+        audit["runs"][1]["checkpoint_sha256"] = "0" * 64
+    elif tamper == "order":
+        audit["runs"].reverse()
+    elif tamper == "count":
+        audit["runs"][0]["top5_count"] = 201
+    elif tamper == "policy":
+        audit["checkpoint_policy"] = "best_only"
+    elif tamper == "best":
+        audit["best_test"] = dict(audit["runs"][0])
+    else:
+        audit["unexpected"] = True
+    path.write_text(
+        json.dumps(audit, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert module._audit_matches_inputs(layout, "nice") is False
+
+
+def test_audit_resume_requires_current_checkpoint_and_standard_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_exact_audit_fixture(module, layout)
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: False)
+    monkeypatch.setattr(module, "_matrix_matches_inputs", lambda *_args: True)
+    assert module._audit_matches_inputs(layout, "nice") is False
+    monkeypatch.setattr(module, "_checkpoint_matches_inputs", lambda *_args: True)
+    monkeypatch.setattr(module, "_matrix_matches_inputs", lambda *_args: False)
+    assert module._audit_matches_inputs(layout, "nice") is False
 
 
 def test_resume_matching_skips_only_complete_hash_bound_output(tmp_path: Path) -> None:
