@@ -651,3 +651,183 @@ def test_lightweight_runner_publishes_exact_grid_manifest_and_cleans_failures(
         )
     assert not os.path.lexists(failed_output)
     assert not list(results_root.glob(".failed_runs.tmp-*"))
+
+
+@pytest.mark.parametrize("model", ("nice", "atm_s", "our_project"))
+def test_lightweight_single_model_runner_publishes_150_records_without_other_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    runner = _load_runner()
+    all_artifacts, all_hashes = _synthetic_formal_artifacts()
+    monkeypatch.setattr(runner, "evaluate_artifact", _lightweight_evaluation)
+    results_root = tmp_path / "matching_fairness_v3"
+    artifact_root = results_root / "matrices"
+    (artifact_root / model).mkdir(parents=True)
+    trial_manifest = results_root / "trial.json"
+    trial_manifest.write_text("{}\n", encoding="utf-8")
+    trial_hash = hashlib.sha256(trial_manifest.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        runner,
+        "_load_single_model_artifacts",
+        lambda *_args, **_kwargs: (
+            all_artifacts[model],
+            all_hashes[model],
+            trial_hash,
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_formal_artifacts",
+        lambda *_args, **_kwargs: pytest.fail(
+            "single-model mode must not load all three baselines"
+        ),
+    )
+    output = results_root / f"runs_{model}"
+
+    count = runner.run_scenarios(
+        protocol_path=Path(
+            "experiments/matching_fairness/configs/protocol_sub08_seed42.json"
+        ),
+        artifact_root=artifact_root,
+        trial_manifest_path=trial_manifest,
+        output_dir=output,
+        model=model,
+    )
+
+    assert count == 150
+    summaries = sorted(output.rglob("summary.json"))
+    ledgers = sorted(output.rglob("per_query.csv"))
+    assert len(summaries) == len(ledgers) == 30
+    assert (output / model / "subj08" / "seed42").is_dir()
+    assert not any(
+        (output / other).exists() for other in set(runner._MODEL_ORDER) - {model}
+    )
+    records = [
+        record
+        for path in summaries
+        for record in json.loads(path.read_text(encoding="utf-8"))[
+            "decoder_records"
+        ]
+    ]
+    runner._validate_record_grid(records, models=(model,))
+
+
+def test_run_scenarios_cli_accepts_one_formal_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_scenarios.py",
+            "--artifact-root",
+            "matrices",
+            "--trial-manifest",
+            "trial.json",
+            "--output-dir",
+            "runs_nice",
+            "--model",
+            "nice",
+        ],
+    )
+    assert runner.parse_args().model == "nice"
+
+
+def test_single_model_loader_validates_identity_trial_hash_and_real_halves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    root = tmp_path / "matrices"
+    model_dir = root / "nice"
+    for name in ("standard", "eeg_a", "eeg_b"):
+        (model_dir / name).mkdir(parents=True, exist_ok=True)
+    trial = tmp_path / "trial.json"
+    trial.write_text("{}\n", encoding="utf-8")
+    trial_hash = hashlib.sha256(trial.read_bytes()).hexdigest()
+    gallery = tuple(f"image-{index:03d}" for index in range(200))
+    base = {
+        "model_slug": "nice",
+        "checkpoint_role": "val_selected_formal",
+        "checkpoint": "best_val.pth",
+        "checkpoint_sha256": "1" * 64,
+        "checkpoint_manifest_sha256": "2" * 64,
+        "source_lock": {},
+        "asset_lock_manifest_sha256": "3" * 64,
+        "asset_lock": {},
+        "input_sha256": {},
+        "logit_scale_type": "exp",
+        "trial_manifest_sha256": trial_hash,
+        "subject": "sub-08",
+        "seed": 42,
+        "native_metrics": {
+            "top1_count": 200,
+            "top5_count": 200,
+            "sample_count": 200,
+        },
+    }
+
+    def make(half: str, query_hash: str) -> ScoreArtifact:
+        return ScoreArtifact(
+            similarity=np.eye(200),
+            query_ids=gallery,
+            gallery_entry_ids=gallery,
+            gallery_canonical_ids=gallery,
+            target_canonical_ids=gallery,
+            metadata={
+                **base,
+                "trial_half": half,
+                "query_embeddings_sha256": query_hash,
+            },
+        )
+
+    artifacts = {
+        "standard": make("standard", "4" * 64),
+        "eeg_a": make("a", "5" * 64),
+        "eeg_b": make("b", "6" * 64),
+    }
+    monkeypatch.setattr(
+        runner,
+        "read_score_artifact",
+        lambda path: artifacts[path.name],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_score_artifact_sha256",
+        lambda path: hashlib.sha256(path.name.encode()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_validate_formal_artifact_provenance",
+        lambda *_args, **_kwargs: None,
+    )
+    seen = []
+    monkeypatch.setattr(
+        runner,
+        "validate_trial_manifest",
+        lambda manifest, ids: seen.append((manifest, ids)),
+    )
+
+    loaded, hashes, actual_trial_hash = runner._load_single_model_artifacts(
+        root,
+        model="nice",
+        trial_manifest_path=trial,
+        expected_image_count=200,
+        protocol_sha256="7" * 64,
+    )
+
+    assert set(loaded) == set(hashes) == {"standard", "a", "b"}
+    assert actual_trial_hash == trial_hash
+    assert seen == [({}, gallery)]
+    artifacts["eeg_b"] = make("b", "5" * 64)
+    with pytest.raises(ValueError, match="EEG-A and EEG-B"):
+        runner._load_single_model_artifacts(
+            root,
+            model="nice",
+            trial_manifest_path=trial,
+            expected_image_count=200,
+            protocol_sha256="7" * 64,
+        )

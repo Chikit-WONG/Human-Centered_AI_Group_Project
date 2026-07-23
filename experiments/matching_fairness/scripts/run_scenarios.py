@@ -27,6 +27,7 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from matching_fairness.artifacts import (  # noqa: E402
     ScoreArtifact,
+    independent_ranks,
     publish_staged_directory,
     read_score_artifact,
 )
@@ -41,8 +42,10 @@ from matching_fairness.formal_artifacts import (  # noqa: E402
     validate_brainrw_export_tree,
 )
 from matching_fairness.native_export import (  # noqa: E402
+    _formal_model_identity,
     _formal_artifact_inventory,
     _score_artifact_sha256,
+    _validate_formal_artifact_provenance,
 )
 from matching_fairness.scenarios import (  # noqa: E402
     ScenarioSpec,
@@ -63,7 +66,6 @@ _HALF_DIRECTORIES = {
     "a": "eeg_a",
     "b": "eeg_b",
 }
-_EXPECTED_RECORDS = 3 * 30 * 5
 _RUN_MANIFEST_ALGORITHM = "AIAA3800-MATCHING-FAIRNESS-RUN-v1"
 
 
@@ -421,22 +423,37 @@ def _scenario_artifacts(
     return tuple(cells)
 
 
-def _validate_record_grid(records: list[dict[str, object]]) -> None:
+def _validate_record_grid(
+    records: list[dict[str, object]],
+    *,
+    models: Sequence[str] = _MODEL_ORDER,
+) -> None:
     """Fail closed unless every formal model/scenario/decoder cell is unique."""
 
-    if len(records) != _EXPECTED_RECORDS:
+    selected_models = tuple(models)
+    if (
+        not selected_models
+        or len(set(selected_models)) != len(selected_models)
+        or any(model not in _MODEL_ORDER for model in selected_models)
+    ):
+        raise ValueError("record grid models must be unique formal model slugs")
+    expected_records = len(selected_models) * 30 * len(DECODER_NAMES)
+    if len(records) != expected_records:
         raise ValueError(
-            f"formal fairness run requires exactly 450 decoder records; got {len(records)}"
+            f"formal fairness run requires exactly {expected_records} decoder records; "
+            f"got {len(records)}"
         )
     keys = [
         (record.get("model"), record.get("scenario_index"), record.get("decoder"))
         for record in records
     ]
-    if len(set(keys)) != _EXPECTED_RECORDS:
-        raise ValueError("formal decoder records must use 450 unique grid keys")
+    if len(set(keys)) != expected_records:
+        raise ValueError(
+            f"formal decoder records must use {expected_records} unique grid keys"
+        )
     expected = {
         (model, scenario_index, decoder)
-        for model in _MODEL_ORDER
+        for model in selected_models
         for scenario_index in range(30)
         for decoder in DECODER_NAMES
     }
@@ -450,6 +467,7 @@ def run_scenarios(
     artifact_root: Path,
     trial_manifest_path: Path,
     output_dir: Path,
+    model: str | None = None,
 ) -> int:
     """Validate sealed inputs, evaluate all cells, then atomically publish."""
 
@@ -465,17 +483,34 @@ def run_scenarios(
     )
     protocol = Protocol.load(protocol_path)
     protocol.assert_formal_scope()
-    artifacts, artifact_hashes, trial_manifest_sha256 = _load_formal_artifacts(
-        artifact_root,
-        trial_manifest_path=trial_manifest_path,
-        expected_image_count=200,
-        protocol_sha256=hashlib.sha256(
-            _read_regular_file_nofollow(protocol_path, "formal protocol")
-        ).hexdigest(),
-    )
-    common_gallery = artifacts["nice"]["standard"].gallery_canonical_ids
-    for model in _MODEL_ORDER:
-        if artifacts[model]["standard"].gallery_canonical_ids != common_gallery:
+    if model is not None and model not in _MODEL_ORDER:
+        raise ValueError(f"unsupported formal artifact model: {model}")
+    selected_models = _MODEL_ORDER if model is None else (model,)
+    protocol_sha256 = hashlib.sha256(
+        _read_regular_file_nofollow(protocol_path, "formal protocol")
+    ).hexdigest()
+    if model is None:
+        artifacts, artifact_hashes, trial_manifest_sha256 = _load_formal_artifacts(
+            artifact_root,
+            trial_manifest_path=trial_manifest_path,
+            expected_image_count=200,
+            protocol_sha256=protocol_sha256,
+        )
+    else:
+        model_artifacts, model_hashes, trial_manifest_sha256 = (
+            _load_single_model_artifacts(
+                artifact_root,
+                model=model,
+                trial_manifest_path=trial_manifest_path,
+                expected_image_count=200,
+                protocol_sha256=protocol_sha256,
+            )
+        )
+        artifacts = {model: model_artifacts}
+        artifact_hashes = {model: model_hashes}
+    common_gallery = artifacts[selected_models[0]]["standard"].gallery_canonical_ids
+    for selected_model in selected_models:
+        if artifacts[selected_model]["standard"].gallery_canonical_ids != common_gallery:
             raise ValueError("formal models must share exact canonical gallery order")
 
     configs = _decoder_configs(
@@ -500,11 +535,11 @@ def run_scenarios(
             staging / "scenario_manifest.json",
             plan.manifest_bytes,
         )
-        for model in _MODEL_ORDER:
+        for selected_model in selected_models:
             cells = _scenario_artifacts(
-                artifacts[model]["standard"],
-                artifacts[model]["a"],
-                artifacts[model]["b"],
+                artifacts[selected_model]["standard"],
+                artifacts[selected_model]["a"],
+                artifacts[selected_model]["b"],
                 plan=plan,
             )
             for cell in cells:
@@ -512,12 +547,13 @@ def run_scenarios(
                     evaluate_artifact(cell.artifact, config) for config in configs
                 )
                 cell_records = [
-                    _result_record(model, cell, result) for result in evaluations
+                    _result_record(selected_model, cell, result)
+                    for result in evaluations
                 ]
                 records.extend(cell_records)
                 _write_cell(
                     staging,
-                    model=model,
+                    model=selected_model,
                     subject=protocol.subject,
                     seed=protocol.seed,
                     cell=cell,
@@ -525,11 +561,11 @@ def run_scenarios(
                     records=cell_records,
                     source_hashes=_cell_source_hashes(
                         cell,
-                        artifact_hashes[model],
+                        artifact_hashes[selected_model],
                     ),
                     scenario_manifest_sha256=plan.manifest_sha256,
                 )
-        _validate_record_grid(records)
+        _validate_record_grid(records, models=selected_models)
         manifest_path = staging / "scenario_manifest.json"
         _validate_scenario_manifest(
             manifest_path.read_bytes(),
@@ -537,8 +573,11 @@ def run_scenarios(
         )
         summaries = tuple(staging.rglob("summary.json"))
         ledgers = tuple(staging.rglob("per_query.csv"))
-        if len(summaries) != 90 or len(ledgers) != 90:
-            raise RuntimeError("formal run must contain exactly 90 JSON/CSV result pairs")
+        expected_cells = len(selected_models) * 30
+        if len(summaries) != expected_cells or len(ledgers) != expected_cells:
+            raise RuntimeError(
+                f"formal run must contain exactly {expected_cells} JSON/CSV result pairs"
+            )
         publish_staged_directory(staging, output_dir)
     finally:
         if os.path.lexists(staging):
@@ -758,6 +797,90 @@ def _load_formal_artifacts(
     return artifacts, hashes, trial_hash
 
 
+def _load_single_model_artifacts(
+    artifact_root: Path,
+    *,
+    model: str,
+    trial_manifest_path: Path,
+    expected_image_count: int,
+    protocol_sha256: str,
+) -> tuple[dict[str, ScoreArtifact], dict[str, str], str]:
+    """Strictly load one baseline without requiring unrelated baseline outputs."""
+
+    if model not in _MODEL_ORDER:
+        raise ValueError(f"unsupported formal artifact model: {model}")
+    artifact_root = _validated_existing_directory(artifact_root, "formal artifact root")
+    trial_manifest_path = _validated_existing_file(trial_manifest_path, "trial manifest")
+    if re.fullmatch(r"[0-9a-f]{64}", protocol_sha256) is None:
+        raise ValueError("formal protocol SHA-256 is invalid")
+    model_dir = artifact_root / model
+    if model_dir.is_symlink() or not model_dir.is_dir():
+        raise ValueError(f"formal model directory is invalid: {model}")
+    trial_bytes = _read_regular_file_nofollow(trial_manifest_path, "trial manifest")
+    trial_hash = hashlib.sha256(trial_bytes).hexdigest()
+    artifacts: dict[str, ScoreArtifact] = {}
+    hashes: dict[str, str] = {}
+    common_gallery: tuple[str, ...] | None = None
+    model_identity: dict[str, object] | None = None
+    expected_role = "fixed_formal" if model == "our_project" else "val_selected_formal"
+    for half, directory in _HALF_DIRECTORIES.items():
+        path = model_dir / directory
+        artifact = read_score_artifact(path)
+        metadata = artifact.metadata
+        if (
+            artifact.similarity.shape != (expected_image_count, expected_image_count)
+            or metadata.get("model_slug") != model
+            or metadata.get("trial_half") != half
+            or metadata.get("checkpoint_role") != expected_role
+            or metadata.get("subject") != "sub-08"
+            or metadata.get("seed") != 42
+            or metadata.get("trial_manifest_sha256") != trial_hash
+            or not (
+                artifact.query_ids
+                == artifact.target_canonical_ids
+                == artifact.gallery_entry_ids
+                == artifact.gallery_canonical_ids
+            )
+        ):
+            raise ValueError(f"formal artifact identity mismatch: {(model, half)}")
+        ranks = independent_ranks(artifact)
+        expected_metrics = {
+            "top1_count": int((ranks <= 1).sum()),
+            "top5_count": int((ranks <= 5).sum()),
+            "sample_count": len(ranks),
+        }
+        if metadata.get("native_metrics") != expected_metrics:
+            raise ValueError(f"formal artifact metric parity failed: {(model, half)}")
+        _validate_formal_artifact_provenance(
+            artifact, model, expected_image_count=expected_image_count
+        )
+        if model == "our_project" and metadata.get("protocol_sha256") != protocol_sha256:
+            raise ValueError("BrainRW artifact does not bind the supplied protocol")
+        identity = _formal_model_identity(metadata, model)
+        if model_identity is None:
+            model_identity = identity
+        elif identity != model_identity:
+            raise ValueError("model provenance must be identical across halves")
+        if common_gallery is None:
+            common_gallery = artifact.gallery_canonical_ids
+        elif artifact.gallery_canonical_ids != common_gallery:
+            raise ValueError("model artifacts do not share canonical gallery order")
+        artifacts[half] = artifact
+        hashes[half] = _score_artifact_sha256(path)
+    if (
+        artifacts["a"].metadata.get("query_embeddings_sha256")
+        == artifacts["b"].metadata.get("query_embeddings_sha256")
+    ):
+        raise ValueError("EEG-A and EEG-B query embeddings are identical")
+    try:
+        trial_manifest = json.loads(trial_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("trial manifest must be valid UTF-8 JSON") from error
+    assert common_gallery is not None
+    validate_trial_manifest(trial_manifest, common_gallery)
+    return artifacts, hashes, trial_hash
+
+
 def _result_record(
     model: str,
     cell: ScenarioCell,
@@ -890,6 +1013,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--trial-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--model", choices=_MODEL_ORDER)
     return parser.parse_args()
 
 
@@ -900,6 +1024,7 @@ def main() -> None:
         artifact_root=args.artifact_root,
         trial_manifest_path=args.trial_manifest,
         output_dir=args.output_dir,
+        model=args.model,
     )
     print(f"published {count} decoder records to {args.output_dir}")
 
