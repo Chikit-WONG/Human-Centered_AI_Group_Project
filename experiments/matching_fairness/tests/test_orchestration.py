@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -19,7 +20,6 @@ RUNNER = EXPERIMENT_ROOT / "run_matching_fairness.sh"
 SUBMITTER_PATH = EXPERIMENT_ROOT / "scripts/submit_pipeline.py"
 SLURM_ROOT = EXPERIMENT_ROOT / "slurm"
 LOGS_FRAGMENT = "/test/brain-rw/logs/matching_fairness_v3/"
-REPORTING_TEST_PATH = EXPERIMENT_ROOT / "tests/test_reporting.py"
 
 
 def _load_submitter():
@@ -34,17 +34,6 @@ def _load_submitter():
 def _load_script(name: str):
     path = EXPERIMENT_ROOT / "scripts" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"orchestration_{name}", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_reporting_fixture_helpers():
-    spec = importlib.util.spec_from_file_location(
-        "orchestration_reporting_fixture_helpers", REPORTING_TEST_PATH
-    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -114,42 +103,377 @@ def test_dry_run_does_not_create_runtime_directories(tmp_path: Path) -> None:
     assert not layout.logs_root.exists()
 
 
-def test_fixture_pipeline_is_byte_stable(tmp_path: Path) -> None:
-    helpers = _load_reporting_fixture_helpers()
+def _write_canonical_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _checkpoint_manifest(model: str) -> dict[str, object]:
+    checkpoint = {
+        "epoch": 1,
+        "val_loss": 0.1,
+        "checkpoint": "epoch_0001.pth",
+        "sha256": "e" * 64,
+    }
+    return {
+        "schema_version": 1,
+        "model": model,
+        "encoder_type": "NICE" if model == "nice" else "ATMS",
+        "subject": "sub-08",
+        "seed": 42,
+        "source": {
+            "url": "https://github.com/dongyangli-del/EEG_Image_decode.git",
+            "branch": "develop",
+            "commit": "f" * 40,
+            "checkout_sha256": "a" * 64,
+        },
+        "inputs": {
+            "training_eeg": {
+                "name": "preprocessed_eeg_training.npy",
+                "sha256": "b" * 64,
+            },
+            "training_features": {
+                "name": "ViT-H-14_features_train.pt",
+                "sha256": "c" * 64,
+            },
+        },
+        "hyperparameters": {
+            "epochs": 500,
+            "batch_size": 1024,
+            "learning_rate": 3e-4,
+            "val_ratio": 0.1,
+            "early_stopping_patience": 10,
+            "ema_decay": 0.999,
+            "logit_scale_type": "exp",
+            "avg_trials": True,
+            "n_chans": 63,
+            "n_times": 250,
+        },
+        "encoder_behavior": {
+            "use_subject_id": model == "atm_s",
+            "normalize_feats": model == "atm_s",
+        },
+        "checkpoints": [checkpoint],
+        "selection": {
+            "epoch": 1,
+            "val_loss": 0.1,
+            "checkpoint": "epoch_0001.pth",
+        },
+        "best_checkpoint": {"name": "best_val.pth", "sha256": "e" * 64},
+        "history": {"name": "history.csv", "sha256": "d" * 64},
+        "stopped_early": False,
+    }
+
+
+def _write_sealed_fairness_inputs(root: Path, protocol: Path) -> tuple[Path, Path]:
+    import numpy as np
+
+    from matching_fairness.artifacts import ScoreArtifact, write_score_artifact
+    from matching_fairness.native_export import (
+        _ASSET_RELATIVE_PATHS,
+        _formal_artifact_inventory,
+        _score_artifact_sha256,
+    )
+    from matching_fairness.provenance import sha256_file, sha256_path
+    from matching_fairness.trial_splits import build_trial_manifest
+
+    ids = tuple(f"image-{index:03d}" for index in range(200))
+    sessions = np.tile(np.repeat(np.arange(4), 20), (200, 1))
+    trial_manifest = root / "trial_manifest.json"
+    _write_canonical_json(
+        trial_manifest,
+        build_trial_manifest(ids, sessions, seed=42),
+    )
+    trial_sha256 = sha256_file(trial_manifest)
+    protocol_sha256 = sha256_file(protocol)
+    matrices = root / "matrices"
+    checkpoints = root / "checkpoints"
+    standard_similarity = np.eye(200, dtype=np.float32)
+    eeg_a_similarity = standard_similarity.copy()
+    eeg_b_similarity = standard_similarity.copy()
+    rows = np.arange(200)
+    eeg_a_similarity[rows, (rows + 1) % 200] = 0.01
+    eeg_b_similarity[rows, (rows + 2) % 200] = 0.02
+    similarity_by_half = {
+        "standard": standard_similarity,
+        "a": eeg_a_similarity,
+        "b": eeg_b_similarity,
+    }
+    native_metrics = {
+        "top1_count": 200,
+        "top5_count": 200,
+        "sample_count": 200,
+    }
+    source_lock = {
+        "url": "https://github.com/dongyangli-del/EEG_Image_decode.git",
+        "branch": "develop",
+        "commit": "f" * 40,
+        "checkout_sha256": "a" * 64,
+    }
+    asset_hashes = {
+        _ASSET_RELATIVE_PATHS[0]: "b" * 64,
+        _ASSET_RELATIVE_PATHS[1]: "7" * 64,
+        _ASSET_RELATIVE_PATHS[2]: "c" * 64,
+        _ASSET_RELATIVE_PATHS[3]: "8" * 64,
+    }
+    asset_lock = {
+        "repo_id": "LidongYang/EEG_Image_decode",
+        "repo_type": "dataset",
+        "asset_root": "/sealed/assets",
+        "files": {
+            name: {"bytes": 1, "sha256": digest}
+            for name, digest in asset_hashes.items()
+        },
+    }
+    role_by_directory = {"standard": "standard", "eeg_a": "a", "eeg_b": "b"}
+
+    for model_index, model in enumerate(("nice", "atm_s")):
+        checkpoint_path = checkpoints / model / "checkpoint_manifest.json"
+        _write_canonical_json(checkpoint_path, _checkpoint_manifest(model))
+        checkpoint_manifest_sha256 = sha256_file(checkpoint_path)
+        for half_index, (directory, half) in enumerate(role_by_directory.items()):
+            metadata = {
+                "model_slug": model,
+                "trial_half": half,
+                "checkpoint_role": "val_selected_formal",
+                "checkpoint": "/sealed/best_val.pth",
+                "checkpoint_sha256": "e" * 64,
+                "checkpoint_manifest_sha256": checkpoint_manifest_sha256,
+                "source_lock": source_lock,
+                "asset_lock_manifest_sha256": "9" * 64,
+                "asset_lock": asset_lock,
+                "input_sha256": {
+                    "test_eeg": asset_hashes[_ASSET_RELATIVE_PATHS[1]],
+                    "test_features": asset_hashes[_ASSET_RELATIVE_PATHS[3]],
+                    "trial_manifest": trial_sha256,
+                },
+                "trial_manifest_sha256": trial_sha256,
+                "subject": "sub-08",
+                "seed": 42,
+                "logit_scale_type": "exp",
+                "effective_logit_scale": 1.0,
+                "query_embeddings_sha256": (
+                    f"{model_index * 3 + half_index + 1:064x}"
+                ),
+                "native_metrics": native_metrics,
+            }
+            write_score_artifact(
+                matrices / model / directory,
+                ScoreArtifact(
+                    similarity=similarity_by_half[half],
+                    query_ids=ids,
+                    gallery_entry_ids=ids,
+                    gallery_canonical_ids=ids,
+                    target_canonical_ids=ids,
+                    metadata=metadata,
+                ),
+            )
+
+    brain_inputs = {
+        "protocol_sha256": protocol_sha256,
+        "trial_manifest_sha256": trial_sha256,
+        "brain_test_sha256": "3" * 64,
+        "evaluator_sha256": "4" * 64,
+        "test_image_tree_sha256": "5" * 64,
+        "model_content_sha256": {
+            "brain_model": "6" * 64,
+            "vision_adapter": "7" * 64,
+            "pretrained_vision_base": "8" * 64,
+        },
+    }
+    brain_root = matrices / "our_project"
+    for half_index, (directory, half) in enumerate(role_by_directory.items()):
+        metadata = {
+            "model_slug": "our_project",
+            "trial_half": half,
+            "checkpoint_role": "fixed_formal",
+            "checkpoint": "/sealed/brain_model",
+            "checkpoint_content_sha256": "6" * 64,
+            "similarity": "cosine",
+            "query_embeddings_sha256": f"{half_index + 10:064x}",
+            "subject": "sub-08",
+            "seed": 42,
+            "trial_manifest_sha256": trial_sha256,
+            "protocol_sha256": protocol_sha256,
+            "brain_test_sha256": "3" * 64,
+            "model_content_sha256": brain_inputs["model_content_sha256"],
+            "evaluator_version": "AIAA3800-BRAINRW-FORMAL-v1",
+            "evaluator_sha256": "4" * 64,
+            "runtime_inputs": {
+                "test_image_tree_sha256": "5" * 64,
+                "selected_channel_indices": list(range(46, 63)),
+                "time_slice": [0, 250],
+                "dataset_name": "things",
+                "expected_sample_count": 200,
+            },
+            "native_metrics": native_metrics,
+        }
+        write_score_artifact(
+            brain_root / directory,
+            ScoreArtifact(
+                similarity=similarity_by_half[half],
+                query_ids=ids,
+                gallery_entry_ids=ids,
+                gallery_canonical_ids=ids,
+                target_canonical_ids=ids,
+                metadata=metadata,
+            ),
+        )
+        run = brain_root / "runs" / directory
+        run.mkdir(parents=True)
+        _write_canonical_json(run / "metrics.json", native_metrics)
+        (run / "predictions.csv").write_text(
+            "query_id,predicted_id\nimage-000,image-000\n",
+            encoding="utf-8",
+        )
+    _write_canonical_json(
+        brain_root / "export_manifest.json",
+        {
+            "schema_version": 1,
+            "scope": "fixed_formal_export",
+            "checkpoint_role": "fixed_formal",
+            "model_slug": "our_project",
+            "subject": "sub-08",
+            "seed": 42,
+            "artifacts": {
+                directory: {
+                    "path": directory,
+                    "sha256": _score_artifact_sha256(brain_root / directory),
+                }
+                for directory in role_by_directory
+            },
+            "runs": {
+                directory: {
+                    "path": f"runs/{directory}",
+                    "sha256": sha256_path(brain_root / "runs" / directory),
+                }
+                for directory in role_by_directory
+            },
+            "inputs": brain_inputs,
+        },
+    )
+
+    inventory = _formal_artifact_inventory(
+        [
+            matrices / model / directory
+            for model in ("nice", "atm_s", "our_project")
+            for directory in role_by_directory
+        ],
+        expected_image_count=200,
+    )
+    audit_run = {
+        "epoch": 1,
+        "checkpoint": "/sealed/epoch_0001.pth",
+        "checkpoint_sha256": "e" * 64,
+        "effective_logit_scale": 1.0,
+        "top1_count": 200,
+        "top5_count": 200,
+        "sample_count": 200,
+    }
+    for model in ("nice", "atm_s"):
+        _write_canonical_json(
+            matrices / model / "best_test_audit.json",
+            {
+                "schema_version": 1,
+                "scope": "best_test_audit_only",
+                "model_slug": model,
+                "checkpoint_policy": "every_epoch_checkpoint",
+                "fairness_artifact_created": False,
+                "formal_artifact_inventory": inventory,
+                "runs": [audit_run],
+                "best_test": audit_run,
+            },
+        )
+    return matrices, trial_manifest
+
+
+def _file_hash_snapshot(root: Path, protocol: Path | None = None) -> dict[str, str]:
+    files = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+    if protocol is not None:
+        files["<formal-protocol>"] = hashlib.sha256(protocol.read_bytes()).hexdigest()
+    return files
+
+
+def test_fixture_pipeline_is_byte_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_runner = _load_script("run_scenarios")
+    production_calls: list[Path] = []
+    production_run = scenario_runner.run_scenarios
+
+    def counted_production_run(**kwargs):
+        production_calls.append(Path(kwargs["output_dir"]))
+        return production_run(**kwargs)
+
+    monkeypatch.setattr(scenario_runner, "run_scenarios", counted_production_run)
     aggregate_results = _load_script("aggregate_results").aggregate_results
+    protocol = EXPERIMENT_ROOT / "configs/protocol_sub08_seed42.json"
+    sealed_root = tmp_path / "sealed-inputs"
+    sealed_root.mkdir()
+    matrices, trial_manifest = _write_sealed_fairness_inputs(sealed_root, protocol)
+    original_sealed_inputs = _file_hash_snapshot(sealed_root, protocol)
+    input_snapshots: list[dict[str, str]] = []
+    aggregate_input_snapshots: list[dict[str, str]] = []
+    run_snapshots: list[dict[str, str]] = []
+    roots: list[Path] = []
+
+    for name in ("fixture-a", "fixture-b"):
+        root = tmp_path / name / "matching_fairness_v3"
+        root.mkdir(parents=True)
+        shutil.copytree(sealed_root / "checkpoints", root / "checkpoints")
+        shutil.copytree(matrices, root / "matrices")
+        input_snapshots.append(_file_hash_snapshot(sealed_root, protocol))
+        aggregate_input_snapshots.append(
+            {
+                f"checkpoints/{name}": digest
+                for name, digest in _file_hash_snapshot(root / "checkpoints").items()
+            }
+            | {
+                f"matrices/{name}": digest
+                for name, digest in _file_hash_snapshot(root / "matrices").items()
+            }
+        )
+
+        count = scenario_runner.run_scenarios(
+            protocol_path=protocol,
+            artifact_root=matrices,
+            trial_manifest_path=trial_manifest,
+            output_dir=root / "runs",
+        )
+        assert count == 450
+        assert len(tuple((root / "runs").rglob("summary.json"))) == 90
+        assert len(tuple((root / "runs").rglob("per_query.csv"))) == 90
+        assert _file_hash_snapshot(sealed_root, protocol) == original_sealed_inputs
+        run_snapshots.append(_file_hash_snapshot(root / "runs"))
+        roots.append(root)
+
+    assert len(production_calls) == 2
+    assert input_snapshots[0] == input_snapshots[1] == original_sealed_inputs
+    assert aggregate_input_snapshots[0] == aggregate_input_snapshots[1]
+    assert run_snapshots[0] == run_snapshots[1]
+
     compared = (
         "aggregate_metrics.csv",
         "aggregate_summary.json",
         "RESULTS.md",
         "RESULTS_ZH.md",
     )
-    hashes: list[dict[str, str]] = []
-
-    for name in ("fixture-a", "fixture-b"):
-        root = tmp_path / name / "matching_fairness_v3"
-        root.mkdir(parents=True)
-        source_hashes = helpers._write_audit_inputs(root)
-        for model in ("nice", "atm_s"):
-            audit_path = root / "matrices" / model / "best_test_audit.json"
-            audit = json.loads(audit_path.read_text(encoding="utf-8"))
-            for entry in audit["formal_artifact_inventory"]:
-                role = {"standard": "standard", "a": "eeg_a", "b": "eeg_b"}[
-                    entry["trial_half"]
-                ]
-                entry["path"] = f"matrices/{entry['model_slug']}/{role}"
-            helpers._write_canonical_json(audit_path, audit)
-        helpers._write_task7_fixture(root / "runs", source_hashes)
-
+    hashes = []
+    for root in roots:
         aggregate = aggregate_results(root)
         hashes.append(
             {
-                filename: hashlib.sha256(
-                    (aggregate / filename).read_bytes()
-                ).hexdigest()
+                filename: hashlib.sha256((aggregate / filename).read_bytes()).hexdigest()
                 for filename in compared
             }
         )
-
     assert hashes[0] == hashes[1]
 
 

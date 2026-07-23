@@ -24,13 +24,15 @@ from matching_fairness.evaluation import (
 SCRIPT = Path("experiments/matching_fairness/scripts/run_scenarios.py")
 
 
-def test_run_scenarios_direct_cli_help_resolves_package_without_pythonpath() -> None:
+def test_run_scenarios_direct_cli_help_resolves_package_without_pythonpath(
+    tmp_path: Path,
+) -> None:
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
 
     completed = subprocess.run(
-        [sys.executable, str(SCRIPT), "--help"],
-        cwd=Path.cwd(),
+        [sys.executable, str(SCRIPT.resolve()), "--help"],
+        cwd=tmp_path,
         env=environment,
         check=False,
         capture_output=True,
