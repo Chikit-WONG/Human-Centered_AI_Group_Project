@@ -1250,7 +1250,7 @@ def _write_brainrw_snapshot_fixture(layout) -> bytes:
         "text": np.asarray([[image_id] * 80 for image_id in image_ids]),
         "session": sessions,
         "ch_names": [f"channel-{index}" for index in range(63)],
-        "times": np.arange(250),
+        "times": np.arange(300) / 250.0 - 0.2,
     }
     layout.brainrw_test.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, layout.brainrw_test)
@@ -1275,6 +1275,18 @@ def _write_brainrw_snapshot_fixture(layout) -> bytes:
     return encoded
 
 
+def _replace_brainrw_snapshot_times(layout, times) -> None:
+    import torch
+
+    payload = torch.load(layout.brainrw_test, map_location="cpu", weights_only=False)
+    payload["times"] = times
+    torch.save(payload, layout.brainrw_test)
+    encoded = layout.brainrw_test.read_bytes()
+    preflight = json.loads(layout.preflight_manifest.read_text(encoding="utf-8"))
+    preflight["brainrw"]["sha256"] = hashlib.sha256(encoded).hexdigest()
+    _write_canonical_json(layout.preflight_manifest, preflight)
+
+
 def test_trial_manifest_deserializes_only_verified_snapshot_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1295,6 +1307,126 @@ def test_trial_manifest_deserializes_only_verified_snapshot_bytes(
     manifest = module._trial_manifest_payload(layout)
     assert manifest["seed"] == 42
     assert observed == [expected]
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        pytest.param(
+            "wrong-shape", "shape exactly \\(300,\\)", id="wrong-shape"
+        ),
+        pytest.param(
+            "wrong-grid",
+            "expected 250 Hz full grid beginning at -0.2",
+            id="wrong-grid",
+        ),
+        pytest.param(
+            "non-finite", "finite numeric values", id="non-finite"
+        ),
+    ),
+)
+def test_trial_manifest_rejects_malformed_time_metadata(
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    import numpy as np
+
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _write_brainrw_snapshot_fixture(layout)
+    if case == "wrong-shape":
+        replacement = np.arange(299) / 250.0 - 0.2
+    elif case == "wrong-grid":
+        replacement = np.arange(300) / 250.0 - 0.196
+    else:
+        replacement = np.arange(300) / 250.0 - 0.2
+        replacement[125] = np.nan
+    _replace_brainrw_snapshot_times(layout, replacement)
+
+    with pytest.raises(ValueError, match=message):
+        module._trial_manifest_payload(layout)
+
+
+def test_partial_preflight_requires_explicit_overwrite_and_rebuilds_only_derived(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    phase_manifest = module.phase_manifest_path(layout, "preflight")
+    layout.preflight_manifest.parent.mkdir(parents=True, exist_ok=True)
+    layout.preflight_manifest.write_bytes(b"legacy-partial-preflight\n")
+    layout.source_lock.write_bytes(b"sealed-source-lock\n")
+    layout.asset_lock.write_bytes(b"sealed-asset-lock\n")
+    source_before = layout.source_lock.read_bytes()
+    asset_before = layout.asset_lock.read_bytes()
+    observed_removals: list[tuple[Path, Path]] = []
+    real_safe_remove = module._safe_remove_derived
+
+    def safe_remove(path: Path, root: Path) -> None:
+        observed_removals.append((path, root))
+        real_safe_remove(path, root)
+
+    def ensure_source_and_assets(candidate) -> None:
+        assert candidate.source_lock.read_bytes() == source_before
+        assert candidate.asset_lock.read_bytes() == asset_before
+
+    def run_preflight_command(_command: list[str]) -> None:
+        layout.preflight_manifest.write_text(
+            '{"status":"passed"}\n', encoding="utf-8"
+        )
+
+    def ensure_trial_manifest(_layout) -> None:
+        layout.trial_manifest.write_text(
+            '{"seed":42}\n', encoding="utf-8"
+        )
+
+    monkeypatch.setattr(module, "_safe_remove_derived", safe_remove)
+    monkeypatch.setattr(module, "_ensure_source_and_assets", ensure_source_and_assets)
+    monkeypatch.setattr(module, "_run", run_preflight_command)
+    monkeypatch.setattr(module, "_ensure_trial_manifest", ensure_trial_manifest)
+    monkeypatch.setattr(
+        module,
+        "_phase_inputs",
+        lambda _layout, phase: {"phase": phase, "sealed": "inputs"},
+    )
+
+    with pytest.raises(ValueError, match="partial|orphaned"):
+        module.run_preflight(layout, overwrite=False)
+    assert layout.preflight_manifest.read_bytes() == b"legacy-partial-preflight\n"
+    assert not layout.trial_manifest.exists()
+    assert not phase_manifest.exists()
+    assert observed_removals == []
+    assert layout.source_lock.read_bytes() == source_before
+    assert layout.asset_lock.read_bytes() == asset_before
+
+    assert module.run_preflight(layout, overwrite=True) == "run"
+    assert observed_removals == [
+        (layout.preflight_manifest, layout.manifests_root),
+        (layout.trial_manifest, layout.manifests_root),
+        (phase_manifest, layout.manifests_root),
+    ]
+    assert layout.preflight_manifest.is_file()
+    assert layout.trial_manifest.is_file()
+    assert phase_manifest.is_file()
+    assert json.loads(phase_manifest.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "phase": "preflight",
+        "subject": "sub-08",
+        "seed": 42,
+        "input_sha256": {"phase": "preflight", "sealed": "inputs"},
+        "output_sha256": {
+            "preflight": hashlib.sha256(
+                layout.preflight_manifest.read_bytes()
+            ).hexdigest(),
+            "trial_manifest": hashlib.sha256(
+                layout.trial_manifest.read_bytes()
+            ).hexdigest(),
+        },
+    }
+    assert layout.source_lock.read_bytes() == source_before
+    assert layout.asset_lock.read_bytes() == asset_before
 
 
 @pytest.mark.parametrize("mutation", ("replace", "in_place"))

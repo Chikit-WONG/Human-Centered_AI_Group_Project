@@ -1670,9 +1670,28 @@ def _trial_manifest_payload(layout: RuntimeLayout) -> dict[str, object]:
         or len(channels) != 63
         or any(not isinstance(value, str) or not value for value in channels)
         or len(set(channels)) != 63
-        or times.shape != (250,)
     ):
-        raise ValueError("BrainRW channel/time metadata schema is invalid")
+        raise ValueError("BrainRW channel metadata schema is invalid")
+    if times.shape != (300,):
+        raise ValueError("BrainRW time metadata must have shape exactly (300,)")
+    if not np.issubdtype(times.dtype, np.number) or not np.all(np.isfinite(times)):
+        raise ValueError("BrainRW time metadata must contain finite numeric values")
+    expected_full_times = np.arange(300) / 250.0 - 0.2
+    if not np.array_equal(times, expected_full_times):
+        raise ValueError(
+            "BrainRW time metadata must use the expected 250 Hz full grid "
+            "beginning at -0.2"
+        )
+    expected_eeg_times = expected_full_times[50:]
+    if (
+        times[50:].shape != (250,)
+        or times[50] != 0.0
+        or not np.array_equal(times[50:], expected_eeg_times)
+    ):
+        raise ValueError(
+            "BrainRW time metadata [50:] must align exactly to the 250 EEG samples "
+            "beginning at 0.0"
+        )
     pairs: list[tuple[str, object]] = []
     for image_row, session_row in zip(images, sessions):
         ids = {Path(str(value)).stem for value in image_row.tolist()}
@@ -1708,7 +1727,7 @@ def run_preflight(layout: RuntimeLayout, *, overwrite: bool) -> str:
         os.path.lexists(layout.trial_manifest),
         os.path.lexists(phase_manifest),
     )
-    if any(state) and not all(state):
+    if any(state) and not all(state) and not overwrite:
         raise ValueError("preflight output is partial or orphaned")
     prepare_runtime_directories(layout)
     _ensure_source_and_assets(layout)
