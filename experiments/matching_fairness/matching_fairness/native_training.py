@@ -114,7 +114,7 @@ def train_native(config: NativeTrainConfig) -> TrainingResult:
     """Train one official NICE or ATM-S encoder without constructing test data."""
     _validate_config(config)
     source_lock = _validate_source_lock(config.source_checkout, config.source_lock)
-    _claim_output_directory(config.output_dir)
+    _prepare_output_root(config.output_dir)
     with _official_source_context(config.source_checkout):
         return _train_native_in_context(config, source_lock)
 
@@ -305,12 +305,8 @@ def _validate_config(config: NativeTrainConfig) -> None:
         raise ValueError(f"training features must be named {_TRAINING_FEATURES_NAME}")
 
 
-def _claim_output_directory(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        path.mkdir()
-    except FileExistsError:
-        raise FileExistsError(f"output directory already exists: {path}") from None
+def _prepare_output_root(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def _validate_source_lock(checkout: Path, manifest: Path) -> SourceLock:

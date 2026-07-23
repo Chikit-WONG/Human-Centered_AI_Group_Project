@@ -517,6 +517,21 @@ def test_same_seed_restart_has_identical_history_hash(
     assert first.history_sha256 == second.history_sha256
 
 
+def test_nice_and_atm_s_can_share_output_root_with_model_level_claims(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "shared-results"
+
+    nice = train_native(_config(fake_native_inputs, output_dir, model="nice"))
+    atm_s = train_native(_config(fake_native_inputs, output_dir, model="atm_s"))
+
+    assert nice.checkpoint_dir == output_dir / "checkpoints/nice"
+    assert atm_s.checkpoint_dir == output_dir / "checkpoints/atm_s"
+    assert nice.manifest.is_file()
+    assert atm_s.manifest.is_file()
+
+
 def test_source_lock_is_validated_before_official_modules_are_loaded(
     fake_native_inputs: FakeNativeInputs,
     tmp_path: Path,
@@ -654,7 +669,7 @@ def test_existing_stale_output_is_rejected_without_modification(
         if path.is_file()
     }
 
-    with pytest.raises(FileExistsError, match="output directory already exists"):
+    with pytest.raises(FileExistsError, match="checkpoints/nice"):
         train_native(_config(fake_native_inputs, output_dir))
 
     after = {
@@ -665,17 +680,17 @@ def test_existing_stale_output_is_rejected_without_modification(
     assert after == before
 
 
-def test_existing_empty_output_directory_is_rejected_without_modification(
+def test_existing_empty_output_root_is_reused(
     fake_native_inputs: FakeNativeInputs,
     tmp_path: Path,
 ) -> None:
     output_dir = tmp_path / "empty-output"
     output_dir.mkdir()
 
-    with pytest.raises(FileExistsError, match="output directory already exists"):
-        train_native(_config(fake_native_inputs, output_dir))
+    result = train_native(_config(fake_native_inputs, output_dir))
 
-    assert tuple(output_dir.iterdir()) == ()
+    assert result.checkpoint_dir == output_dir / "checkpoints/nice"
+    assert result.manifest.is_file()
 
 
 def _make_additional_fake_inputs(root: Path, *, source_origin: int) -> FakeNativeInputs:
