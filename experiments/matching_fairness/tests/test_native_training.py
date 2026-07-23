@@ -29,6 +29,10 @@ class FakeNativeInputs:
     training_features: Path
 
 
+def _feature_bank(rows: int, width: int = 1_024) -> torch.Tensor:
+    return torch.ones(1).expand(rows, width)
+
+
 def _git(checkout: Path, *arguments: str) -> None:
     subprocess.run(
         ["git", "-C", str(checkout), *arguments],
@@ -110,8 +114,13 @@ def _write_fake_upstream(checkout: Path) -> None:
                     ]
                     self.text_features = preloaded_features["text_features"]
                     self.img_features = preloaded_features["img_features"]
-                    if eeg_path.read_bytes() == b"truncate text features":
+                    marker = eeg_path.read_bytes()
+                    if marker == b"truncate text features":
                         self.text_features = self.text_features[:1]
+                    elif marker == b"narrow image features":
+                        self.img_features = self.img_features[:, :1]
+                    elif marker == b"narrow text features":
+                        self.text_features = self.text_features[:, :1]
 
                 def __len__(self):
                     return len(self.data)
@@ -357,8 +366,8 @@ def fake_native_inputs(tmp_path: Path) -> FakeNativeInputs:
     training_features = tmp_path / "assets/ViT-H-14_features_train.pt"
     torch.save(
         {
-            "img_features": torch.ones(16_540, 1),
-            "text_features": torch.ones(1_654, 1),
+            "img_features": _feature_bank(16_540),
+            "text_features": _feature_bank(1_654),
         },
         training_features,
     )
@@ -555,8 +564,8 @@ def test_training_text_feature_bank_must_have_one_row_per_class(
 ) -> None:
     torch.save(
         {
-            "img_features": torch.ones(16_540, 1),
-            "text_features": torch.ones(1_653, 1),
+            "img_features": _feature_bank(16_540),
+            "text_features": _feature_bank(1_653),
         },
         fake_native_inputs.training_features,
     )
@@ -576,6 +585,59 @@ def test_post_materialization_text_features_must_keep_all_class_rows(
         match="official dataset text_features length must be 1,654",
     ):
         train_native(_config(fake_native_inputs, tmp_path / "truncated"))
+
+
+@pytest.mark.parametrize(
+    ("key", "rows"),
+    (("img_features", 16_540), ("text_features", 1_654)),
+)
+def test_training_feature_banks_require_exact_embedding_width(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+    key: str,
+    rows: int,
+) -> None:
+    features = {
+        "img_features": _feature_bank(16_540),
+        "text_features": _feature_bank(1_654),
+    }
+    features[key] = _feature_bank(rows, width=1)
+    torch.save(features, fake_native_inputs.training_features)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"training {key} shape must be \({rows}, 1024\), "
+            rf"found \({rows}, 1\)"
+        ),
+    ):
+        train_native(_config(fake_native_inputs, tmp_path / f"narrow-{key}"))
+
+
+@pytest.mark.parametrize(
+    ("marker", "key", "rows"),
+    (
+        (b"narrow image features", "img_features", 16_540),
+        (b"narrow text features", "text_features", 1_654),
+    ),
+)
+def test_post_materialization_feature_banks_require_exact_embedding_width(
+    fake_native_inputs: FakeNativeInputs,
+    tmp_path: Path,
+    marker: bytes,
+    key: str,
+    rows: int,
+) -> None:
+    fake_native_inputs.training_eeg.write_bytes(marker)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"official dataset {key} shape must be \({rows}, 1024\), "
+            rf"found \({rows}, 1\)"
+        ),
+    ):
+        train_native(_config(fake_native_inputs, tmp_path / f"dataset-{key}"))
 
 
 def test_existing_stale_output_is_rejected_without_modification(
@@ -656,8 +718,8 @@ def _make_additional_fake_inputs(root: Path, *, source_origin: int) -> FakeNativ
     training_features = root / "assets/ViT-H-14_features_train.pt"
     torch.save(
         {
-            "img_features": torch.ones(16_540, 1),
-            "text_features": torch.ones(1_654, 1),
+            "img_features": _feature_bank(16_540),
+            "text_features": _feature_bank(1_654),
         },
         training_features,
     )

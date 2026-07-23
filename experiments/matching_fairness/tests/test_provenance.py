@@ -383,6 +383,7 @@ def test_preflight_accepts_complete_tiny_fixtures(tmp_path: Path) -> None:
         train_image_feature_rows=6,
         train_text_feature_rows=3,
         test_feature_rows=2,
+        feature_width=2,
         session_counts={0: 1, 1: 1, 2: 1, 3: 1},
     )
     runtime = _valid_runtime()
@@ -440,10 +441,64 @@ def test_preflight_rejects_wrong_train_text_class_bank_row_count(
                 train_image_feature_rows=6,
                 train_text_feature_rows=3,
                 test_feature_rows=2,
+                feature_width=2,
                 session_counts={0: 1, 1: 1, 2: 1, 3: 1},
             ),
         )
     assert not manifest.exists()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "key", "rows"),
+    (
+        (ASSET_RELATIVE_PATHS[2], "img_features", 6),
+        (ASSET_RELATIVE_PATHS[2], "text_features", 3),
+        (ASSET_RELATIVE_PATHS[3], "img_features", 2),
+        (ASSET_RELATIVE_PATHS[3], "text_features", 2),
+    ),
+)
+def test_preflight_rejects_correct_rows_with_wrong_feature_width(
+    tmp_path: Path,
+    relative_path: str,
+    key: str,
+    rows: int,
+) -> None:
+    checkout = _make_checkout(tmp_path)
+    paths = _write_tiny_preflight_fixtures(tmp_path)
+    feature_path = paths["asset_root"] / relative_path
+    features = torch.load(feature_path, map_location="cpu", weights_only=True)
+    features[key] = torch.ones(rows, 3)
+    torch.save(features, feature_path)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"official feature {key} shape mismatch: "
+            rf"expected \({rows}, 2\), found \({rows}, 3\)"
+        ),
+    ):
+        run_preflight(
+            protocol_path=CONFIG,
+            checkout_path=checkout,
+            asset_root=paths["asset_root"],
+            brainrw_test_path=paths["brainrw_test"],
+            official_test_images=paths["image_root"],
+            manifest_path=tmp_path / "preflight.json",
+            runtime=_valid_runtime(),
+            expectations=PreflightExpectations(
+                eeg_tail=(3, 5),
+                test_shape=(2, 4, 3, 5),
+                train_image_feature_rows=6,
+                train_text_feature_rows=3,
+                test_feature_rows=2,
+                feature_width=2,
+                session_counts={0: 1, 1: 1, 2: 1, 3: 1},
+            ),
+        )
+
+
+def test_preflight_defaults_require_1024_feature_dimensions() -> None:
+    assert PreflightExpectations().feature_width == 1_024
 
 
 def test_preflight_rejects_escaping_asset_before_deserialization(
@@ -473,6 +528,7 @@ def test_preflight_rejects_escaping_asset_before_deserialization(
                 train_image_feature_rows=6,
                 train_text_feature_rows=3,
                 test_feature_rows=2,
+                feature_width=2,
                 session_counts={0: 1, 1: 1, 2: 1, 3: 1},
             ),
         )
@@ -498,6 +554,7 @@ def test_preflight_rejects_image_identity_mismatch(tmp_path: Path) -> None:
                 train_image_feature_rows=6,
                 train_text_feature_rows=3,
                 test_feature_rows=2,
+                feature_width=2,
                 session_counts={0: 1, 1: 1, 2: 1, 3: 1},
             ),
         )

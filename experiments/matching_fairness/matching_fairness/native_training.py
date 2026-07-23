@@ -43,6 +43,7 @@ _N_CLASSES = 1_654
 _CONDITIONS_PER_CLASS = 10
 _AVERAGED_TRIALS_PER_CONDITION = 1
 _N_TRAINING_SAMPLES = _N_CLASSES * _CONDITIONS_PER_CLASS
+_FEATURE_WIDTH = 1_024
 _TRAINING_EEG_NAME = "preprocessed_eeg_training.npy"
 _TRAINING_FEATURES_NAME = "ViT-H-14_features_train.pt"
 _OFFICIAL_NAMESPACES = ("eegdatasets", "encoder_utils", "Retrieval", "models")
@@ -469,6 +470,19 @@ def _load_training_features(path: Path) -> dict[str, torch.Tensor]:
         raise ValueError("training img_features must have 16,540 rows")
     if len(text_features) != _N_CLASSES:
         raise ValueError("training text_features must have 1,654 rows")
+    expected_shapes = {
+        "img_features": (_N_TRAINING_SAMPLES, _FEATURE_WIDTH),
+        "text_features": (_N_CLASSES, _FEATURE_WIDTH),
+    }
+    for key, feature in (
+        ("img_features", img_features),
+        ("text_features", text_features),
+    ):
+        shape = tuple(feature.shape)
+        if shape != expected_shapes[key]:
+            raise ValueError(
+                f"training {key} shape must be {expected_shapes[key]}, found {shape}"
+            )
     return {"img_features": img_features, "text_features": text_features}
 
 
@@ -523,6 +537,17 @@ def _validate_training_dataset(dataset: Any) -> None:
         if actual != expected:
             raise ValueError(
                 f"official dataset {attribute} length must be {expected:,}, found {actual:,}"
+            )
+    expected_feature_shapes = {
+        "img_features": (_N_TRAINING_SAMPLES, _FEATURE_WIDTH),
+        "text_features": (_N_CLASSES, _FEATURE_WIDTH),
+    }
+    for attribute, expected in expected_feature_shapes.items():
+        value = getattr(dataset, attribute)
+        shape = tuple(getattr(value, "shape", ()))
+        if shape != expected:
+            raise ValueError(
+                f"official dataset {attribute} shape must be {expected}, found {shape}"
             )
 
 

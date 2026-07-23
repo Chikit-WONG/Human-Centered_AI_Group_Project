@@ -84,6 +84,7 @@ class PreflightExpectations:
     train_image_feature_rows: int = 16_540
     train_text_feature_rows: int = 1_654
     test_feature_rows: int = 200
+    feature_width: int = 1_024
     session_counts: Mapping[int, int] = field(
         default_factory=lambda: {0: 20, 1: 20, 2: 20, 3: 20}
     )
@@ -177,7 +178,10 @@ def _load_official_eeg(path: Path, numpy: Any) -> Any:
 
 
 def _require_feature_payload(
-    path: Path, expected_rows: Mapping[str, int], torch: Any
+    path: Path,
+    expected_rows: Mapping[str, int],
+    expected_width: int,
+    torch: Any,
 ) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, Mapping):
@@ -197,7 +201,14 @@ def _require_feature_payload(
                 f"official feature {key} row mismatch: expected {rows}, "
                 f"found {feature.shape[0]}"
             )
-        shapes[key] = [int(value) for value in feature.shape]
+        shape = tuple(int(value) for value in feature.shape)
+        expected_shape = (rows, expected_width)
+        if shape != expected_shape:
+            raise ValueError(
+                f"official feature {key} shape mismatch: "
+                f"expected {expected_shape}, found {shape}"
+            )
+        shapes[key] = list(shape)
     return shapes
 
 
@@ -327,6 +338,7 @@ def run_preflight(
             "img_features": expectations.train_image_feature_rows,
             "text_features": expectations.train_text_feature_rows,
         },
+        expectations.feature_width,
         torch,
     )
     test_feature_shapes = _require_feature_payload(
@@ -335,6 +347,7 @@ def run_preflight(
             "img_features": expectations.test_feature_rows,
             "text_features": expectations.test_feature_rows,
         },
+        expectations.feature_width,
         torch,
     )
     brainrw = _validate_brainrw(
