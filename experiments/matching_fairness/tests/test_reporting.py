@@ -14,7 +14,9 @@ import pytest
 
 from matching_fairness.artifacts import ScoreArtifact, write_score_artifact
 from matching_fairness.native_export import _score_artifact_sha256
+from matching_fairness.provenance import OFFICIAL_SOURCE_URL
 from matching_fairness.reporting import (
+    _validate_checkpoint_manifest,
     aggregate_records,
     aggregate_results,
     load_reproduction_audits,
@@ -175,6 +177,9 @@ def audit_rows() -> tuple[dict[str, object], ...]:
             "best_test_epoch": 7,
             "best_test_top1_count": 155,
             "best_test_top5_count": 192,
+            "source_commit": "f" * 40,
+            "checkpoint_manifest_sha256": "1" * 64,
+            "audit_manifest_sha256": "2" * 64,
         },
         {
             "model": "atm_s",
@@ -186,6 +191,9 @@ def audit_rows() -> tuple[dict[str, object], ...]:
             "best_test_epoch": 6,
             "best_test_top1_count": 146,
             "best_test_top5_count": 189,
+            "source_commit": "e" * 40,
+            "checkpoint_manifest_sha256": "3" * 64,
+            "audit_manifest_sha256": "4" * 64,
         },
     )
 
@@ -273,6 +281,27 @@ def test_sinkhorn_metadata_is_strict_and_nonconvergence_is_bilingual() -> None:
     sinkhorn["assignment_metadata"]["temperature"] = 0.2
     with pytest.raises(ValueError, match="Sinkhorn"):
         aggregate_records(records)
+
+    adversarial = (
+        {"converged": True, "iterations": 1, "marginal_error": 1e-3},
+        {"converged": False, "iterations": 1, "marginal_error": 1e-12},
+    )
+    for mutation in adversarial:
+        records = valid_records()
+        sinkhorn = next(row for row in records if row["decoder"] == "sinkhorn")
+        sinkhorn["assignment_metadata"].update(mutation)
+        with pytest.raises(ValueError, match="Sinkhorn"):
+            aggregate_records(records)
+
+
+def test_publish_rejects_extra_audit_field_with_hpc_path(tmp_path: Path) -> None:
+    rows = [dict(row) for row in audit_rows()]
+    rows[0]["debug_path"] = "/hpc2hdd/home/private/checkpoint.pth"
+    destination = tmp_path / "aggregate"
+
+    with pytest.raises(ValueError, match="audit.*schema|schema.*audit"):
+        publish_aggregate(aggregate_records(valid_records()), destination, rows)
+    assert not destination.exists()
 
 
 def test_standard_presentation_represents_all_27_scenarios() -> None:
@@ -928,7 +957,7 @@ def _write_audit_inputs(root: Path) -> dict[tuple[str, str], str]:
     native: dict[str, tuple[dict[str, object], bytes]] = {}
     for model_index, model in enumerate(("nice", "atm_s")):
         source = {
-            "url": "https://github.com/eeyhsong/NICE-EEG.git",
+            "url": OFFICIAL_SOURCE_URL,
             "branch": "develop",
             "commit": "f" * 40,
             "checkout_sha256": "a" * 64,
@@ -1162,7 +1191,17 @@ def test_audit_rejects_task5_manifest_provenance_tampering(
     aggregate = aggregate_records(load_run_records(root / "runs"))
     manifest_path = root / "checkpoints" / "nice" / "checkpoint_manifest.json"
     original = json.loads(manifest_path.read_text(encoding="utf-8"))
+    wrong_source = json.loads(json.dumps(original))
+    wrong_source["source"]["url"] = "https://github.com/eeyhsong/NICE-EEG.git"
+    with pytest.raises(
+        ValueError,
+        match="source|official|provenance",
+    ):
+        _validate_checkpoint_manifest(wrong_source, "nice")
     mutations = (
+        lambda manifest: manifest["source"].update(
+            {"url": "https://github.com/eeyhsong/NICE-EEG.git"}
+        ),
         lambda manifest: manifest["source"].update(
             {"commit": "0" * 40, "checkout_sha256": "1" * 64}
         ),

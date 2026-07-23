@@ -22,7 +22,7 @@ from .artifacts import (
     publish_staged_directory,
     read_score_artifact,
 )
-from .provenance import sha256_file
+from .provenance import OFFICIAL_SOURCE_URL, sha256_file
 from .scenarios import build_standard_manifest, standard_scenarios
 from .trial_splits import select_duplicate_image_ids
 
@@ -1249,6 +1249,16 @@ def _validate_assignment_metadata(
     ):
         raise ValueError("Sinkhorn assignment metadata is invalid")
 
+    tolerance = float(metadata["tolerance"])
+    marginal_error = float(metadata["marginal_error"])
+    converged = metadata["converged"]
+    if converged != (marginal_error <= tolerance):
+        raise ValueError("Sinkhorn convergence flag contradicts marginal error")
+    if not converged and iterations != metadata["max_iterations"]:
+        raise ValueError(
+            "Sinkhorn non-convergence must exhaust the configured iterations"
+        )
+
 
 def _record_source_hashes(
     record: Mapping[str, object],
@@ -1426,9 +1436,7 @@ def _validated_audit_rows(audits: Sequence[Mapping[str, object]]) -> tuple[dict[
         return ()
     if len(audits) != 2:
         raise ValueError("reproduction audit requires NICE and ATM-S rows")
-    result = []
-    expected_models = ("nice", "atm_s")
-    required = {
+    fields = (
         "model",
         "formal_epoch",
         "formal_val_loss",
@@ -1438,24 +1446,59 @@ def _validated_audit_rows(audits: Sequence[Mapping[str, object]]) -> tuple[dict[
         "best_test_epoch",
         "best_test_top1_count",
         "best_test_top5_count",
-    }
+        "source_commit",
+        "checkpoint_manifest_sha256",
+        "audit_manifest_sha256",
+    )
+    integer_fields = (
+        "formal_epoch",
+        "formal_top1_count",
+        "formal_top5_count",
+        "sample_count",
+        "best_test_epoch",
+        "best_test_top1_count",
+        "best_test_top5_count",
+    )
+    result: list[dict[str, object]] = []
+    expected_models = ("nice", "atm_s")
     for expected, raw in zip(expected_models, audits):
-        if not isinstance(raw, Mapping) or not required.issubset(raw):
-            raise ValueError("reproduction audit row is incomplete")
-        row = dict(raw)
+        if not isinstance(raw, Mapping) or set(raw) != set(fields):
+            raise ValueError("reproduction audit row schema is invalid")
+        row = {field: raw[field] for field in fields}
         if row["model"] != expected:
             raise ValueError("reproduction audit model order is invalid")
-        for field in required.difference({"model", "formal_val_loss"}):
+        for field in integer_fields:
             _integer(row[field], field)
         loss = row["formal_val_loss"]
-        if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(float(loss)):
+        if (
+            isinstance(loss, bool)
+            or not isinstance(loss, (int, float))
+            or not math.isfinite(float(loss))
+        ):
             raise ValueError("formal validation loss must be finite")
         sample = int(row["sample_count"])
-        if sample <= 0 or any(
-            not 0 <= int(row[field]) <= sample
-            for field in ("formal_top1_count", "formal_top5_count", "best_test_top1_count", "best_test_top5_count")
+        if (
+            int(row["formal_epoch"]) <= 0
+            or int(row["best_test_epoch"]) <= 0
+            or sample <= 0
+            or not 0
+            <= int(row["formal_top1_count"])
+            <= int(row["formal_top5_count"])
+            <= sample
+            or not 0
+            <= int(row["best_test_top1_count"])
+            <= int(row["best_test_top5_count"])
+            <= sample
         ):
             raise ValueError("reproduction audit metric counts are invalid")
+        source_commit = row["source_commit"]
+        if (
+            not isinstance(source_commit, str)
+            or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+            or not _is_sha256(row["checkpoint_manifest_sha256"])
+            or not _is_sha256(row["audit_manifest_sha256"])
+        ):
+            raise ValueError("reproduction audit immutable provenance is invalid")
         result.append(row)
     return tuple(result)
 
@@ -1483,8 +1526,7 @@ def _validate_checkpoint_manifest(
     if (
         not isinstance(source, Mapping)
         or set(source) != {"url", "branch", "commit", "checkout_sha256"}
-        or not isinstance(source.get("url"), str)
-        or not source["url"]
+        or source.get("url") != OFFICIAL_SOURCE_URL
         or source.get("branch") != "develop"
         or re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit", ""))) is None
         or not _is_sha256(source.get("checkout_sha256"))
