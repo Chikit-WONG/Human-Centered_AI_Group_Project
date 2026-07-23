@@ -304,16 +304,61 @@ def test_publish_rejects_extra_audit_field_with_hpc_path(tmp_path: Path) -> None
     assert not destination.exists()
 
 
-def test_standard_presentation_represents_all_27_scenarios() -> None:
-    report = render_english_report(aggregate_records(valid_records()), audit_rows())
-    for index, scenario in enumerate(standard_scenarios()):
-        assert f"{index:02d} {scenario.slug}" in report
+def test_english_report_uses_readable_scenario_labels_only() -> None:
+    aggregate = aggregate_records(valid_records())
+    english = render_english_report(aggregate, audit_rows())
+
+    expected_standard = {
+        "Baseline one-to-one matching (200 EEG queries × 200 images)",
+        "Duplicate 10 images (200 EEG queries × 210 images)",
+        "Duplicate 20 images (200 EEG queries × 220 images)",
+        "Remove 5 images (200 EEG queries × 195 images)",
+        "Remove 5 images, duplicate 10 images (200 EEG queries × 205 images)",
+        "Remove 5 images, duplicate 20 images (200 EEG queries × 215 images)",
+        "Remove 10 images (200 EEG queries × 190 images)",
+        "Remove 10 images, duplicate 10 images (200 EEG queries × 200 images)",
+        "Remove 10 images, duplicate 20 images (200 EEG queries × 210 images)",
+        "Remove 5 EEG queries (195 EEG queries × 200 images)",
+        "Remove 5 EEG queries, duplicate 10 images (195 EEG queries × 210 images)",
+        "Remove 5 EEG queries, duplicate 20 images (195 EEG queries × 220 images)",
+        "Remove 5 EEG queries, remove 5 images (195 EEG queries × 195 images)",
+        "Remove 5 EEG queries, remove 5 images, duplicate 10 images (195 EEG queries × 205 images)",
+        "Remove 5 EEG queries, remove 5 images, duplicate 20 images (195 EEG queries × 215 images)",
+        "Remove 5 EEG queries, remove 10 images (195 EEG queries × 190 images)",
+        "Remove 5 EEG queries, remove 10 images, duplicate 10 images (195 EEG queries × 200 images)",
+        "Remove 5 EEG queries, remove 10 images, duplicate 20 images (195 EEG queries × 210 images)",
+        "Remove 10 EEG queries (190 EEG queries × 200 images)",
+        "Remove 10 EEG queries, duplicate 10 images (190 EEG queries × 210 images)",
+        "Remove 10 EEG queries, duplicate 20 images (190 EEG queries × 220 images)",
+        "Remove 10 EEG queries, remove 5 images (190 EEG queries × 195 images)",
+        "Remove 10 EEG queries, remove 5 images, duplicate 10 images (190 EEG queries × 205 images)",
+        "Remove 10 EEG queries, remove 5 images, duplicate 20 images (190 EEG queries × 215 images)",
+        "Remove 10 EEG queries, remove 10 images (190 EEG queries × 190 images)",
+        "Remove 10 EEG queries, remove 10 images, duplicate 10 images (190 EEG queries × 200 images)",
+        "Remove 10 EEG queries, remove 10 images, duplicate 20 images (190 EEG queries × 210 images)",
+    }
+    assert len(expected_standard) == 27
+    for label in expected_standard:
+        assert english.count(label) == 3
+
+    assert english.count(
+        "Real duplicate-EEG baseline (200 EEG-A queries × 200 images)"
+    ) == 15
+    assert english.count(
+        "Add 10 real duplicate EEG-B queries (210 EEG queries × 200 images)"
+    ) == 15
+    assert english.count(
+        "Add 20 real duplicate EEG-B queries (220 EEG queries × 200 images)"
+    ) == 15
+    assert all(
+        token not in english
+        for token in ("dropq", "dropg", "dropp", "dupg", "dupq")
+    )
 
 
 def test_chinese_report_uses_readable_scenario_labels_only() -> None:
     aggregate = aggregate_records(valid_records())
     chinese = render_chinese_report(aggregate, audit_rows())
-    english = render_english_report(aggregate, audit_rows())
 
     expected_standard = {
         0: "标准一一匹配（200 条 EEG × 200 张图片）",
@@ -329,8 +374,6 @@ def test_chinese_report_uses_readable_scenario_labels_only() -> None:
     assert chinese.count("加入 10 条真实重复 EEG-B（210 条 EEG × 200 张图片）") == 15
     assert chinese.count("加入 20 条真实重复 EEG-B（220 条 EEG × 200 张图片）") == 15
     assert all(token not in chinese for token in ("dropq", "dropp", "dupg", "dupq"))
-    assert "00 dropq0_dropg0_dropp0_dupg0" in english
-    assert "dupq20" in english
 
 
 def test_reports_contain_bilingual_single_cell_limitations_and_audit_warning() -> None:
