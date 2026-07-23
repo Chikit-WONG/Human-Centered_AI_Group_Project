@@ -1009,11 +1009,9 @@ def _parse_sacct_terminal_records(
     records: dict[int, dict[str, object]] = {}
     for line in stdout.splitlines():
         fields = line.split("|")
-        if len(fields) != 8 or fields[-1] != "":
+        if len(fields) != 7:
             raise ValueError("sacct output record must use exact parsable2 fields")
-        job_id_raw, job_name, raw_state, exit_code, submitted, started, ended, _ = (
-            fields
-        )
+        job_id_raw, job_name, raw_state, exit_code, submitted, started, ended = fields
         if re.fullmatch(r"[1-9][0-9]*", job_id_raw) is None:
             # Job steps are not root allocation records and are irrelevant under -X.
             continue

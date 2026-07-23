@@ -17,6 +17,9 @@ REQUEST_ID = "3ae8dc60c2df4166b7d4021f48146487"
 LEDGER_SHA256 = "2125615c73c156bea4137c1c764aba6b7893e94cb64d819b6856b8a93b4042be"
 REASON = "spool-entrypoint-bug"
 APPROVED_LEDGER = Path(__file__).with_name("fixtures") / "approved_submission.json"
+REAL_SACCT_STDOUT = (
+    Path(__file__).with_name("fixtures") / "real_incident_sacct_parsable2.txt"
+)
 ORDER = ("train", "native_export", "brainrw_export", "native_audit", "final")
 OLD_IDS = (10047830, 10047831, 10047832, 10047833, 10047834)
 RAW_STATES = (
@@ -67,7 +70,7 @@ def _sacct_stdout(
         exit_codes = ("0:15", "0:15", "2:0", "0:15", "0:15")
     return "".join(
         f"{job_id}|{name}|{state}|{exit_code}|2026-07-22T10:00:00|"
-        f"2026-07-22T10:01:00|2026-07-22T10:02:00|\n"
+        f"2026-07-22T10:01:00|2026-07-22T10:02:00\n"
         for job_id, name, state, exit_code in zip(ids, names, states, exit_codes)
     )
 
@@ -285,6 +288,59 @@ def test_scheduler_evidence_hashes_exact_raw_crlf_bytes(tmp_path: Path) -> None:
     assert evidence["stdout_sha256"] == hashlib.sha256(raw_stdout).hexdigest()
 
 
+def test_exact_real_incident_parsable2_fixture_is_accepted(tmp_path: Path) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _original, sha256 = _write_original(module, layout)
+    raw_stdout = REAL_SACCT_STDOUT.read_bytes()
+    assert raw_stdout.endswith(b"\n")
+    assert all(not line.endswith(b"|") for line in raw_stdout.splitlines())
+    runner = _RecoveryRunner(layout, sacct_stdout=raw_stdout)
+
+    _recover(module, layout, sha256, runner)
+
+    evidence = json.loads(layout.submission_recovery_manifest.read_text())[
+        "scheduler_verification"
+    ]
+    assert evidence["stdout_sha256"] == hashlib.sha256(raw_stdout).hexdigest()
+    assert evidence["jobs"]["train"]["start"] == "None"
+    assert evidence["jobs"]["brainrw_export"]["exit_code"] == "2:0"
+    assert evidence["jobs"]["final"]["end"] == "2026-07-23T18:03:06"
+
+
+@pytest.mark.parametrize(
+    "mutate_lines",
+    (
+        lambda lines: [line + "|" for line in lines],
+        lambda lines: ["|".join(lines[0].split("|")[:-1]), *lines[1:]],
+        lambda lines: [
+            lines[0].replace(
+                f"mf-{REQUEST_ID}-train",
+                f"mf-{REQUEST_ID}-train|embedded",
+            ),
+            *lines[1:],
+        ],
+    ),
+    ids=("trailing-delimiter", "six-fields", "embedded-extra-delimiter"),
+)
+def test_parsable2_requires_exactly_seven_fields_without_trailing_delimiter(
+    tmp_path: Path,
+    mutate_lines,
+) -> None:
+    module = _load_submitter()
+    layout = module.RuntimeLayout.for_test(tmp_path)
+    _original, sha256 = _write_original(module, layout)
+    lines = _sacct_stdout().splitlines()
+    lines = mutate_lines(lines)
+    runner = _RecoveryRunner(layout, sacct_stdout="\n".join(lines) + "\n")
+
+    with pytest.raises(ValueError, match="sacct|parsable2|field|record"):
+        _recover(module, layout, sha256, runner)
+
+    assert len(runner.calls) == 1 and runner.calls[0][0] == "sacct"
+    assert not os.path.lexists(layout.submission_recovery_manifest)
+
+
 def test_invalid_utf8_sacct_bytes_fail_before_recovery_or_submission(
     tmp_path: Path,
 ) -> None:
@@ -410,7 +466,7 @@ def test_scheduler_query_failure_creates_no_recovery_ledger(
             + tuple(f"mf-{REQUEST_ID}-{name.replace('_', '-')}" for name in ORDER[1:])
         ),
         _sacct_stdout(exit_codes=("bad", "0:15", "2:0", "0:15", "0:15")),
-        _sacct_stdout() + "99999999|extra-root|FAILED|1:0||||\n",
+        _sacct_stdout() + "99999999|extra-root|FAILED|1:0|||\n",
     ),
 )
 def test_malformed_or_incomplete_sacct_output_fails_closed(
