@@ -48,9 +48,9 @@ def test_chinese_report_uses_readable_scenario_labels_only() -> None:
     for label in expected_standard.values():
         assert chinese.count(label) == 3
 
-    assert chinese.count("真实重复 EEG 基准（200 条 EEG-A × 200 张图片）") == 5
-    assert chinese.count("加入 10 条真实重复 EEG-B（210 条 EEG × 200 张图片）") == 5
-    assert chinese.count("加入 20 条真实重复 EEG-B（220 条 EEG × 200 张图片）") == 5
+    assert chinese.count("真实重复 EEG 基准（200 条 EEG-A × 200 张图片）") == 15
+    assert chinese.count("加入 10 条真实重复 EEG-B（210 条 EEG × 200 张图片）") == 15
+    assert chinese.count("加入 20 条真实重复 EEG-B（220 条 EEG × 200 张图片）") == 15
     assert all(token not in chinese for token in ("dropq", "dropp", "dupg", "dupq"))
     assert "00 dropq0_dropg0_dropp0_dupg0" in english
     assert "dupq20" in english
@@ -83,7 +83,7 @@ Expected: FAIL because the Chinese report still contains `dropq...` and `dupq...
 Add before `_standard_table`:
 
 ```python
-def _chinese_standard_scenario_label(spec: object) -> str:
+def _chinese_standard_scenario_label(spec: ScenarioSpec) -> str:
     operations = []
     if spec.drop_query:
         operations.append(f"删除 {spec.drop_query} 条 EEG")
