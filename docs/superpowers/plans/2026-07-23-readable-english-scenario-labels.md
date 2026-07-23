@@ -320,17 +320,26 @@ experiments/matching_fairness/tests
 
 Expected: `427 passed` with zero failures.
 
-- [ ] **Step 5: Verify and push only the current `ckw` branch**
+- [ ] **Step 5: Verify the current `ckw` branch before review**
 
 Run:
 
 ```bash
 git status --short --branch
 git log --oneline origin/ckw..HEAD
+```
+
+Expected: the branch is `ckw`, no new branch exists, and the worktree is clean. The Task 2 implementer must not push; the controller pushes `ckw` only after the task review and final whole-branch review are approved.
+
+## Controller integration after all reviews
+
+After Task 2 and the final whole-branch review are approved, the controller runs:
+
+```bash
 git -c http.version=HTTP/1.1 push origin ckw
 git status --short --branch
 git rev-parse HEAD
 git rev-parse origin/ckw
 ```
 
-Expected: the branch is `ckw`, no new branch exists, the worktree is clean, and local `HEAD` equals `origin/ckw` after the push.
+Expected: local `HEAD` equals `origin/ckw`, and no branch was created or deleted.
