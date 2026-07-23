@@ -1352,11 +1352,14 @@ def test_partial_preflight_requires_explicit_overwrite_and_rebuilds_only_derived
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from matching_fairness.trial_splits import validate_trial_manifest
+
     module = _load_submitter()
     layout = module.RuntimeLayout.for_test(tmp_path)
     phase_manifest = module.phase_manifest_path(layout, "preflight")
-    layout.preflight_manifest.parent.mkdir(parents=True, exist_ok=True)
-    layout.preflight_manifest.write_bytes(b"legacy-partial-preflight\n")
+    _write_brainrw_snapshot_fixture(layout)
+    partial_preflight = layout.preflight_manifest.read_bytes()
+    brainrw_before = layout.brainrw_test.read_bytes()
     layout.source_lock.write_bytes(b"sealed-source-lock\n")
     layout.asset_lock.write_bytes(b"sealed-asset-lock\n")
     source_before = layout.source_lock.read_bytes()
@@ -1373,19 +1376,11 @@ def test_partial_preflight_requires_explicit_overwrite_and_rebuilds_only_derived
         assert candidate.asset_lock.read_bytes() == asset_before
 
     def run_preflight_command(_command: list[str]) -> None:
-        layout.preflight_manifest.write_text(
-            '{"status":"passed"}\n', encoding="utf-8"
-        )
-
-    def ensure_trial_manifest(_layout) -> None:
-        layout.trial_manifest.write_text(
-            '{"seed":42}\n', encoding="utf-8"
-        )
+        layout.preflight_manifest.write_bytes(partial_preflight)
 
     monkeypatch.setattr(module, "_safe_remove_derived", safe_remove)
     monkeypatch.setattr(module, "_ensure_source_and_assets", ensure_source_and_assets)
     monkeypatch.setattr(module, "_run", run_preflight_command)
-    monkeypatch.setattr(module, "_ensure_trial_manifest", ensure_trial_manifest)
     monkeypatch.setattr(
         module,
         "_phase_inputs",
@@ -1394,7 +1389,8 @@ def test_partial_preflight_requires_explicit_overwrite_and_rebuilds_only_derived
 
     with pytest.raises(ValueError, match="partial|orphaned"):
         module.run_preflight(layout, overwrite=False)
-    assert layout.preflight_manifest.read_bytes() == b"legacy-partial-preflight\n"
+    assert layout.preflight_manifest.read_bytes() == partial_preflight
+    assert layout.brainrw_test.read_bytes() == brainrw_before
     assert not layout.trial_manifest.exists()
     assert not phase_manifest.exists()
     assert observed_removals == []
@@ -1410,6 +1406,10 @@ def test_partial_preflight_requires_explicit_overwrite_and_rebuilds_only_derived
     assert layout.preflight_manifest.is_file()
     assert layout.trial_manifest.is_file()
     assert phase_manifest.is_file()
+    verified_snapshot = module._verified_brainrw_snapshot(layout)
+    assert verified_snapshot == brainrw_before
+    trial_payload = json.loads(layout.trial_manifest.read_text(encoding="utf-8"))
+    validate_trial_manifest(trial_payload, tuple(trial_payload["image_ids"]))
     assert json.loads(phase_manifest.read_text(encoding="utf-8")) == {
         "schema_version": 1,
         "phase": "preflight",
