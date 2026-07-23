@@ -19,6 +19,7 @@ RUNNER = EXPERIMENT_ROOT / "run_matching_fairness.sh"
 SUBMITTER_PATH = EXPERIMENT_ROOT / "scripts/submit_pipeline.py"
 SLURM_ROOT = EXPERIMENT_ROOT / "slurm"
 LOGS_FRAGMENT = "/test/brain-rw/logs/matching_fairness_v3/"
+REPORTING_TEST_PATH = EXPERIMENT_ROOT / "tests/test_reporting.py"
 
 
 def _load_submitter():
@@ -33,6 +34,17 @@ def _load_submitter():
 def _load_script(name: str):
     path = EXPERIMENT_ROOT / "scripts" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"orchestration_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_reporting_fixture_helpers():
+    spec = importlib.util.spec_from_file_location(
+        "orchestration_reporting_fixture_helpers", REPORTING_TEST_PATH
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -100,6 +112,45 @@ def test_dry_run_does_not_create_runtime_directories(tmp_path: Path) -> None:
     assert result["mode"] == "dry-run"
     assert not layout.results_root.exists()
     assert not layout.logs_root.exists()
+
+
+def test_fixture_pipeline_is_byte_stable(tmp_path: Path) -> None:
+    helpers = _load_reporting_fixture_helpers()
+    aggregate_results = _load_script("aggregate_results").aggregate_results
+    compared = (
+        "aggregate_metrics.csv",
+        "aggregate_summary.json",
+        "RESULTS.md",
+        "RESULTS_ZH.md",
+    )
+    hashes: list[dict[str, str]] = []
+
+    for name in ("fixture-a", "fixture-b"):
+        root = tmp_path / name / "matching_fairness_v3"
+        root.mkdir(parents=True)
+        source_hashes = helpers._write_audit_inputs(root)
+        for model in ("nice", "atm_s"):
+            audit_path = root / "matrices" / model / "best_test_audit.json"
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            for entry in audit["formal_artifact_inventory"]:
+                role = {"standard": "standard", "a": "eeg_a", "b": "eeg_b"}[
+                    entry["trial_half"]
+                ]
+                entry["path"] = f"matrices/{entry['model_slug']}/{role}"
+            helpers._write_canonical_json(audit_path, audit)
+        helpers._write_task7_fixture(root / "runs", source_hashes)
+
+        aggregate = aggregate_results(root)
+        hashes.append(
+            {
+                filename: hashlib.sha256(
+                    (aggregate / filename).read_bytes()
+                ).hexdigest()
+                for filename in compared
+            }
+        )
+
+    assert hashes[0] == hashes[1]
 
 
 @pytest.mark.parametrize(

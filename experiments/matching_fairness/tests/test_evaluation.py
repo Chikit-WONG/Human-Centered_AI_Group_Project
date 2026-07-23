@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 import numpy as np
@@ -21,6 +22,23 @@ from matching_fairness.evaluation import (
 
 
 SCRIPT = Path("experiments/matching_fairness/scripts/run_scenarios.py")
+
+
+def test_run_scenarios_direct_cli_help_resolves_package_without_pythonpath() -> None:
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--artifact-root" in completed.stdout
 
 
 def _load_runner():
