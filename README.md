@@ -4,9 +4,9 @@ English | [简体中文](README_ZH.md)
 
 Course project for **AIAA3800 — Human-Centered Artificial Intelligence**.
 
-This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The original formal protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`) at each of five seeds (`42` through `46`). A controlled SAMGA experiment isolates the effect of applying the same visual LoRA/TTUR intervention to an otherwise identical frozen-CLIP SAMGA control. A third, separate track performs an audited best-effort reproduction with the released SAMGA training code and pinned inferred InternViT V2.5 features. A global one-to-one Hungarian decoder is retained only as a transductive seed-42 Subject-08 ablation.
+This repository studies whether non-invasive EEG recordings can be mapped into a visual-semantic embedding space and used to retrieve the image that a person viewed. The original formal protocol trains a separate brain encoder and LoRA-adapted CLIP vision encoder for each of the ten THINGS-EEG2 subjects (`sub-01` through `sub-10`) at each of five seeds (`42` through `46`). A controlled SAMGA experiment isolates the effect of applying the same visual LoRA/TTUR intervention to an otherwise identical frozen-CLIP SAMGA control. A third, separate track performs an audited best-effort reproduction with the released SAMGA training code and pinned inferred InternViT V2.5 features. A dedicated matching-fairness suite compares Independent, Greedy, Hungarian, Stable Matching, and Sinkhorn decoding on NICE, ATM-S, and Our project under identical seed-42 Subject-08 standard and perturbed galleries.
 
-> **Scope.** The original headline result covers a complete 10-subject × 5-seed grid: seeds `42`, `43`, `44`, `45`, and `46`, with 50 independently trained subject–seed models. The controlled SAMGA extension adds 50 matched Frozen models and 50 matched LoRA models on the same grid. The public-code reproduction separately evaluates released-launcher seed `2025` and a project-defined fixed-60 stability grid at seeds `42`–`46`; the latter are not claimed to be the paper's undisclosed seeds. Results remain separate because the paper does not publish its exact visual checkpoint, extractor, five seed values, or checkpoint-selection rule. The Hungarian result covers only seed `42` / `sub-08` and is excluded from every standard aggregate.
+> **Scope.** The original headline result covers a complete 10-subject × 5-seed grid: seeds `42`, `43`, `44`, `45`, and `46`, with 50 independently trained subject–seed models. The controlled SAMGA extension adds 50 matched Frozen models and 50 matched LoRA models on the same grid. The public-code reproduction separately evaluates released-launcher seed `2025` and a project-defined fixed-60 stability grid at seeds `42`–`46`; the latter are not claimed to be the paper's undisclosed seeds. Results remain separate because the paper does not publish its exact visual checkpoint, extractor, five seed values, or checkpoint-selection rule. The matching-fairness suite covers only seed `42` / `sub-08`; all global-assignment values are secondary transductive ablations and are excluded from every standard multi-subject aggregate.
 
 > **Reproduction guide.** For pinned assets, executable commands, complete
 > protocol details, and claim boundaries, see the
@@ -21,7 +21,7 @@ This repository studies whether non-invasive EEG recordings can be mapped into a
 - Trains and evaluates all 50 subject–seed models independently, then reports both per-seed ten-subject and five-seed standard Top-1/Top-5 aggregates.
 - Runs a pre-registered 50-pair SAMGA Frozen-versus-LoRA attribution study with matched task initialization and a sealed concept-disjoint pilot validation split.
 - Audits the released SAMGA source, pins an inferred InternViT V2.5 revision, and reports fixed/final and test-selected metrics under explicitly different labels.
-- Provides unit tests, independent checkpoint-reload checks, and per-query predictions for every standard run, plus similarity-matrix provenance for the seed-42 / `sub-08` Hungarian ablation.
+- Provides unit tests, independent checkpoint-reload checks, and per-query predictions for every standard run, plus hash-bound similarity-matrix provenance for the three-baseline seed-42 / `sub-08` matching-fairness suite.
 
 ## Method
 
@@ -162,6 +162,20 @@ Two further reporting decisions prevent protocol mixing:
 - The final NeurIPS ATM paper reports 26.13%/55.32% in its formal Table 8. The often-cited 28.64%/58.47% comes from a different arXiv/ablation reporting rule, so it is not mixed into this table.
 
 Although every test concept in this split has exactly one stimulus image, making concept identity and image identity one-to-one at scoring time, the gallery representation still matters. Our project ranks the actual test-image embeddings; it does not replace them with class templates. All literature values above are paper-reported rather than rerun inside this repository.
+
+### Three-baseline matching-fairness comparison
+
+This controlled implementation/re-evaluation uses the same seed-42 `sub-08` test queries and the same 200-image gallery for **NICE**, **ATM-S**, and **Our project**. It is a single-subject/single-seed diagnostic rather than a perfect reproduction of the paper results or evidence of cross-subject significance. The table was generated from the local audited artifact `matching_fairness_v3/aggregate/main_table.csv` (SHA-256 `54f00400eb5c9c9c41c0a855b1d60bc3094672c842a405cd7d7cfca4af151952`); that result artifact is not tracked by Git, while the version-controlled experiment guide records the reproducible protocol.
+
+| Baseline | Checkpoint / training source | Independent Top-1 | Independent Top-5 | Greedy assignment | Hungarian assignment | Stable Matching assignment | Sinkhorn assignment |
+|---|---|---:|---:|---:|---:|---:|---:|
+| NICE | One seed-42 training run; validation-loss-selected epoch 94 | 18.00% | 41.00% | 22.00% | 31.50% | 23.50% | 31.50%† |
+| ATM-S | One seed-42 training run; validation-loss-selected epoch 205 | 46.00% | 76.00% | 52.00% | 62.50% | 50.50% | 65.00%† |
+| **Our project** | Existing fixed BrainRW epoch-24/final export plus vision-LoRA adapter; not retrained or validation-selected | **91.00%** | **99.50%** | **95.50%** | **100.00%** | **98.00%** | **100.00%**† |
+
+Independent Top-1/Top-5 are standard row-wise retrieval metrics. Greedy, Hungarian, Stable Matching, and Sinkhorn instead report one **assignment accuracy** per query; assignment Top-5 is undefined and is not reported. The global methods observe the complete score matrix, and the hard one-to-one methods exploit the known bijection in the standard 200×200 setting, so these columns do not replace standard independent retrieval.
+
+The perturbation suite confirms this boundary: after adding 20 real, disjoint-trial duplicate EEG queries (220×200), hard one-to-one methods leave 20 queries unmatched; Our project's Hungarian falls to 89.09%, below Independent at 90.45%. † All three standard Sinkhorn cells missed the preregistered convergence tolerance (`1e-8` within 500 iterations), so their retained assignment accuracies are diagnostic rather than reliable optimal-transport optima. The complete 27 standard perturbations, three real duplicate-EEG settings, provenance rules, and reproduction commands are documented in the [matching-fairness guide](experiments/matching_fairness/README.md).
 
 ### Seed-42 Subject-08 Hungarian one-to-one ablation
 
