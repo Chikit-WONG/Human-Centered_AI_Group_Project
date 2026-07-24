@@ -1,0 +1,513 @@
+%======================================================================================
+% Beamer theme for LaTeX2e
+% This document style loads beamer theme ChPresentation
+% v1.0 August 2020 - First version
+% It is a style file: beamerthemeChPresentation.sty
+% Use it as \usetheme[options]{ChPresentation}
+% Copyright (C) 2020 C. Has
+% beamerthemeChPresentation.sty time stamp: 17:10, 28 August 2020; Chandra Has
+%
+% Author electronic mail: chandrahashbti@gmail.com
+%**************************************************************************************
+
+% IMPORTANT POINTS:
+
+%*************************************************************************************
+% This theme can also be used without the beamer template
+% It works with LaTeX, PDFLaTeX, XeLaTeX and LuaLaTeX
+% Report to author if you find some errors in this file
+% You are allowed to distribute this copy in any form without author  
+% permission
+% You are not allowed to change the name of the class file
+% Your suggestions will be highly appreciated
+%=======================================================================================
+
+%**************************** New theme: ChPresentation ********************************
+\mode<presentation>
+
+\ProvidesPackage{beamerthemeChPresentation}[2020/08/28 v1.0 
+ChPresentation Beamer theme - A typographic style for nice-looking presentation]
+\typeout{Beamer theme 'ChPresentation' v1.0 <28 Aug 20>}
+
+%************************** Theme options ***********************************************
+\newif\if@seminar
+\newif\if@conference
+\newif\if@secheader
+\newif\if@titlefooter
+\newif\if@titlefooter
+\newif\if@backgroundlogo
+\newif\if@chblue
+\newif\if@chgreen
+
+\@seminarfalse
+\@conferencefalse
+\@secheaderfalse
+\@titlefooterfalse
+\@backgroundlogofalse
+\@chbluefalse
+\@chgreenfalse 
+
+\DeclareOptionBeamer{seminar}{\@seminartrue}
+\DeclareOptionBeamer{conference}{\@conferencetrue}
+\DeclareOptionBeamer{plain}{}
+\DeclareOptionBeamer{headline}{\@secheadertrue}
+\DeclareOptionBeamer{footline}{\@titlefootertrue}
+\DeclareOptionBeamer{backgroundlogo}{\@backgroundlogotrue}
+\DeclareOptionBeamer{logtoprightside}{}
+\DeclareOptionBeamer{darkblue}{\@chbluetrue}
+\DeclareOptionBeamer{darkgreen}{\@chgreentrue}
+\DeclareOptionBeamer{darkred}{} 
+\DeclareOptionBeamer{titlepage}{\def\chfirstframe{\TitlePage}}
+\DeclareOptionBeamer{notitlepage}{\def\chfirstframe{}}
+\DeclareOptionBeamer{c}{\beamer@centeredtrue}
+\DeclareOptionBeamer{t}{\beamer@centeredfalse}
+\def\beamer@ChPresentation@progressbarfraction{fraction}%
+\def\beamer@ChPresentation@progressbarpercent{percent}%
+
+\ExecuteOptionsBeamer{titlepage, t} 
+\ProcessOptionsBeamer
+
+%************************* Important packages **************************************
+\RequirePackage{iftex}
+% The supplied theme loaded inputenx unconditionally. Tectonic uses the XeTeX
+% engine, where inputenc/inputenx is unnecessary and raises an error.
+\ifPDFTeX
+\RequirePackage[utf8]{inputenx}
+\fi
+\RequirePackage{txfonts}
+\RequirePackage{ragged2e}\justifying
+\RequirePackage{tikz}\usetikzlibrary{shadings}
+\RequirePackage{background}\backgroundsetup{contents={}}
+\RequirePackage{textpos}
+\RequirePackage{appendixnumberbeamer}
+\RequirePackage{pifont}
+\RequirePackage{fontawesome}
+\RequirePackage{xfrac}
+\RequirePackage{booktabs}
+\RequirePackage{media9}
+\RequirePackage{microtype}
+
+%************************* Colors definition **************************************
+\definecolor{CHblue}{RGB}{50 50 130} 
+\definecolor{CHred}{RGB}{170 50 25}
+\definecolor{CHgreen}{rgb}{0.0, 0.2, 0.12}
+\definecolor{CHorange}{rgb}{1.0, 0.27, 0.0}
+\definecolor{HAIred}{HTML}{94070A}
+\definecolor{HAIlightred}{HTML}{be6a6c}
+
+%******************************** Color themes **************************************
+\if@chblue
+\usecolortheme[named=CHblue]{structure}
+\else \if@chgreen
+\usecolortheme[named=CHgreen]{structure}
+\else
+\usecolortheme[named=HAIred]{structure}
+\fi \fi 
+
+\setbeamercolor{button}{use=structure,fg=white,bg=structure.fg!50!black}
+\renewcommand{\beamerreturnbutton}[1]{%
+	\setbeamerfont{button}{size=\scriptsize\bfseries\boldmath}	
+	\setbeamercolor{button}{use=structure,fg=white,bg=red}
+	\beamerbutton{\insertreturnsymbol #1}
+}
+
+\setbeamercolor{page number in head/foot}{use=structure, bg=structure.fg!30}
+
+\usecolortheme{whale}
+\usecolortheme{orchid}
+
+%******************************** Font theme **************************************
+%\usefonttheme{serif}
+\usefonttheme[onlymath]{serif}
+
+\setbeamerfont{headline}{series=\bfseries}
+\setbeamerfont{footline}{series=\bfseries}
+\setbeamerfont{title}{series=\bfseries, size=\Large}
+\setbeamerfont{subtitle}{series=\bfseries, size=\normalsize}
+\setbeamerfont{frametitle}{series=\bfseries, size=\large}
+\setbeamerfont{author}{series=\bfseries, size=\small}
+\setbeamerfont{institute}{series=\bfseries, size=\scriptsize}
+\setbeamerfont{date}{series=\bfseries, size=\scriptsize}
+\setbeamerfont{section in toc}{series=\bfseries, size=\small}
+\setbeamerfont{subsection in toc}{size=\footnotesize}
+\setbeamerfont{section title}{series=\bfseries, size=\Large}
+\setbeamerfont{itemize/enumerate body}{size=\footnotesize}
+\setbeamerfont{itemize/enumerate subbody}{size=\scriptsize}
+\setbeamerfont{itemize/enumerate subsubbody}{size=\scriptsize}
+
+\setbeamerfont{block title}{series=\bfseries, size=\normalsize}
+\setbeamerfont{button}{size=\scriptsize\bfseries\boldmath}
+
+\newenvironment{cblock}{%
+	\setbeamercolor{block body}{bg=white}
+	\begin{block}
+	}{%
+	\end{block}
+}
+
+\newenvironment{cexampleblock}{%
+	\setbeamercolor{block body example}{bg=white}
+	\begin{exampleblock}
+	}{%
+	\end{exampleblock}
+}
+
+\newenvironment{calertblock}{%
+	\setbeamercolor{block body alerted}{bg=white}
+	\begin{alertblock}
+	}{%
+	\end{alertblock}
+}
+
+%****************************** Inner/Outer theme ***********************************
+%\useoutertheme{infolines}
+\useinnertheme{circles}
+
+%****************************** Custom title-page commands ****************************
+\newcommand{\email}[2][Email:]{\gdef\insertemail{#1~\href{mailto:#2}{#2}}}
+\email[]{}
+
+\newcommand{\conference}[1]{\gdef\insertconference{#1}}
+\conference{}
+
+\newcommand{\coauthors}[1]{\gdef\insertcoauthors{#1}}
+\coauthors{}
+
+\newcommand{\conferencelogo}[1]{\gdef\insertconferencelogo{#1}
+}
+\conferencelogo{}
+
+\newcommand{\framelogo}[1]{\gdef\insertframelogo{#1}}
+\framelogo{}
+\newcommand{\framebackgroundlogoopacity}[1][]{\gdef\insertframebackgroundlogoopacity{#1}}
+\framebackgroundlogoopacity[0.2]
+
+\newcommand{\backgroundcanvas}[1]{\setbeamertemplate{background canvas}{#1}
+}  
+  
+\newcommand{\sep}[1][5pt]{\hskip#1}
+
+\newcommand{\TitlePage}{%
+	\begin{frame}[plain, noframenumbering]
+		\titlepage
+	\end{frame}
+}
+
+%****************************** Frame progress bar ********************************
+\newcommand{\progressbar}[2][yellow]{%
+	\gdef\insertprogressbar{%
+		\pgfmathsetmacro{\theta}{360/\inserttotalframenumber*\insertframenumber}
+		\begin{tikzpicture}[scale=0.035]
+		\ifx\beamer@ChPresentation@progressbar\beamer@ChPresentation@progressbarpercent%
+		\fill[#1] (0,0) circle (12);
+		\fill[#2] (0,0) -- (0,12) arc (90:90-\theta:12) -- (0,0);
+		\fill[structure.fg] (0,0) circle (9);	
+		\node[text=white] at (0,0) {\pgfmathparse{\insertframenumber*100/\inserttotalframenumber}
+			\pgfmathprintnumber[assume math mode=true,fixed,precision=1]{\pgfmathresult}\%
+		};
+		\else 
+		\ifx\beamer@ChPresentation@progressbar\beamer@ChPresentation@progressbarfraction%
+		\fill[#1] (0,0) circle (11);
+		\fill[#2] (0,0) -- (0,11) arc (90:90-\theta:12) -- (0,0);
+		\fill[structure.fg] (0,0) circle (8);	
+		\node[text=white] at (0,0) {\small\sfrac{\insertframenumber}{\inserttotalframenumber}};
+		\fi \fi 
+		\end{tikzpicture}
+	}
+} 
+\progressbar{red}
+
+%***************************** Default beamer formatting ********************************
+%% Title page
+\AtBeginDocument{\chfirstframe}
+\setbeamertemplate{title page}{%
+	\leavevmode
+	\vfill 	
+	\if@seminar
+	\begin{beamercolorbox}[rounded=true, shadow=false, sep=4pt,center]{title}
+		\usebeamerfont{title}\inserttitle
+		\ifx\insertsubtitle\@empty\else \par 
+		{\usebeamerfont{subtitle}\insertsubtitle}
+		\fi
+	\end{beamercolorbox}%
+	\vfill     	
+	\begin{beamercolorbox}[sep=4pt,center]{author} 
+		\ifx\insertemail\@empty	  	
+		\usebeamerfont{author}\insertauthor
+		\else
+		\usebeamerfont{author}\insertauthor\par  \tiny \insertemail
+		\fi
+	\end{beamercolorbox}%  	
+    	\ifx\inserttitlegraphic\@empty\else
+	\vfill 	
+	\begin{beamercolorbox}[sep=4pt,center]{titlegraphic}		
+		\inserttitlegraphic
+	\end{beamercolorbox}%
+	   \fi
+	\vfill 
+	\begin{beamercolorbox}[sep=4pt,center]{institute}		
+		\usebeamerfont{institute}\insertinstitute
+	\end{beamercolorbox}%
+	\vfill
+	\begin{beamercolorbox}[sep=4pt,center]{date} 		
+		\usebeamerfont{date}\insertdate
+	\end{beamercolorbox}% 
+	\else   
+	\if@conference
+	\begin{beamercolorbox}[rounded=true, shadow=false, sep=4pt, center]{title}
+		\usebeamerfont{title}\inserttitle
+		\ifx\insertsubtitle\@empty\else \par 
+		{\usebeamerfont{subtitle}\insertsubtitle}
+		\fi     	
+	\end{beamercolorbox}%
+	\vfill 
+	   \ifx\insertcoauthors\@empty
+	\begin{beamercolorbox}[sep=4pt,center]{author}   	
+		\usebeamerfont{author}\insertauthor%			
+	\end{beamercolorbox}% 
+      \else
+    \begin{beamercolorbox}[sep=4pt,center]{author}   	
+    	\usebeamerfont{author} \insertauthor{} \sep  \insertcoauthors			
+    \end{beamercolorbox}%
+      \fi
+	\vfill 
+	\begin{beamercolorbox}[sep=4pt,center]{institute}		
+		\usebeamerfont{institute}\insertinstitute   
+		\ifx\insertemail\@empty	\else \par 
+		\vspace{0.35\baselineskip} 
+		\tiny \usebeamercolor[fg]{author} \insertemail 
+		\fi 
+	\end{beamercolorbox}%
+	\vfill
+	\begin{beamercolorbox}[sep=4pt,center]{conference}
+		\usebeamerfont{institute}\insertconference
+	\end{beamercolorbox}%
+	\vspace{5pt}
+	\begin{beamercolorbox}[sep=4pt,center]{date} 		
+		\usebeamerfont{date}\insertdate
+	\end{beamercolorbox}% 
+	   \ifx\insertcollegelogo\insertconferencelogo \@empty\else
+	\vspace{-3\baselineskip}
+	\begin{beamercolorbox}[wd=0.9\paperwidth, sep=4pt]{titlegraphic}
+		\usebeamercolor[fg]{titlegraphic}\inserttitlegraphic \hfill \insertconferencelogo 
+	\end{beamercolorbox}%
+	\fi \else 
+	\begin{beamercolorbox}[rounded=true, shadow=false, sep=8pt,center]{title}	
+		\usebeamerfont{title}\usebeamercolor[fg]{title}\inserttitle
+		\ifx\usebeamercolor[fg]{subtitle}\insertsubtitle\@empty\else \par 
+		{\usebeamerfont{subtitle}\insertsubtitle}
+		\fi     	
+	\end{beamercolorbox}%
+	\vfill 
+	\begin{beamercolorbox}[sep=6pt,center]{author}   	
+		\usebeamerfont{author}\usebeamercolor[fg]{author}\insertauthor
+	\end{beamercolorbox}%  
+	\vfill  
+	\begin{beamercolorbox}[sep=6pt,center]{institute}		
+		\usebeamerfont{institute}\usebeamercolor[fg]{institute}\insertinstitute
+	\end{beamercolorbox}%
+	\vfill 
+	%\begin{beamercolorbox}[sep=6pt,center]{date} 		
+	%	\usebeamerfont{date}\usebeamercolor[fg]{date}\insertdate
+	%\end{beamercolorbox}%
+	\vfill
+	\begin{beamercolorbox}[sep=8pt, center]{titlegraphic}
+		\usebeamercolor[fg]{titlegraphic}\inserttitlegraphic 
+	\end{beamercolorbox}%	
+	\fi \fi
+}
+
+
+%% Footline
+\if@titlefooter
+%\useoutertheme{infolines}
+\setbeamertemplate{footline}{%
+	%\leavevmode 	
+	%\begin{beamercolorbox}[wd=0.3\paperwidth, ht=2.5ex, dp=1ex, center]{author in head/foot}
+	%	\insertshortauthor~(\insertshortinstitute)
+	%\end{beamercolorbox}%
+	%\begin{beamercolorbox}[wd=0.38\paperwidth, ht=2.5ex, dp=1ex, center]{title in head/foot}
+	%	\insertshorttitle
+	%\end{beamercolorbox}%
+	%\begin{beamercolorbox}[wd=0.22\paperwidth, ht=2.5ex, dp=1ex, center]{date in head/foot}
+	%	\insertshortdate
+	%\end{beamercolorbox}%
+	% The supplied value was 2\paperwidth, which produced a one-page-width
+	% overfull box on every frame without changing the visible bar.
+	\begin{beamercolorbox}[wd=\paperwidth, ht=1.8ex, dp=0.6ex, center]{page number in head/foot}	
+		\ifx\beamer@ChPresentation@progressbar\beamer@ChPresentation@progressbarpercent%	
+		{\vspace{-0.6ex} \insertprogressbar}
+		\else 
+		\ifx\beamer@ChPresentation@progressbar\beamer@ChPresentation@progressbarfraction%
+		{\vspace{-0.6ex} \insertprogressbar}
+		\else 
+		\insertframenumber/\inserttotalframenumber
+		\fi \fi 
+	\end{beamercolorbox}%
+}
+\fi  
+
+%% Headline
+\if@secheader
+\useoutertheme{infolines}
+\setbeamertemplate{headline}{%
+	\leavevmode	
+%	\begin{beamercolorbox}[wd=1\paperwidth, ht=2.5ex, dp=1ex, center]{section in head/foot}
+%		\insertsectionhead   
+%	\end{beamercolorbox}%
+	\begin{beamercolorbox}[wd=\paperwidth, ht=2.5ex, dp=1ex, center]{palette quaternary}
+		\insertsectionnavigationhorizontal{\paperwidth}{\hfill}{\hfill}
+	\end{beamercolorbox}%
+} 
+\fi 
+
+%% Frame title and frame logo 
+% Note---> The option 'leftskip' causes overfull hbox warning 
+\if@backgroundlogo
+\setbeamertemplate{frametitle}{%
+	\nointerlineskip
+	\leavevmode	
+   \begin{beamercolorbox}[wd=\paperwidth, ht=2.7ex, dp=1.5ex]{frametitle}
+	\hskip3mm \insertframetitle   
+   \end{beamercolorbox}% 
+      \vspace*{-0.358\baselineskip}
+      \backgroundsetup{placement=center, opacity=\insertframebackgroundlogoopacity, scale=6, angle=0, contents={\insertframelogo}}
+      \BgMaterial   
+}
+\else
+\setbeamertemplate{frametitle}{%
+	\nointerlineskip 
+   \begin{beamercolorbox}[wd=\paperwidth, ht=2.7ex, dp=1.5ex]{frametitle}
+     \hskip3mm \insertframetitle  
+   \end{beamercolorbox}%
+}
+
+\addtobeamertemplate{frametitle}{}{%
+	\begin{textblock*}{100mm}(0.86\linewidth, -3.6ex)
+	  \insertframelogo 	
+	\end{textblock*}
+}
+\fi  
+
+%% Section and subsection in toc
+\setbeamertemplate{section in toc}{%
+	\leavevmode\leftskip=6mm
+	\llap{%	  
+	   \usebeamercolor[bg]{section number projected}
+		\begin{pgfpicture}{0ex}{0ex}{1ex}{0ex}
+			\color{bg}
+			\pgfpathcircle{\pgfpoint{0ex}{0.75ex}}{1.2ex}
+			\pgfusepath{fill}
+			\pgftext[base]{\color{fg}\inserttocsectionnumber}
+		\end{pgfpicture}%
+		\kern1ex%
+	}%
+	\kern1ex
+	\parbox[t]{\dimexpr\textwidth-30mm}{\inserttocsection}
+	\par
+}
+
+\setbeamertemplate{subsection in toc}{%
+	\leavevmode\leftskip=9mm
+	{\usebeamercolor[bg]{subsection number projected}\Large $\bullet$}%
+	\hskip1ex
+	\inserttocsubsection\par
+}
+
+%% Section page
+\setbeamertemplate{section page}{%
+	\vspace{1.5\baselineskip}
+	\begin{beamercolorbox}[sep=6pt, center]{part title}
+		\usebeamerfont{section title}\insertsection\par
+	\end{beamercolorbox}% 
+}
+
+\newcommand{\SectionPage}{\frame[c, plain, noframenumbering]{\sectionpage}}
+
+%% Lists 
+\renewcommand{\insertsubenumlabel}{\alph{enumii}}
+\renewcommand{\insertsubsubenumlabel}{\roman{enumiii}}
+
+\setbeamertemplate{itemize item}{\bfseries\ding{114}}
+\setbeamertemplate{itemize subitem}{\bfseries\ding{108}}
+\setbeamertemplate{itemize subsubitem}{\bfseries\ding{118}}
+
+%% Blocks
+\setbeamertemplate{blocks}[rounded][shadow=false] 
+
+%% Micellaneous commands
+\setbeamersize{text margin left=6mm, text margin right=6mm} 
+\setbeamertemplate{navigation symbols}{}
+\setlength{\parskip}{4pt}
+\newcommand{\linespacing}[1][]{\renewcommand{\baselinestretch}{#1}}
+\linespacing[1.12]
+\newcommand{\etal}{\textit{et al.}}
+\renewcommand{\appendixname}{Appendix}
+ 
+\let\chcite\cite
+
+%\renewcommand{\cite}[1]{\tiny\color{blue!80!red}\chcite{#1}}
+\renewcommand{\cite}[1]{\tiny\color{HAIlightred}\chcite{#1}}
+
+%*************************** Links and document properties *************************** 
+\hypersetup{%
+	pdftitle={\beamer@shorttitle},
+	pdfauthor={\beamer@shortauthor}, 			 
+	pdfsubject={Presentation template using latex beamer class},			
+	pdfkeywords={LaTeX, PDF, Hyperlinks, Beamer},
+	pdfproducer={TeXstudio},
+	pdfcreator={pdflatex is the compiler}
+	pdftoolbar=true,
+	pdfmenubar=true,             
+	linkcolor=,
+	filecolor=magenta,
+	urlcolor=red, 
+    colorlinks,
+    linkbordercolor=red, 
+    citecolor=HAIlightred	
+ }
+
+
+\mode<all>
+
+% File \textit{beamerthemeChPresentation.sty} ends here.
+%=====================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

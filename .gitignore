@@ -104,9 +104,17 @@ model_weights/
 *.fls
 *.lof
 *.lot
+*.nav
+*.snm
 *.synctex.gz
+*.synctex.gz(busy)
 *.toc
+*.vrb
+*.xdv
+*.bcf
+*.run.xml
 
-# Project-local working plans and generated evaluation results
+# Project-local working plans, render previews, and generated evaluation results
 plan/
 results/
+/tmp/
